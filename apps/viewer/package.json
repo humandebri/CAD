@@ -1,0 +1,23 @@
+{
+  "name": "cad-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "test": "tsc --noEmit",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@preact/preset-vite": "^2.10.5",
+    "lucide-preact": "^1.23.0",
+    "preact": "10.29.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3"
+  }
+}

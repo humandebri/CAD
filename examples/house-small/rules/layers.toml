@@ -1,0 +1,7 @@
+[layers."0-1"]
+name = "A-WALL"
+visible = true
+printable = true
+color = "jw_black"
+line_type = "solid"
+line_width = 0.25

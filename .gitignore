@@ -1,0 +1,13 @@
+/target/
+node_modules/
+.pnpm-store/
+dist/
+/build/
+/snapshots/
+/exports/
+**/build/
+**/snapshots/
+**/exports/
+**/test-results/
+**/playwright-report/
+*.log

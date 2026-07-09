@@ -1,0 +1,18 @@
+[colors.jw_black]
+rgb = "#000000"
+print_width = 0.25
+
+[line_types.solid]
+dash = []
+
+[text_styles.note]
+font_family = "Hiragino Sans"
+height = 250
+align = "left"
+
+[dimension_styles.dim_100]
+text_style = "note"
+arrow_size = 120
+extension_gap = 40
+precision = 0
+unit = "mm"

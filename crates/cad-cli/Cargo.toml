@@ -1,0 +1,18 @@
+[package]
+name = "cad-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cadc"
+path = "src/main.rs"
+
+[dependencies]
+cad-check.workspace = true
+cad-diff.workspace = true
+cad-model.workspace = true
+cad-render-svg.workspace = true
+clap.workspace = true
+miette.workspace = true
+thiserror.workspace = true

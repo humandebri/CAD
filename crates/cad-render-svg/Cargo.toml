@@ -1,0 +1,12 @@
+[package]
+name = "cad-render-svg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-model.workspace = true
+svg.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
