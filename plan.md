@@ -1,6 +1,6 @@
 # MVP Implementation Plan
 
-Status: draft
+Status: implemented through Phase 6
 
 Source: [ADR.md](ADR.md)
 
