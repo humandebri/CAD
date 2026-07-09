@@ -4,8 +4,8 @@ Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
 ## Current Phase
 
-Phase 4 establishes strict loading, checking, SVG rendering, and semantic diff
-for the NDJSON/TOML CAD source model.
+Phase 5 establishes strict loading, checking, SVG rendering, semantic diff, and
+a local viewer for generated review artifacts.
 
 ## Layout
 
@@ -20,6 +20,7 @@ apps/
   viewer
 examples/
   house-small
+  house-small-modified
 ```
 
 ## Checks
