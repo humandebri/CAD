@@ -180,7 +180,6 @@ preact
 @preact/preset-vite
 vite
 typescript
-@testing-library/preact
 @playwright/test
 tailwindcss
 lucide-preact
