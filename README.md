@@ -4,8 +4,8 @@ Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
 ## Current Phase
 
-Phase 3 establishes strict loading, checking, and SVG rendering for the
-NDJSON/TOML CAD source model. Diff behavior starts in later phases.
+Phase 4 establishes strict loading, checking, SVG rendering, and semantic diff
+for the NDJSON/TOML CAD source model.
 
 ## Layout
 
@@ -30,6 +30,8 @@ cargo run -p cad-cli -- --help
 cargo run -p cad-cli -- format examples/house-small
 cargo run -p cad-cli -- check examples/house-small --format json --out examples/house-small/build/check.json
 cargo run -p cad-cli -- render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg
+cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json
+cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format svg --out examples/house-small/build/plan_1f.diff.svg
 cargo metadata --no-deps --format-version 1
 pnpm --dir apps/viewer install
 pnpm --dir apps/viewer exec playwright install chromium

@@ -1,0 +1,15 @@
+[layers."0-1"]
+name = "A-WALL"
+visible = true
+printable = true
+color = "jw_black"
+line_type = "solid"
+line_width = 0.35
+
+[layers."0-2"]
+name = "A-ANNO"
+visible = true
+printable = true
+color = "jw_green"
+line_type = "solid"
+line_width = 0.25

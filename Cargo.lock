@@ -139,6 +139,8 @@ dependencies = [
  "insta",
  "serde",
  "serde_json",
+ "svg",
+ "tempfile",
 ]
 
 [[package]]

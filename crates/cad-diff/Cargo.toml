@@ -9,6 +9,8 @@ cad-model.workspace = true
 cad-render-svg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+svg.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true

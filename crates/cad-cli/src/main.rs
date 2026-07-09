@@ -1,7 +1,6 @@
 //! Command-line entrypoint for cadc.
 //!
-//! Phase 2 exposes strict source loading and checking. `cadc format` still only
-//! loads the project and does not rewrite files yet.
+//! CLI entrypoint for source loading, checking, rendering, and semantic diff.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
@@ -36,6 +35,20 @@ enum Command {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
     },
+    #[command(about = "Compare CAD source projects by stable entity IDs")]
+    Diff {
+        #[arg(value_name = "BASE")]
+        base: PathBuf,
+
+        #[arg(value_name = "HEAD")]
+        head: PathBuf,
+
+        #[arg(long, value_enum)]
+        format: DiffFormat,
+
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
     #[command(about = "Render CAD source to SVG")]
     Render {
         #[arg(value_name = "PROJECT")]
@@ -56,6 +69,12 @@ enum CheckFormat {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RenderFormat {
+    Svg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DiffFormat {
+    Json,
     Svg,
 }
 
@@ -93,6 +112,25 @@ fn main() -> Result<()> {
                 source.drawings.len(),
                 entity_count
             );
+        }
+        Some(Command::Diff {
+            base,
+            head,
+            format,
+            out,
+        }) => {
+            let base = cad_model::load_project(&base).into_diagnostic()?;
+            let head = cad_model::load_project(&head).into_diagnostic()?;
+            match format {
+                DiffFormat::Json => {
+                    let json = cad_diff::diff_projects_json(&base, &head).into_diagnostic()?;
+                    write_text_file(&out, &format!("{json}\n"))?;
+                }
+                DiffFormat::Svg => {
+                    let svg = cad_diff::diff_projects_svg(&base, &head);
+                    write_text_file(&out, &format!("{svg}\n"))?;
+                }
+            }
         }
         Some(Command::Render {
             project,
