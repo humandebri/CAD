@@ -36,11 +36,27 @@ enum Command {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
     },
+    #[command(about = "Render CAD source to SVG")]
+    Render {
+        #[arg(value_name = "PROJECT")]
+        project: PathBuf,
+
+        #[arg(long, value_enum)]
+        format: RenderFormat,
+
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CheckFormat {
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RenderFormat {
+    Svg,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +94,15 @@ fn main() -> Result<()> {
                 entity_count
             );
         }
+        Some(Command::Render {
+            project,
+            format: RenderFormat::Svg,
+            out,
+        }) => {
+            let source = cad_model::load_project(&project).into_diagnostic()?;
+            let svg = cad_render_svg::render_project_svg(&source).into_diagnostic()?;
+            write_text_file(&out, &format!("{svg}\n"))?;
+        }
         None => {}
     }
 
@@ -94,6 +119,17 @@ fn write_json_report(path: &PathBuf, report: &cad_check::CheckReport) -> Result<
         .into_diagnostic()
         .wrap_err("failed to serialize check report")?;
     fs::write(path, format!("{text}\n"))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn write_text_file(path: &PathBuf, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, text)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", path.display()))
 }

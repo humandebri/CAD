@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 cad-model.workspace = true
 svg.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true

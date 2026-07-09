@@ -3,7 +3,7 @@
 //! This crate validates parsed CAD source and emits the structured JSON
 //! diagnostics consumed by the CLI and later viewer phases.
 
-use cad_model::{Entity, EntityRecord, ModelError, ProjectSource};
+use cad_model::{Entity, EntityRecord, ModelError, ProjectSource, entity_bbox};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -548,64 +548,6 @@ fn segments_intersect(a: ([f64; 2], [f64; 2]), b: ([f64; 2], [f64; 2])) -> bool 
 
 fn direction(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     ((c[0] - a[0]) * (b[1] - a[1])) - ((b[0] - a[0]) * (c[1] - a[1]))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct BBox {
-    min: [f64; 2],
-    max: [f64; 2],
-}
-
-impl BBox {
-    fn from_points(points: &[[f64; 2]]) -> Option<Self> {
-        let mut iter = points.iter();
-        let first = *iter.next()?;
-        if !point_is_finite(first) {
-            return None;
-        }
-
-        let mut bbox = Self {
-            min: first,
-            max: first,
-        };
-        for point in iter {
-            if !point_is_finite(*point) {
-                return None;
-            }
-            bbox.min[0] = bbox.min[0].min(point[0]);
-            bbox.min[1] = bbox.min[1].min(point[1]);
-            bbox.max[0] = bbox.max[0].max(point[0]);
-            bbox.max[1] = bbox.max[1].max(point[1]);
-        }
-        Some(bbox)
-    }
-
-    fn from_center_radius(center: [f64; 2], radius: f64) -> Option<Self> {
-        if !point_is_finite(center) || !radius.is_finite() || radius <= 0.0 {
-            return None;
-        }
-        Some(Self {
-            min: [center[0] - radius, center[1] - radius],
-            max: [center[0] + radius, center[1] + radius],
-        })
-    }
-}
-
-fn entity_bbox(entity: &Entity) -> Option<BBox> {
-    match entity {
-        Entity::Line { p1, p2, .. } | Entity::Dimension { p1, p2, .. } => {
-            BBox::from_points(&[*p1, *p2])
-        }
-        Entity::Polyline { points, .. } => BBox::from_points(points),
-        Entity::Arc { center, radius, .. } | Entity::Circle { center, radius, .. } => {
-            BBox::from_center_radius(*center, *radius)
-        }
-        Entity::Text { at, .. } | Entity::BlockRef { at, .. } => BBox::from_points(&[*at]),
-    }
-}
-
-fn point_is_finite(point: [f64; 2]) -> bool {
-    point[0].is_finite() && point[1].is_finite()
 }
 
 #[cfg(test)]
