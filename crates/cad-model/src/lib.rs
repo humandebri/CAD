@@ -310,10 +310,16 @@ impl Entity {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EntityRecord {
+    pub line: usize,
+    pub entity: Entity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DrawingSource {
     pub name: String,
     pub sheet: SheetConfig,
-    pub entities: Vec<Entity>,
+    pub entities: Vec<EntityRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,7 +428,7 @@ where
     })
 }
 
-fn read_entities(path: &Path) -> ModelResult<Vec<Entity>> {
+fn read_entities(path: &Path) -> ModelResult<Vec<EntityRecord>> {
     let text = fs::read_to_string(path).map_err(|source| ModelError::Read {
         path: path.to_path_buf(),
         source,
@@ -446,7 +452,10 @@ fn read_entities(path: &Path) -> ModelResult<Vec<Entity>> {
                     source,
                 })?;
             ensure_schema(path, Some(line_number), entity.schema_version())?;
-            Ok(entity)
+            Ok(EntityRecord {
+                line: line_number,
+                entity,
+            })
         })
         .collect()
 }
@@ -483,8 +492,9 @@ mod tests {
         assert_eq!(project.drawings.len(), 1);
         assert_eq!(project.drawings[0].name, "plan_1f");
         assert_eq!(project.drawings[0].entities.len(), 1);
+        assert_eq!(project.drawings[0].entities[0].line, 1);
         assert_eq!(
-            project.drawings[0].entities[0].id().as_str(),
+            project.drawings[0].entities[0].entity.id().as_str(),
             "ent_01JZ0000000000000000000000"
         );
     }

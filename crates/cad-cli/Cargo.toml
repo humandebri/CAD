@@ -15,4 +15,5 @@ cad-model.workspace = true
 cad-render-svg.workspace = true
 clap.workspace = true
 miette.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

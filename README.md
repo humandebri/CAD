@@ -4,8 +4,8 @@ Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
 ## Current Phase
 
-Phase 1 establishes strict loading for the NDJSON/TOML CAD source model. Full
-checking, rendering, and diff behavior start in later phases.
+Phase 2 establishes strict loading and checking for the NDJSON/TOML CAD source
+model. Rendering and diff behavior start in later phases.
 
 ## Layout
 
@@ -28,6 +28,7 @@ examples/
 cargo test --workspace
 cargo run -p cad-cli -- --help
 cargo run -p cad-cli -- format examples/house-small
+cargo run -p cad-cli -- check examples/house-small --format json --out examples/house-small/build/check.json
 cargo metadata --no-deps --format-version 1
 pnpm --dir apps/viewer install
 pnpm --dir apps/viewer exec playwright install chromium

@@ -110,6 +110,9 @@ dependencies = [
  "cad-model",
  "insta",
  "miette",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -123,6 +126,7 @@ dependencies = [
  "cad-render-svg",
  "clap",
  "miette",
+ "serde_json",
  "thiserror",
 ]
 
