@@ -6,16 +6,21 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
-    "test": "tsc --noEmit",
-    "test:e2e": "playwright test"
+    "test": "tsc --noEmit && playwright test --config playwright.unit.config.ts",
+    "test:e2e": "playwright test",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
   },
   "dependencies": {
     "@preact/preset-vite": "^2.10.5",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.1",
     "lucide-preact": "^1.23.0",
     "preact": "10.29.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
+    "@tauri-apps/cli": "2.11.4",
     "tailwindcss": "^4.3.2",
     "typescript": "^6.0.3",
     "vite": "^8.1.3"

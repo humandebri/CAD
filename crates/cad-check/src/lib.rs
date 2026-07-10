@@ -223,7 +223,8 @@ impl<'a> Checker<'a> {
             Entity::Line { .. }
             | Entity::Polyline { .. }
             | Entity::Arc { .. }
-            | Entity::Circle { .. } => {}
+            | Entity::Circle { .. }
+            | Entity::Ellipse { .. } => {}
         }
     }
 
@@ -286,6 +287,38 @@ impl<'a> Checker<'a> {
                         "geometry.invalid_circle",
                         Some("radius"),
                         "circle radius is zero or below epsilon".to_owned(),
+                    );
+                }
+            }
+            Entity::Ellipse {
+                radius_x,
+                radius_y,
+                start_deg,
+                end_deg,
+                ..
+            } => {
+                if *radius_x <= EPSILON_MM || *radius_y <= EPSILON_MM {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_ellipse",
+                        Some(if *radius_x <= EPSILON_MM {
+                            "radius_x"
+                        } else {
+                            "radius_y"
+                        }),
+                        "ellipse radius is zero or below epsilon".to_owned(),
+                    );
+                }
+                let span = (*end_deg - *start_deg).abs();
+                if span <= EPSILON_MM || span > 360.0 + EPSILON_MM {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_ellipse",
+                        Some("end_deg"),
+                        "ellipse arc span must be greater than zero and at most 360 degrees"
+                            .to_owned(),
                     );
                 }
             }
@@ -685,6 +718,7 @@ mod tests {
                 r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,1.0],[0.0,1.0],[1.0,0.0]],"closed":false}"#,
                 r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0],[1.0,1.0]],"closed":true}"#,
                 r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000005","type":"polyline","layer":"0-1","points":[],"closed":false}"#,
+                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000006","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":0.0,"radius_y":1.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":361.0}"#,
             ]
             .join("\n"),
         )
@@ -698,6 +732,7 @@ mod tests {
         assert_code(&report, "geometry.self_intersection");
         assert_code(&report, "geometry.open_closed_polyline");
         assert_code(&report, "geometry.invalid_bbox");
+        assert_code(&report, "geometry.invalid_ellipse");
     }
 
     #[test]
@@ -782,7 +817,7 @@ mod tests {
         .expect("layers TOML should be writable");
         write(
             temp.path().join("rules/styles.toml"),
-            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
+            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nwidth = 125\nspacing = 0\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
         )
         .expect("styles TOML should be writable");
         write(

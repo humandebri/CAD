@@ -1,0 +1,21 @@
+[package]
+name = "cad-import-jww"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-model.workspace = true
+encoding_rs.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+cad-check.workspace = true
+cad-render-svg.workspace = true
+insta.workspace = true
+tempfile.workspace = true

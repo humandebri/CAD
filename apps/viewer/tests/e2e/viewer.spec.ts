@@ -10,13 +10,28 @@ test("reviews generated artifacts", async ({ page }) => {
   await expect(page.getByText("CAD Review")).toBeVisible();
   await expect(page.locator(".drawing-stage svg")).toBeVisible();
   await expect(page.getByText("line_width_changed")).toBeVisible();
+  await page.locator(".drawing-stage svg text").first().click();
+  await expect(
+    page.locator('.drawing-stage [data-entity-id="ent_01JZ0000000000000000000001"].is-selected'),
+  ).toHaveCount(1);
 
   await page.getByRole("button", { name: "Sheet" }).click();
   await expect(page.locator(".drawing-stage svg [data-entity-id]").first()).toBeAttached();
 
   await page.getByRole("button", { name: "Diff" }).click();
+  const svg = page.locator(".drawing-stage svg");
+  const initialViewBox = await svg.getAttribute("viewBox");
   await page.getByText("ent_01JZ0000000000000000000000").first().click();
 
+  await expect.poll(async () => svg.getAttribute("viewBox")).not.toBe(initialViewBox);
+  await expect(
+    page.locator('.drawing-stage [data-entity-id="ent_01JZ0000000000000000000000"].is-selected'),
+  ).toHaveCount(2);
+  const selectedLine = page.locator(".drawing-stage .is-selected line").first();
+  await expect.poll(() => computedSvgStyle(selectedLine, "strokeWidth")).toBe("2px");
+  await expect.poll(() => computedSvgStyle(selectedLine, "vectorEffect")).toBe(
+    "non-scaling-stroke",
+  );
   await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText(
     "geometry_changed",
   );
@@ -24,3 +39,138 @@ test("reviews generated artifacts", async ({ page }) => {
     "Phase 0 sample comment",
   );
 });
+
+test("wheel zooms beyond 800 percent and previous view restores the burst", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+
+  const svg = page.locator(".drawing-stage svg");
+  const stage = page.locator(".drawing-stage");
+  const stageBox = await stage.boundingBox();
+  if (stageBox === null) {
+    throw new Error("drawing stage has no bounding box");
+  }
+  const initialWidth = viewBoxWidth(await svg.getAttribute("viewBox"));
+  const line = page.locator(".drawing-stage svg line").first();
+  const initialStrokeWidth = await computedSvgStyle(line, "strokeWidth");
+  expect(await computedSvgStyle(line, "vectorEffect")).toBe("non-scaling-stroke");
+  await page.mouse.move(stageBox.x + stageBox.width / 2, stageBox.y + stageBox.height / 2);
+  for (let index = 0; index < 7; index += 1) {
+    await page.mouse.wheel(0, -1000);
+  }
+
+  await expect.poll(async () => viewBoxWidth(await svg.getAttribute("viewBox"))).toBeLessThan(
+    initialWidth / 100,
+  );
+  await expect(page.locator("output.zoom-readout")).toContainText("x");
+  await expect.poll(() => computedSvgStyle(line, "strokeWidth")).toBe(initialStrokeWidth);
+  await expect.poll(() => computedSvgStyle(line, "vectorEffect")).toBe("non-scaling-stroke");
+  await page.waitForTimeout(200);
+  await page.getByRole("button", { name: "Previous view" }).click();
+  await expect
+    .poll(async () => viewBoxWidth(await svg.getAttribute("viewBox")))
+    .toBeCloseTo(initialWidth, 6);
+});
+
+test("toolbar area zoom draws a marquee without selecting an entity", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+  await page.getByRole("button", { name: "Zoom area" }).click();
+
+  const stage = page.locator(".drawing-stage");
+  const svg = page.locator(".drawing-stage svg");
+  const stageBox = await stage.boundingBox();
+  if (stageBox === null) {
+    throw new Error("drawing stage has no bounding box");
+  }
+  const initialWidth = viewBoxWidth(await svg.getAttribute("viewBox"));
+  const start = { x: stageBox.x + stageBox.width * 0.3, y: stageBox.y + stageBox.height * 0.3 };
+  const end = { x: stageBox.x + stageBox.width * 0.7, y: stageBox.y + stageBox.height * 0.7 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(end.x, end.y, { steps: 4 });
+  await expect(page.locator(".zoom-area-rect")).toBeVisible();
+  await page.mouse.up();
+
+  await expect.poll(async () => viewBoxWidth(await svg.getAttribute("viewBox"))).toBeLessThan(
+    initialWidth,
+  );
+  await expect(page.getByRole("button", { name: "Zoom area" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText(
+    "Select an entity",
+  );
+
+  await page.getByRole("button", { name: "Zoom area" }).click();
+  await expect(page.getByRole("button", { name: "Zoom area" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Zoom area" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+});
+
+test("Jw_cad two-button diagonals zoom an area and restore the previous view", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+
+  const stage = page.locator(".drawing-stage");
+  const svg = page.locator(".drawing-stage svg");
+  const stageBox = await stage.boundingBox();
+  if (stageBox === null) {
+    throw new Error("drawing stage has no bounding box");
+  }
+  const initialWidth = viewBoxWidth(await svg.getAttribute("viewBox"));
+  const start = { x: stageBox.x + stageBox.width * 0.25, y: stageBox.y + stageBox.height * 0.25 };
+  const end = { x: stageBox.x + stageBox.width * 0.65, y: stageBox.y + stageBox.height * 0.65 };
+  await jwCadDrag(page, start, end);
+  await expect.poll(async () => viewBoxWidth(await svg.getAttribute("viewBox"))).toBeLessThan(
+    initialWidth,
+  );
+
+  const previousStart = {
+    x: stageBox.x + stageBox.width * 0.6,
+    y: stageBox.y + stageBox.height * 0.4,
+  };
+  const previousEnd = { x: previousStart.x - 80, y: previousStart.y + 80 };
+  await jwCadDrag(page, previousStart, previousEnd);
+  await expect
+    .poll(async () => viewBoxWidth(await svg.getAttribute("viewBox")))
+    .toBeCloseTo(initialWidth, 6);
+});
+
+async function jwCadDrag(
+  page: import("@playwright/test").Page,
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+) {
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down({ button: "left" });
+  await page.mouse.down({ button: "right" });
+  await page.mouse.move(end.x, end.y, { steps: 4 });
+  await page.mouse.up({ button: "right" });
+  await page.mouse.up({ button: "left" });
+}
+
+function viewBoxWidth(value: string | null): number {
+  if (value === null) {
+    throw new Error("SVG viewBox is missing");
+  }
+  const width = Number(value.trim().split(/[\s,]+/)[2]);
+  if (!Number.isFinite(width) || width <= 0) {
+    throw new Error(`invalid SVG viewBox: ${value}`);
+  }
+  return width;
+}
+
+async function computedSvgStyle(
+  locator: import("@playwright/test").Locator,
+  property: "strokeWidth" | "vectorEffect",
+): Promise<string> {
+  return locator.evaluate((element, styleProperty) => getComputedStyle(element)[styleProperty], property);
+}

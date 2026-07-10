@@ -15,6 +15,10 @@ cargo run -p cad-cli -- check examples/house-small --format json --out examples/
 cargo run -p cad-cli -- render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg
 cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json
 cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format svg --out examples/house-small/build/plan_1f.diff.svg
+IMPORT_PARENT="$(mktemp -d)"
+cargo run -p cad-cli -- import-jww examples/jww-fixtures/Test1.jww --out "$IMPORT_PARENT/test1_imported"
+cargo run -p cad-cli -- check "$IMPORT_PARENT/test1_imported" --format json --out "$IMPORT_PARENT/test1_imported/build/check.json"
+cargo run -p cad-cli -- render "$IMPORT_PARENT/test1_imported" --format svg --out "$IMPORT_PARENT/test1_imported/build/test1.svg"
 cargo metadata --no-deps --format-version 1 >/dev/null
 
 pnpm --dir apps/viewer install
@@ -22,6 +26,7 @@ pnpm --dir apps/viewer exec playwright install chromium
 pnpm --dir apps/viewer build
 pnpm --dir apps/viewer test
 pnpm --dir apps/viewer test:e2e
+pnpm --dir apps/viewer desktop:build
 
 find . \
   -path ./.git -prune -o \
@@ -31,5 +36,6 @@ find . \
   -path ./apps/viewer/dist -prune -o \
   -path ./apps/viewer/test-results -prune -o \
   -path ./examples/house-small/build -prune -o \
+  -name .DS_Store -prune -o \
   -maxdepth 4 -type f -print
 git status --short --branch

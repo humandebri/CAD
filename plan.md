@@ -1,6 +1,6 @@
 # MVP Implementation Plan
 
-Status: implemented through Phase 6
+Status: implemented through Phase 8
 
 Source: [ADR.md](ADR.md)
 
@@ -266,29 +266,71 @@ MVPに含めないもの:
 
 ## Post-MVP Roadmap
 
-### Phase 7: Low-latency Preview
+### Phase 7: macOS Desktop App
+
+Status: implemented
+
+- `apps/viewer` をTauri v2でdesktop app化する。
+- frontendはTauri `invoke`でRust commandを呼ぶ。
+- Rust commandは既存crateを直接使って `check/render/diff` を実行する。
+- diff baseはGit `HEAD`、headはworking treeに固定する。
+- Git repo外、初回commitなし、`HEAD`にproject未存在の場合はdiff unavailableとして扱う。
+- Open Project、Re-run Review、current project path表示を追加する。
+- macOS `.app` bundle生成を検証する。
+
+### Phase 8: JWW One-Way Import
+
+Status: implemented
+
+- `cad-import-jww` crateを追加する。
+- `cadc import-jww <INPUT.jww> --out <PROJECT_DIR>` を追加する。
+- JWWの線、円、円弧、楕円、楕円弧、文字、寸法をNDJSON entityへ変換する。
+- JWW curveのradian角度をCAD正本のdegree角度へ変換する。
+- JWW block定義を読み、block参照を通常entityへflatten展開する。
+- JWW layer group/layerを `jww_g{group}_l{layer}` へ変換する。
+- JWW pen色/線種をTOML styleへ変換する。
+- JWW文字サイズは `size_x` / `size_y` / `spacing` からtext styleを生成する。
+- JWW用紙サイズと単一layer group scaleを `sheet.toml` へ反映する。
+- JWW header色テーブルは未解析のため、default color mapping warningを出す。
+- 既知のunsupported recordとstyle conflictを `build/import-jww-report.json` へwarningとして記録する。
+- checker不合格になる微小geometryは `geometry_skipped` warningとして記録し、NDJSONへ出さない。
+- 寸法は最小fixtureで検証し、ライセンス確認済み実fixture追加を継続課題にする。
+- block_ref正本化はせず、JWW import時だけ展開する。
+- 未知JWW classはrecord長を安全にskipできないためfatalにする。
+- block定義内のparse失敗もfatalにし、部分的なblockを出力しない。
+- block展開は生成entity 25万件、展開step 100万回を上限とし、超過時はtruncateせずimport全体を失敗させる。
+- 非有限値を含むgeometryとblockは採番・style生成前にwarning skipし、有効entityが残らなければimportを失敗させる。
+- 反転block内の文字は `mirror_y`、寸法文字は `text_rotation_deg` / `text_mirror_y` として正本へ保持する。
+- sheet範囲は生成entityを型付きparseし、共通 `entity_bbox` のunionから決定する。
+- import出力は同一filesystemの一時directoryへ生成後、no-replace renameで原子的に公開する。
+- Desktop appに `Import JWW` 導線を追加する。
+- Viewer zoomをSVG viewBox操作へ統一し、`0.05x..4096x`の範囲にする。
+- Viewer上のentity線幅をnon-scaling strokeにし、印刷用SVGの実寸線幅は維持する。
+- カーソル中心wheel zoom、範囲拡大、前表示、Jw_cad式両ボタンドラッグを追加する。
+- macOS trackpad向けにZoom AreaとPrevious Viewのtoolbar操作を追加する。
+- AI context書込をlatest-only直列queueへ通し、連続選択時の逆順完了を防ぐ。
+- Git HEAD展開はNUL区切りpathを使い、日本語project pathを保持する。
+
+### Phase 9: Low-latency Preview
 
 - ファイル監視を追加する。
 - NDJSON/TOML変更時に `check/render/diff` を自動再実行する。
-- `cadc serve` を追加する。
-- viewerをlocalhost APIへ接続する。
+- desktop commandの再実行をdebounceする。
+- viewerのartifact更新を低遅延化する。
 - コメント作成とstatus変更を追加する。
 
-### Phase 8: Desktop App
+### Phase 10: Desktop Distribution
 
-- Tauri化する。
-- `cadc` coreを同梱する。
-- ローカルAPIを維持するかIPCへ置換する。
 - macOS Apple Silicon向け署名/配布を検証する。
 
-### Phase 9: Boundary Format Export
+### Phase 11: Boundary Format Export
 
 - DXF exportを追加する。
 - PDF exportを追加する。
-- JWW import/exportを追加する。
+- JWW exportを追加する。
 - DWG対応は商用SDK境界を調査してから判断する。
 
-### Phase 10: QCAD Integration
+### Phase 12: QCAD Integration
 
 - QCAD pluginまたは外部スクリプトでNDJSON import/exportを試作する。
 - QCAD側entityとNDJSON永続IDの対応を検証する。
@@ -303,5 +345,7 @@ MVPに含めないもの:
 5. Phase 4
 6. Phase 5
 7. Phase 6
+8. Phase 7
+9. Phase 8
 
 各Phaseは単独でレビュー可能な差分にする。次Phaseへ進む前に、該当Phaseの完了条件を満たす。

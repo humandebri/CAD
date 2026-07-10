@@ -167,6 +167,8 @@ pub struct LineTypeDef {
 pub struct TextStyleDef {
     pub font_family: String,
     pub height: f64,
+    pub width: f64,
+    pub spacing: f64,
     pub align: TextAlign,
 }
 
@@ -238,6 +240,17 @@ pub enum Entity {
         center: Point,
         radius: f64,
     },
+    Ellipse {
+        schema_version: String,
+        id: EntityId,
+        layer: String,
+        center: Point,
+        radius_x: f64,
+        radius_y: f64,
+        rotation_deg: f64,
+        start_deg: f64,
+        end_deg: f64,
+    },
     Text {
         schema_version: String,
         id: EntityId,
@@ -245,6 +258,8 @@ pub enum Entity {
         style: String,
         at: Point,
         rotation_deg: f64,
+        #[serde(default)]
+        mirror_y: bool,
         value: String,
     },
     Dimension {
@@ -255,6 +270,10 @@ pub enum Entity {
         p1: Point,
         p2: Point,
         offset: f64,
+        #[serde(default)]
+        text_rotation_deg: f64,
+        #[serde(default)]
+        text_mirror_y: bool,
         value: Option<String>,
     },
     BlockRef {
@@ -276,6 +295,7 @@ impl Entity {
             | Self::Polyline { id, .. }
             | Self::Arc { id, .. }
             | Self::Circle { id, .. }
+            | Self::Ellipse { id, .. }
             | Self::Text { id, .. }
             | Self::Dimension { id, .. }
             | Self::BlockRef { id, .. } => id,
@@ -289,6 +309,7 @@ impl Entity {
             | Self::Polyline { schema_version, .. }
             | Self::Arc { schema_version, .. }
             | Self::Circle { schema_version, .. }
+            | Self::Ellipse { schema_version, .. }
             | Self::Text { schema_version, .. }
             | Self::Dimension { schema_version, .. }
             | Self::BlockRef { schema_version, .. } => schema_version,
@@ -302,6 +323,7 @@ impl Entity {
             | Self::Polyline { layer, .. }
             | Self::Arc { layer, .. }
             | Self::Circle { layer, .. }
+            | Self::Ellipse { layer, .. }
             | Self::Text { layer, .. }
             | Self::Dimension { layer, .. }
             | Self::BlockRef { layer, .. } => layer,
@@ -369,7 +391,121 @@ pub fn entity_bbox(entity: &Entity) -> Option<BBox> {
         Entity::Arc { center, radius, .. } | Entity::Circle { center, radius, .. } => {
             BBox::from_center_radius(*center, *radius)
         }
+        Entity::Ellipse {
+            center,
+            radius_x,
+            radius_y,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            ..
+        } => ellipse_bbox(
+            *center,
+            *radius_x,
+            *radius_y,
+            *rotation_deg,
+            *start_deg,
+            *end_deg,
+        ),
         Entity::Text { at, .. } | Entity::BlockRef { at, .. } => BBox::from_points(&[*at]),
+    }
+}
+
+/// Offsets a dimension segment along its signed unit normal. Keeping this
+/// geometry in the model prevents render and diff implementations diverging.
+#[must_use]
+pub fn dimension_offset_segment(p1: Point, p2: Point, offset: f64) -> Option<(Point, Point)> {
+    if !point_is_finite(p1) || !point_is_finite(p2) || !offset.is_finite() {
+        return None;
+    }
+    let dx = p2[0] - p1[0];
+    let dy = p2[1] - p1[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f64::EPSILON {
+        return None;
+    }
+    let normal = [-dy / length, dx / length];
+    let delta = [normal[0] * offset, normal[1] * offset];
+    Some((
+        [p1[0] + delta[0], p1[1] + delta[1]],
+        [p2[0] + delta[0], p2[1] + delta[1]],
+    ))
+}
+
+/// Returns a point on an ellipse where `parameter_deg` is measured in the
+/// ellipse's unrotated local coordinate system.
+#[must_use]
+pub fn ellipse_point(
+    center: Point,
+    radius_x: f64,
+    radius_y: f64,
+    rotation_deg: f64,
+    parameter_deg: f64,
+) -> Point {
+    let parameter = parameter_deg.to_radians();
+    let rotation = rotation_deg.to_radians();
+    let local_x = radius_x * parameter.cos();
+    let local_y = radius_y * parameter.sin();
+    [
+        center[0] + local_x * rotation.cos() - local_y * rotation.sin(),
+        center[1] + local_x * rotation.sin() + local_y * rotation.cos(),
+    ]
+}
+
+/// Computes the exact axis-aligned bounds for a rotated ellipse arc by adding
+/// every derivative extremum that falls inside the signed parameter sweep.
+#[must_use]
+pub fn ellipse_bbox(
+    center: Point,
+    radius_x: f64,
+    radius_y: f64,
+    rotation_deg: f64,
+    start_deg: f64,
+    end_deg: f64,
+) -> Option<BBox> {
+    if !point_is_finite(center)
+        || !radius_x.is_finite()
+        || !radius_y.is_finite()
+        || !rotation_deg.is_finite()
+        || !start_deg.is_finite()
+        || !end_deg.is_finite()
+        || radius_x <= 0.0
+        || radius_y <= 0.0
+        || (end_deg - start_deg).abs() <= f64::EPSILON
+    {
+        return None;
+    }
+
+    let rotation = rotation_deg.to_radians();
+    let x_extreme = (-radius_y * rotation.sin()).atan2(radius_x * rotation.cos());
+    let y_extreme = (radius_y * rotation.cos()).atan2(radius_x * rotation.sin());
+    let candidates = [
+        start_deg,
+        end_deg,
+        x_extreme.to_degrees(),
+        x_extreme.to_degrees() + 180.0,
+        y_extreme.to_degrees(),
+        y_extreme.to_degrees() + 180.0,
+    ];
+    let points = candidates
+        .into_iter()
+        .filter(|parameter| angle_is_on_sweep(*parameter, start_deg, end_deg))
+        .map(|parameter| ellipse_point(center, radius_x, radius_y, rotation_deg, parameter))
+        .collect::<Vec<_>>();
+    BBox::from_points(&points)
+}
+
+fn angle_is_on_sweep(candidate_deg: f64, start_deg: f64, end_deg: f64) -> bool {
+    const ANGLE_EPSILON_DEG: f64 = 1e-9;
+
+    let sweep = end_deg - start_deg;
+    if sweep.abs() >= 360.0 - ANGLE_EPSILON_DEG {
+        return true;
+    }
+    if sweep > 0.0 {
+        (candidate_deg - start_deg).rem_euclid(360.0) <= sweep + ANGLE_EPSILON_DEG
+    } else {
+        (start_deg - candidate_deg).rem_euclid(360.0) <= -sweep + ANGLE_EPSILON_DEG
     }
 }
 
@@ -574,9 +710,10 @@ mod tests {
             r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0]],"closed":false}"#,
             r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":1.0,"start_deg":0.0,"end_deg":90.0}"#,
             r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":1.0}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000005","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000006","type":"block_ref","layer":"0-1","block":"door_910","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":2.0,"radius_y":1.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0}"#,
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}"#,
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000007","type":"block_ref","layer":"0-1","block":"door_910","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
         ];
 
         for line in source {
@@ -701,6 +838,60 @@ mod tests {
         assert_eq!(bbox.max, [3.0, 2.0]);
     }
 
+    #[test]
+    fn computes_rotated_ellipse_and_arc_bbox() {
+        let full = ellipse_bbox([10.0, 20.0], 4.0, 2.0, 90.0, 0.0, 360.0)
+            .expect("full ellipse should have bbox");
+        assert!((full.min[0] - 8.0).abs() < 1e-9);
+        assert!((full.max[0] - 12.0).abs() < 1e-9);
+        assert!((full.min[1] - 16.0).abs() < 1e-9);
+        assert!((full.max[1] - 24.0).abs() < 1e-9);
+
+        let quarter = ellipse_bbox([0.0, 0.0], 4.0, 2.0, 0.0, 0.0, 90.0)
+            .expect("ellipse arc should have bbox");
+        assert!(quarter.min[0].abs() < 1e-9);
+        assert!(quarter.min[1].abs() < 1e-9);
+        assert!((quarter.max[0] - 4.0).abs() < 1e-9);
+        assert!((quarter.max[1] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn defaults_text_mirror_fields_for_existing_schema() {
+        let text: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
+        )
+        .expect("legacy text should parse");
+        let dimension: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"value":null}"#,
+        )
+        .expect("legacy dimension should parse");
+
+        assert!(matches!(
+            text,
+            Entity::Text {
+                mirror_y: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dimension,
+            Entity::Dimension {
+                text_rotation_deg: 0.0,
+                text_mirror_y: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn offsets_dimension_along_line_normal() {
+        let (d1, d2) = dimension_offset_segment([0.0, 0.0], [0.0, 10.0], 2.0)
+            .expect("vertical dimension should offset");
+
+        assert_eq!(d1, [-2.0, 0.0]);
+        assert_eq!(d2, [-2.0, 10.0]);
+    }
+
     fn minimal_project() -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         create_dir_all(temp.path().join("rules")).expect("rules dir should be created");
@@ -719,7 +910,7 @@ mod tests {
         .expect("layers TOML should be writable");
         write(
             temp.path().join("rules/styles.toml"),
-            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
+            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nwidth = 125\nspacing = 0\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
         )
         .expect("styles TOML should be writable");
         write(

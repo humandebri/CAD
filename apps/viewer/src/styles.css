@@ -28,7 +28,7 @@ button {
 
 .topbar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto minmax(220px, 1fr);
+  grid-template-columns: auto minmax(260px, 1fr) auto auto;
   align-items: center;
   gap: 12px;
   padding: 0 14px;
@@ -37,6 +37,7 @@ button {
 }
 
 .brand,
+.project-actions,
 .view-tools,
 .mode-tabs,
 .detail-panel h2,
@@ -50,6 +51,38 @@ button {
   gap: 8px;
   font-size: 14px;
   font-weight: 700;
+}
+
+.project-actions {
+  min-width: 0;
+  gap: 8px;
+}
+
+.tool-button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid #c7d1ce;
+  background: #ffffff;
+  color: #25302d;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.tool-button:disabled {
+  cursor: default;
+  opacity: 0.48;
+}
+
+.diff-source {
+  min-width: 0;
+  overflow: hidden;
+  color: #66736f;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mode-tabs {
@@ -92,6 +125,7 @@ button {
 }
 
 .icon-button:hover,
+.tool-button:not(:disabled):hover,
 .tab:hover,
 .result-row:hover,
 .comment-row:hover {
@@ -99,7 +133,19 @@ button {
   background: #ffffff;
 }
 
+.icon-button.is-active {
+  border-color: #1d6f64;
+  background: #dcebe6;
+  color: #14564e;
+}
+
+.icon-button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
 .icon-button:focus-visible,
+.tool-button:focus-visible,
 .tab:focus-visible,
 .result-row:focus-visible,
 .comment-row:focus-visible {
@@ -108,7 +154,7 @@ button {
 }
 
 .zoom-readout {
-  width: 48px;
+  width: 54px;
   text-align: center;
   color: #53615d;
   font-size: 12px;
@@ -186,6 +232,16 @@ h3 {
   background: #ecf3f0;
   color: #33403c;
   font-size: 11px;
+}
+
+.project-path {
+  max-width: 250px;
+  overflow: hidden;
+  margin: 5px 0 0;
+  color: #66736f;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .result-stack {
@@ -276,6 +332,15 @@ h3 {
   font-size: 13px;
 }
 
+.warning-line {
+  margin-bottom: 0;
+  padding: 8px;
+  border: 1px solid #d7c36a;
+  background: #fff8d8;
+  color: #6f5a00;
+  font-size: 12px;
+}
+
 .canvas-panel {
   min-width: 0;
   min-height: 0;
@@ -288,24 +353,30 @@ h3 {
 }
 
 .drawing-stage {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   display: grid;
   place-items: center;
   cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
 
 .drawing-stage.is-panning {
   cursor: grabbing;
 }
 
+.drawing-stage.is-zoom-area {
+  cursor: crosshair;
+}
+
 .svg-surface {
-  width: min(88vw, 960px);
-  height: min(78vh, 720px);
+  width: 100%;
+  height: 100%;
   display: grid;
   place-items: center;
-  transform-origin: center;
 }
 
 .svg-surface > svg {
@@ -320,9 +391,23 @@ h3 {
   cursor: pointer;
 }
 
-.drawing-stage .is-selected {
+.drawing-stage svg [data-entity-id] :is(line, path, polyline, circle, ellipse, rect) {
+  vector-effect: non-scaling-stroke;
+}
+
+.drawing-stage .is-selected,
+.drawing-stage .is-selected * {
+  vector-effect: non-scaling-stroke;
   filter: drop-shadow(0 0 8px rgba(29, 111, 100, 0.75));
-  stroke-width: 0.7mm;
+  stroke-width: 2px;
+}
+
+.zoom-area-rect {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid #1d6f64;
+  background: rgba(29, 111, 100, 0.1);
 }
 
 .empty-state {
@@ -376,6 +461,10 @@ h3 {
     grid-template-columns: 1fr;
     height: auto;
     padding: 10px;
+  }
+
+  .project-actions {
+    flex-wrap: wrap;
   }
 
   .view-tools {

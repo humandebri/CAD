@@ -35,6 +35,14 @@ enum Command {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
     },
+    #[command(about = "Import a JWW file into a new CAD source project")]
+    ImportJww {
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        #[arg(long, value_name = "PROJECT_DIR")]
+        out: PathBuf,
+    },
     #[command(about = "Compare CAD source projects by stable entity IDs")]
     Diff {
         #[arg(value_name = "BASE")]
@@ -111,6 +119,16 @@ fn main() -> Result<()> {
                 "format scaffold ok: {} drawing(s), {} entity/entities",
                 source.drawings.len(),
                 entity_count
+            );
+        }
+        Some(Command::ImportJww { input, out }) => {
+            let report = cad_import_jww::import_jww_file(&input, &out).into_diagnostic()?;
+            println!(
+                "imported {} entity/entities from {} into {} ({} warning(s))",
+                report.supported_entities,
+                input.display(),
+                out.display(),
+                report.warnings.len()
             );
         }
         Some(Command::Diff {

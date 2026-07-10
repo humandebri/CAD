@@ -3,12 +3,14 @@
 //! This crate compares CAD source by stable entity IDs and emits JSON/SVG
 //! review artifacts. It does not mutate either project.
 
-use cad_model::{BBox, Entity, EntityRecord, Point, ProjectSource, entity_bbox};
+use cad_model::{
+    BBox, Entity, EntityRecord, Point, ProjectSource, TextAlign, TextStyleDef, entity_bbox,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use svg::Document;
 use svg::node::element::path::Data;
-use svg::node::element::{Circle, Group, Line, Path, Polyline, Text};
+use svg::node::element::{Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Text};
 
 pub const CRATE_NAME: &str = "cad-diff";
 pub const DIFF_SCHEMA_VERSION: &str = "0.1";
@@ -166,7 +168,7 @@ pub fn diff_projects(base: &ProjectSource, head: &ProjectSource) -> DiffReport {
         }
 
         if let Some(records) = head_drawings.get(&drawing_name) {
-            warnings.extend(text_overlap_warnings(&drawing_name, records));
+            warnings.extend(text_overlap_warnings(head, &drawing_name, records));
         }
     }
 
@@ -194,8 +196,10 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                     .get(&change.drawing)
                     .and_then(|records| find_record(records, &change.entity_id))
                 {
-                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(record));
-                    root = root.add(render_overlay_entity(record, "#00AA00", 0.95, "added"));
+                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
+                    root = root.add(render_overlay_entity(
+                        head, record, "#00AA00", 0.95, "added",
+                    ));
                 }
             }
             ChangeKind::Removed => {
@@ -203,8 +207,10 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                     .get(&change.drawing)
                     .and_then(|records| find_record(records, &change.entity_id))
                 {
-                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(record));
-                    root = root.add(render_overlay_entity(record, "#DD2222", 0.95, "removed"));
+                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(base, record));
+                    root = root.add(render_overlay_entity(
+                        base, record, "#DD2222", 0.95, "removed",
+                    ));
                 }
             }
             ChangeKind::Modified => {
@@ -212,8 +218,9 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                     .get(&change.drawing)
                     .and_then(|records| find_record(records, &change.entity_id))
                 {
-                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(record));
+                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(base, record));
                     root = root.add(render_overlay_entity(
+                        base,
                         record,
                         "#DD2222",
                         0.45,
@@ -224,8 +231,10 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                     .get(&change.drawing)
                     .and_then(|records| find_record(records, &change.entity_id))
                 {
-                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(record));
-                    root = root.add(render_overlay_entity(record, "#D6B300", 0.95, "modified"));
+                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
+                    root = root.add(render_overlay_entity(
+                        head, record, "#D6B300", 0.95, "modified",
+                    ));
                 }
             }
             ChangeKind::Unchanged => {
@@ -233,8 +242,14 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                     .get(&change.drawing)
                     .and_then(|records| find_record(records, &change.entity_id))
                 {
-                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(record));
-                    root = root.add(render_overlay_entity(record, "#999999", 0.25, "unchanged"));
+                    view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
+                    root = root.add(render_overlay_entity(
+                        head,
+                        record,
+                        "#999999",
+                        0.25,
+                        "unchanged",
+                    ));
                 }
             }
         }
@@ -311,10 +326,31 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             ..
         } => format!("arc:{center:?}:{radius}:{start_deg}:{end_deg}"),
         Entity::Circle { center, radius, .. } => format!("circle:{center:?}:{radius}"),
+        Entity::Ellipse {
+            center,
+            radius_x,
+            radius_y,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            ..
+        } => {
+            format!("ellipse:{center:?}:{radius_x}:{radius_y}:{rotation_deg}:{start_deg}:{end_deg}")
+        }
         Entity::Text {
-            at, rotation_deg, ..
-        } => format!("text:{at:?}:{rotation_deg}"),
-        Entity::Dimension { p1, p2, offset, .. } => format!("dimension:{p1:?}:{p2:?}:{offset}"),
+            at,
+            rotation_deg,
+            mirror_y,
+            ..
+        } => format!("text:{at:?}:{rotation_deg}:{mirror_y}"),
+        Entity::Dimension {
+            p1,
+            p2,
+            offset,
+            text_rotation_deg,
+            text_mirror_y,
+            ..
+        } => format!("dimension:{p1:?}:{p2:?}:{offset}:{text_rotation_deg}:{text_mirror_y}"),
         Entity::BlockRef {
             block,
             at,
@@ -410,10 +446,14 @@ fn parse_scale(scale: &str) -> Option<f64> {
     Some(denominator / numerator)
 }
 
-fn text_overlap_warnings(drawing_name: &str, records: &[EntityRecord]) -> Vec<DiffWarning> {
+fn text_overlap_warnings(
+    project: &ProjectSource,
+    drawing_name: &str,
+    records: &[EntityRecord],
+) -> Vec<DiffWarning> {
     let texts = records
         .iter()
-        .filter_map(|record| text_bbox(record).map(|bbox| (record, bbox)))
+        .filter_map(|record| text_bbox(project, record).map(|bbox| (record, bbox)))
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
     for left_index in 0..texts.len() {
@@ -436,24 +476,106 @@ fn text_overlap_warnings(drawing_name: &str, records: &[EntityRecord]) -> Vec<Di
     warnings
 }
 
-fn text_bbox(record: &EntityRecord) -> Option<BBox> {
+fn text_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
     match &record.entity {
-        Entity::Text { at, value, .. } => {
-            let width = value.chars().count() as f64 * 150.0;
-            Some(BBox {
-                min: *at,
-                max: [at[0] + width, at[1] + 250.0],
-            })
-        }
+        Entity::Text {
+            style,
+            at,
+            rotation_deg,
+            mirror_y,
+            value,
+            ..
+        } => project
+            .styles
+            .text_styles
+            .get(style)
+            .and_then(|text_style| {
+                text_bbox_for_style(
+                    at,
+                    *rotation_deg,
+                    *mirror_y,
+                    value,
+                    text_style,
+                    text_anchor(&text_style.align),
+                )
+            }),
         _ => None,
     }
 }
 
-fn visual_bbox(record: &EntityRecord) -> Option<BBox> {
+fn visual_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
     match &record.entity {
-        Entity::Text { .. } => text_bbox(record).or_else(|| entity_bbox(&record.entity)),
+        Entity::Text { .. } => text_bbox(project, record).or_else(|| entity_bbox(&record.entity)),
+        Entity::Dimension { .. } => {
+            dimension_bbox(project, &record.entity).or_else(|| entity_bbox(&record.entity))
+        }
         _ => entity_bbox(&record.entity),
     }
+}
+
+fn dimension_bbox(project: &ProjectSource, entity: &Entity) -> Option<BBox> {
+    let Entity::Dimension {
+        style,
+        p1,
+        p2,
+        offset,
+        text_rotation_deg,
+        text_mirror_y,
+        value,
+        ..
+    } = entity
+    else {
+        return None;
+    };
+    let dimension_style = project.styles.dimension_styles.get(style)?;
+    let text_style = project
+        .styles
+        .text_styles
+        .get(&dimension_style.text_style)?;
+    let (d1, d2) = cad_model::dimension_offset_segment(*p1, *p2, *offset)?;
+    let label = dimension_label(p1, p2, value);
+    let line_bbox = BBox::from_points(&[*p1, *p2, d1, d2])?;
+    let text_bbox = text_bbox_for_style(
+        &[(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+        *text_rotation_deg,
+        *text_mirror_y,
+        &label,
+        text_style,
+        "middle",
+    )?;
+    Some(union_bbox(line_bbox, text_bbox))
+}
+
+fn text_bbox_for_style(
+    at: &Point,
+    rotation_deg: f64,
+    mirror_y: bool,
+    value: &str,
+    style: &TextStyleDef,
+    anchor: &str,
+) -> Option<BBox> {
+    let width = text_length(value, style);
+    let height = style.height.max(0.0);
+    if !at[0].is_finite()
+        || !at[1].is_finite()
+        || !rotation_deg.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+    {
+        return None;
+    }
+    let x0 = match anchor {
+        "middle" => at[0] - (width / 2.0),
+        "end" => at[0] - width,
+        _ => at[0],
+    };
+    let (y0, y1) = if mirror_y {
+        (at[1] - height, at[1])
+    } else {
+        (at[1], at[1] + height)
+    };
+    let corners = [[x0, y0], [x0 + width, y0], [x0, y1], [x0 + width, y1]];
+    BBox::from_points(&corners.map(|point| rotate_point(point, *at, rotation_deg)))
 }
 
 fn bboxes_overlap(left: BBox, right: BBox) -> bool {
@@ -474,6 +596,13 @@ fn merge_view_bbox(left: Option<BBox>, right: Option<BBox>) -> Option<BBox> {
     }
 }
 
+fn union_bbox(left: BBox, right: BBox) -> BBox {
+    BBox {
+        min: [left.min[0].min(right.min[0]), left.min[1].min(right.min[1])],
+        max: [left.max[0].max(right.max[0]), left.max[1].max(right.max[1])],
+    }
+}
+
 fn bbox_view_box(bbox: BBox) -> (f64, f64, f64, f64) {
     let largest = bbox.width().max(bbox.height());
     let padding = 100.0_f64.max(largest * 0.05);
@@ -486,6 +615,7 @@ fn bbox_view_box(bbox: BBox) -> (f64, f64, f64, f64) {
 }
 
 fn render_overlay_entity(
+    project: &ProjectSource,
     record: &EntityRecord,
     color: &str,
     opacity: f64,
@@ -499,6 +629,9 @@ fn render_overlay_entity(
         .set("stroke", color)
         .set("fill", "none")
         .set("stroke-width", "0.35mm");
+    if let Some(bbox) = visual_bbox(project, record) {
+        group = group.set("data-bbox", bbox_attr(bbox));
+    }
 
     match &record.entity {
         Entity::Line { p1, p2, .. } => {
@@ -534,48 +667,135 @@ fn render_overlay_entity(
                     .set("r", *radius),
             );
         }
-        Entity::Text { at, value, .. } => {
-            group = group.add(
-                Text::new("")
-                    .set("x", at[0])
-                    .set("y", svg_y(at[1]))
-                    .set("fill", color)
-                    .set("stroke", "none")
-                    .set("font-size", 250)
-                    .add(svg::node::Text::new(value.clone())),
-            );
+        Entity::Ellipse {
+            center,
+            radius_x,
+            radius_y,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            ..
+        } => {
+            if (end_deg - start_deg).abs() >= 360.0 - 1e-9 {
+                group = group.add(
+                    SvgEllipse::new()
+                        .set("cx", center[0])
+                        .set("cy", svg_y(center[1]))
+                        .set("rx", *radius_x)
+                        .set("ry", *radius_y)
+                        .set(
+                            "transform",
+                            format!(
+                                "rotate({} {} {})",
+                                normalize_zero(-rotation_deg),
+                                center[0],
+                                svg_y(center[1])
+                            ),
+                        ),
+                );
+            } else {
+                group = group.add(ellipse_arc_path(
+                    *center,
+                    *radius_x,
+                    *radius_y,
+                    *rotation_deg,
+                    *start_deg,
+                    *end_deg,
+                ));
+            }
         }
-        Entity::Dimension {
-            p1,
-            p2,
-            offset,
+        Entity::Text {
+            style,
+            at,
+            rotation_deg,
+            mirror_y,
             value,
             ..
         } => {
-            let d1 = [p1[0], p1[1] + offset];
-            let d2 = [p2[0], p2[1] + offset];
-            let label = value.clone().unwrap_or_else(|| {
-                cad_model::format_decimal_mm(
-                    ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt(),
-                )
-            });
-            group = group
-                .add(
-                    Line::new()
-                        .set("x1", d1[0])
-                        .set("y1", svg_y(d1[1]))
-                        .set("x2", d2[0])
-                        .set("y2", svg_y(d2[1])),
-                )
-                .add(
+            if let Some(text_style) = project.styles.text_styles.get(style) {
+                group = group.add(text_node(
+                    at,
+                    *rotation_deg,
+                    *mirror_y,
+                    value,
+                    text_style,
+                    text_anchor(&text_style.align),
+                    color,
+                ));
+            } else {
+                group = group.add(
+                    Text::new("")
+                        .set("x", at[0])
+                        .set("y", svg_y(at[1]))
+                        .set("fill", color)
+                        .set("stroke", "none")
+                        .set("font-size", 250)
+                        .set(
+                            "transform",
+                            text_transform_attr(*rotation_deg, *mirror_y, *at),
+                        )
+                        .add(svg::node::Text::new(value.clone())),
+                );
+            }
+        }
+        Entity::Dimension {
+            style,
+            p1,
+            p2,
+            offset,
+            text_rotation_deg,
+            text_mirror_y,
+            value,
+            ..
+        } => {
+            let Some((d1, d2)) = cad_model::dimension_offset_segment(*p1, *p2, *offset) else {
+                return group;
+            };
+            let label = dimension_label(p1, p2, value);
+            group = group.add(
+                Line::new()
+                    .set("x1", d1[0])
+                    .set("y1", svg_y(d1[1]))
+                    .set("x2", d2[0])
+                    .set("y2", svg_y(d2[1])),
+            );
+            if let Some(text_style) =
+                project
+                    .styles
+                    .dimension_styles
+                    .get(style)
+                    .and_then(|dimension_style| {
+                        project.styles.text_styles.get(&dimension_style.text_style)
+                    })
+            {
+                group = group.add(text_node(
+                    &[(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+                    *text_rotation_deg,
+                    *text_mirror_y,
+                    &label,
+                    text_style,
+                    "middle",
+                    color,
+                ));
+            } else {
+                group = group.add(
                     Text::new("")
                         .set("x", (d1[0] + d2[0]) / 2.0)
                         .set("y", svg_y((d1[1] + d2[1]) / 2.0))
                         .set("fill", color)
                         .set("stroke", "none")
                         .set("font-size", 250)
+                        .set(
+                            "transform",
+                            text_transform_attr(
+                                *text_rotation_deg,
+                                *text_mirror_y,
+                                [(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+                            ),
+                        )
                         .add(svg::node::Text::new(label)),
                 );
+            }
         }
         Entity::BlockRef {
             block, at, scale, ..
@@ -610,6 +830,96 @@ fn render_overlay_entity(
     group
 }
 
+fn bbox_attr(bbox: BBox) -> String {
+    format!(
+        "{},{},{},{}",
+        cad_model::format_decimal_mm(bbox.min[0]),
+        cad_model::format_decimal_mm(bbox.min[1]),
+        cad_model::format_decimal_mm(bbox.max[0]),
+        cad_model::format_decimal_mm(bbox.max[1])
+    )
+}
+
+fn text_node(
+    at: &Point,
+    rotation_deg: f64,
+    mirror_y: bool,
+    value: &str,
+    style: &TextStyleDef,
+    anchor: &str,
+    color: &str,
+) -> Text {
+    Text::new("")
+        .set("x", at[0])
+        .set("y", svg_y(at[1]))
+        .set("fill", color)
+        .set("stroke", "none")
+        .set("font-family", style.font_family.clone())
+        .set("font-size", style.height)
+        .set("textLength", text_length(value, style))
+        .set("lengthAdjust", "spacingAndGlyphs")
+        .set("text-anchor", anchor)
+        .set(
+            "transform",
+            text_transform_attr(rotation_deg, mirror_y, *at),
+        )
+        .add(svg::node::Text::new(value.to_owned()))
+}
+
+fn text_length(value: &str, style: &TextStyleDef) -> f64 {
+    ((value.chars().count() as f64) * style.width + style.spacing).max(0.0)
+}
+
+fn text_anchor(align: &TextAlign) -> &'static str {
+    match align {
+        TextAlign::Left => "start",
+        TextAlign::Center => "middle",
+        TextAlign::Right => "end",
+    }
+}
+
+fn dimension_label(p1: &Point, p2: &Point, value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| {
+        cad_model::format_decimal_mm(((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt())
+    })
+}
+
+fn rotate_attr(rotation_deg: f64, at: Point) -> String {
+    format!(
+        "rotate({} {} {})",
+        normalize_zero(-rotation_deg),
+        at[0],
+        svg_y(at[1])
+    )
+}
+
+fn text_transform_attr(rotation_deg: f64, mirror_y: bool, at: Point) -> String {
+    if !mirror_y {
+        return rotate_attr(rotation_deg, at);
+    }
+    let screen_rotation = (-rotation_deg).to_radians();
+    let a = normalize_zero(screen_rotation.cos());
+    let b = normalize_zero(screen_rotation.sin());
+    let c = b;
+    let d = normalize_zero(-screen_rotation.cos());
+    let anchor = [at[0], svg_y(at[1])];
+    let e = normalize_zero(anchor[0] - (a * anchor[0] + c * anchor[1]));
+    let f = normalize_zero(anchor[1] - (b * anchor[0] + d * anchor[1]));
+    format!("matrix({a} {b} {c} {d} {e} {f})")
+}
+
+fn rotate_point(point: Point, origin: Point, rotation_deg: f64) -> Point {
+    let rad = rotation_deg.to_radians();
+    let cos = rad.cos();
+    let sin = rad.sin();
+    let dx = point[0] - origin[0];
+    let dy = point[1] - origin[1];
+    [
+        origin[0] + (dx * cos) - (dy * sin),
+        origin[1] + (dx * sin) + (dy * cos),
+    ]
+}
+
 fn path_from_points(points: &[Point], close: bool) -> Path {
     let Some(first) = points.first() else {
         return Path::new();
@@ -635,6 +945,35 @@ fn arc_path(center: Point, radius: f64, start_deg: f64, end_deg: f64) -> Path {
         Data::new()
             .move_to((start[0], svg_y(start[1])))
             .elliptical_arc_to((radius, radius, 0, large_arc, sweep, end[0], svg_y(end[1]))),
+    )
+}
+
+fn ellipse_arc_path(
+    center: Point,
+    radius_x: f64,
+    radius_y: f64,
+    rotation_deg: f64,
+    start_deg: f64,
+    end_deg: f64,
+) -> Path {
+    let start = cad_model::ellipse_point(center, radius_x, radius_y, rotation_deg, start_deg);
+    let end = cad_model::ellipse_point(center, radius_x, radius_y, rotation_deg, end_deg);
+    let delta = (end_deg - start_deg).abs();
+    let large_arc = if delta > 180.0 { 1 } else { 0 };
+    let sweep = if end_deg >= start_deg { 0 } else { 1 };
+    Path::new().set(
+        "d",
+        Data::new()
+            .move_to((start[0], svg_y(start[1])))
+            .elliptical_arc_to((
+                radius_x,
+                radius_y,
+                normalize_zero(-rotation_deg),
+                large_arc,
+                sweep,
+                end[0],
+                svg_y(end[1]),
+            )),
     )
 }
 
@@ -826,6 +1165,71 @@ mod tests {
         assert!(svg.contains("#00AA00"));
         assert!(svg.contains("#DD2222"));
         assert!(svg.contains("#D6B300"));
+        assert!(svg.contains("data-bbox="));
+    }
+
+    #[test]
+    fn svg_diff_uses_text_styles_for_overlay_bbox() {
+        let base = styled_bbox_project(false);
+        let head = styled_bbox_project(true);
+        let base = cad_model::load_project(base.path()).expect("base should load");
+        let head = cad_model::load_project(head.path()).expect("head should load");
+
+        let svg = diff_projects_svg(&base, &head);
+
+        assert!(svg.contains("data-bbox=\"10,20,95,50\""));
+        assert!(svg.contains("data-bbox=\"-12.5,0,112.5,50\""));
+        assert!(svg.contains("font-size=\"30\""));
+        assert!(svg.contains("textLength=\"85\""));
+        assert!(!svg.contains("data-bbox=\"10,20,310,270\""));
+    }
+
+    #[test]
+    fn ellipse_signature_and_svg_path_include_all_geometry() {
+        let entity: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[1.0,2.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
+        )
+        .expect("ellipse should parse");
+
+        let signature = entity_geometry_signature(&entity);
+        let path = ellipse_arc_path([1.0, 2.0], 8.0, 3.0, 45.0, 0.0, 180.0).to_string();
+
+        assert_eq!(signature, "ellipse:[1.0, 2.0]:8:3:45:0:180");
+        assert!(path.contains("A8,3,-45,0,0"));
+    }
+
+    #[test]
+    fn mirrored_text_and_dimension_metadata_affect_diff_geometry() {
+        let text: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
+        )
+        .expect("text should parse");
+        let dimension: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
+        )
+        .expect("dimension should parse");
+        let style = TextStyleDef {
+            font_family: "Hiragino Sans".to_owned(),
+            height: 2.5,
+            width: 1.25,
+            spacing: 0.0,
+            align: TextAlign::Left,
+        };
+
+        let node = text_node(
+            &[10.0, 20.0],
+            30.0,
+            true,
+            "mirror",
+            &style,
+            "start",
+            "#000000",
+        )
+        .to_string();
+
+        assert!(entity_geometry_signature(&text).ends_with(":true"));
+        assert!(entity_geometry_signature(&dimension).ends_with(":90:true"));
+        assert!(node.contains("transform=\"matrix("));
     }
 
     fn assert_change(report: &DiffReport, entity_id: &str, kind: ChangeKind) {
@@ -871,7 +1275,7 @@ mod tests {
         .expect("layers TOML should be writable");
         write(
             temp.path().join("rules/styles.toml"),
-            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
+            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nwidth = 125\nspacing = 0\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
         )
         .expect("styles TOML should be writable");
         write(
@@ -919,7 +1323,7 @@ mod tests {
         .expect("layers TOML should be writable");
         write(
             temp.path().join("rules/styles.toml"),
-            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nalign = \"left\"\n\n[text_styles.note_big]\nfont_family = \"Hiragino Sans\"\nheight = 300\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
+            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.note]\nfont_family = \"Hiragino Sans\"\nheight = 250\nwidth = 125\nspacing = 0\nalign = \"left\"\n\n[text_styles.note_big]\nfont_family = \"Hiragino Sans\"\nheight = 300\nwidth = 150\nspacing = 0\nalign = \"left\"\n\n[dimension_styles.dim_100]\ntext_style = \"note\"\narrow_size = 120\nextension_gap = 40\nprecision = 0\nunit = \"mm\"\n",
         )
         .expect("styles TOML should be writable");
         write(
@@ -938,6 +1342,50 @@ mod tests {
         };
         write(temp.path().join("drawings/plan_1f/entities.ndjson"), entity)
             .expect("entities NDJSON should be writable");
+
+        temp
+    }
+
+    fn styled_bbox_project(include_entities: bool) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        create_dir_all(temp.path().join("rules")).expect("rules dir should be created");
+        create_dir_all(temp.path().join("drawings/plan_1f"))
+            .expect("drawing dir should be created");
+
+        write(
+            temp.path().join("cad.project.toml"),
+            "schema_version = \"0.1\"\nname = \"styled-bbox-fixture\"\n",
+        )
+        .expect("project TOML should be writable");
+        write(
+            temp.path().join("rules/layers.toml"),
+            "[layers.\"0-1\"]\nname = \"A-NOTE\"\nvisible = true\nprintable = true\ncolor = \"jw_black\"\nline_type = \"solid\"\nline_width = 0.25\n",
+        )
+        .expect("layers TOML should be writable");
+        write(
+            temp.path().join("rules/styles.toml"),
+            "[colors.jw_black]\nrgb = \"#000000\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[text_styles.wide]\nfont_family = \"Hiragino Sans\"\nheight = 30\nwidth = 40\nspacing = 5\nalign = \"left\"\n\n[dimension_styles.dim_wide]\ntext_style = \"wide\"\narrow_size = 12\nextension_gap = 4\nprecision = 0\nunit = \"mm\"\n",
+        )
+        .expect("styles TOML should be writable");
+        write(
+            temp.path().join("drawings/plan_1f/sheet.toml"),
+            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+        )
+        .expect("sheet TOML should be writable");
+        let entities = if include_entities {
+            [
+                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"wide","at":[10.0,20.0],"rotation_deg":0.0,"value":"AB"}"#,
+                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_wide","p1":[0.0,0.0],"p2":[100.0,0.0],"offset":20.0,"value":"100"}"#,
+            ]
+            .join("\n")
+        } else {
+            String::new()
+        };
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            entities,
+        )
+        .expect("entities NDJSON should be writable");
 
         temp
     }

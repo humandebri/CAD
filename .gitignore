@@ -10,4 +10,8 @@ dist/
 **/exports/
 **/test-results/
 **/playwright-report/
+apps/viewer/src-tauri/gen/
+/test/
+.DS_Store
+*.pending-snap
 *.log

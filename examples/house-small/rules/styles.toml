@@ -8,6 +8,8 @@ dash = []
 [text_styles.note]
 font_family = "Hiragino Sans"
 height = 250
+width = 125
+spacing = 0
 align = "left"
 
 [dimension_styles.dim_100]
