@@ -19,6 +19,9 @@ IMPORT_PARENT="$(mktemp -d)"
 cargo run -p cad-cli -- import-jww examples/jww-fixtures/Test1.jww --out "$IMPORT_PARENT/test1_imported"
 cargo run -p cad-cli -- check "$IMPORT_PARENT/test1_imported" --format json --out "$IMPORT_PARENT/test1_imported/build/check.json"
 cargo run -p cad-cli -- render "$IMPORT_PARENT/test1_imported" --format svg --out "$IMPORT_PARENT/test1_imported/build/test1.svg"
+cargo run -p cad-cli -- export-jww "$IMPORT_PARENT/test1_imported" --drawing test1 --out "$IMPORT_PARENT/test1-exported.jww" --report "$IMPORT_PARENT/test1-export-report.json"
+cargo run -p cad-cli -- import-jww "$IMPORT_PARENT/test1-exported.jww" --out "$IMPORT_PARENT/test1_reimported"
+cargo run -p cad-cli -- check "$IMPORT_PARENT/test1_reimported" --format json --out "$IMPORT_PARENT/test1_reimported/build/check.json"
 cargo metadata --no-deps --format-version 1 >/dev/null
 
 pnpm --dir apps/viewer install

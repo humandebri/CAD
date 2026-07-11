@@ -4,7 +4,10 @@ members = [
     "crates/cad-check",
     "crates/cad-render-svg",
     "crates/cad-diff",
+    "crates/cad-jww-codec",
     "crates/cad-import-jww",
+    "crates/cad-export-jww",
+    "crates/cad-edit",
     "crates/cad-cli",
     "apps/viewer/src-tauri",
 ]
@@ -21,10 +24,14 @@ cad-model = { path = "crates/cad-model" }
 cad-check = { path = "crates/cad-check" }
 cad-render-svg = { path = "crates/cad-render-svg" }
 cad-diff = { path = "crates/cad-diff" }
+cad-jww-codec = { path = "crates/cad-jww-codec" }
 cad-import-jww = { path = "crates/cad-import-jww" }
+cad-export-jww = { path = "crates/cad-export-jww" }
+cad-edit = { path = "crates/cad-edit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+toml_edit = "0.25"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 miette = { version = "7", features = ["fancy"] }
@@ -35,6 +42,10 @@ svg = "0.18"
 insta = "1"
 encoding_rs = "0.8"
 chrono = "0.4.45"
+notify-debouncer-mini = "0.7"
+blake3 = "1.8.5"
+geo = { version = "0.33.1", default-features = false }
+rstar = "0.13.0"
 tauri = "2.11.5"
 tauri-build = "2.6.3"
 tauri-plugin-dialog = "2.7.1"

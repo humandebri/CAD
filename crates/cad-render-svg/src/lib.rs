@@ -33,6 +33,13 @@ pub enum RenderError {
     MissingLayer { entity_id: String, layer: String },
     #[error("entity {entity_id:?} references missing color {color:?}")]
     MissingColor { entity_id: String, color: String },
+    #[error("entity {entity_id:?} references missing pen {pen:?}")]
+    MissingPen { entity_id: String, pen: String },
+    #[error("entity {entity_id:?} references missing line type {line_type:?}")]
+    MissingLineType {
+        entity_id: String,
+        line_type: String,
+    },
     #[error("text entity {entity_id:?} references missing style {style:?}")]
     MissingTextStyle { entity_id: String, style: String },
     #[error("dimension entity {entity_id:?} references missing style {style:?}")]
@@ -81,7 +88,13 @@ pub fn render_drawing_svg(project: &ProjectSource, drawing_name: &str) -> Render
 fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult<Group> {
     let entity_id = record.entity.id().as_str().to_owned();
     let layer = resolve_layer(project, &record.entity)?;
-    let stroke = resolve_stroke(project, &entity_id, layer)?;
+    let layer_group = layer
+        .group
+        .as_ref()
+        .and_then(|group_id| project.layers.groups.get(group_id));
+    let visible = layer.visible && layer_group.is_none_or(|group| group.visible);
+    let locked = layer.locked || layer_group.is_some_and(|group| group.locked);
+    let stroke = resolve_stroke(project, &record.entity, layer)?;
     let bbox =
         render_entity_bbox(project, &record.entity).ok_or_else(|| RenderError::MissingBBox {
             entity_id: entity_id.clone(),
@@ -90,6 +103,8 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
     let mut group = Group::new()
         .set("data-entity-id", entity_id)
         .set("data-layer", record.entity.layer())
+        .set("data-layer-visible", visible)
+        .set("data-layer-locked", locked)
         .set(
             "data-bbox",
             format!(
@@ -100,6 +115,12 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                 cad_model::format_decimal_mm(bbox.max[1])
             ),
         );
+    if !stroke.dash.is_empty() {
+        group = group.set("stroke-dasharray", stroke.dash_attr());
+    }
+    if !visible {
+        group = group.set("style", "display:none");
+    }
 
     match &record.entity {
         Entity::Line { p1, p2, .. } => {
@@ -241,12 +262,31 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                         entity_id: record.entity.id().as_str().to_owned(),
                     }
                 })?;
+            let measured = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
             let label = value.clone().unwrap_or_else(|| {
-                cad_model::format_decimal_mm(
-                    ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt(),
+                format!(
+                    "{:.*} {}",
+                    usize::from(dimension_style.precision),
+                    measured,
+                    dimension_style.unit
                 )
             });
+            let extension_start = |source: Point, target: Point| {
+                let dx = target[0] - source[0];
+                let dy = target[1] - source[1];
+                let length = (dx * dx + dy * dy).sqrt();
+                if length <= f64::EPSILON {
+                    source
+                } else {
+                    let gap = dimension_style.extension_gap.min(length);
+                    [source[0] + dx / length * gap, source[1] + dy / length * gap]
+                }
+            };
+            let e1 = extension_start(*p1, d1);
+            let e2 = extension_start(*p2, d2);
             group = group
+                .add(stroked_line(e1, d1, &stroke))
+                .add(stroked_line(e2, d2, &stroke))
                 .add(
                     Line::new()
                         .set("x1", d1[0])
@@ -257,6 +297,18 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                         .set("stroke", stroke.color.clone())
                         .set("stroke-width", stroke.width_attr()),
                 )
+                .add(dimension_arrow(
+                    d1,
+                    d2,
+                    dimension_style.arrow_size,
+                    &stroke.color,
+                ))
+                .add(dimension_arrow(
+                    d2,
+                    d1,
+                    dimension_style.arrow_size,
+                    &stroke.color,
+                ))
                 .add(text_node_with_anchor(
                     &[(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
                     *text_rotation_deg,
@@ -266,6 +318,90 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                     "middle",
                     &stroke.color,
                 ));
+        }
+        Entity::Point {
+            at,
+            marker_code,
+            rotation_deg,
+            scale,
+            ..
+        } => {
+            let size = (2.5 * scale.abs()).max(0.5);
+            if marker_code.is_none() {
+                group = group.add(
+                    Circle::new()
+                        .set("cx", at[0])
+                        .set("cy", svg_y(at[1]))
+                        .set("r", size / 2.0)
+                        .set("fill", stroke.color.clone())
+                        .set("stroke", "none"),
+                );
+            } else {
+                group = group
+                    .add(
+                        Line::new()
+                            .set("x1", at[0] - size)
+                            .set("y1", svg_y(at[1]))
+                            .set("x2", at[0] + size)
+                            .set("y2", svg_y(at[1]))
+                            .set("transform", rotate_attr(*rotation_deg, *at))
+                            .set("stroke", stroke.color.clone())
+                            .set("stroke-width", stroke.width_attr()),
+                    )
+                    .add(
+                        Line::new()
+                            .set("x1", at[0])
+                            .set("y1", svg_y(at[1] - size))
+                            .set("x2", at[0])
+                            .set("y2", svg_y(at[1] + size))
+                            .set("transform", rotate_attr(*rotation_deg, *at))
+                            .set("stroke", stroke.color.clone())
+                            .set("stroke-width", stroke.width_attr()),
+                    );
+            }
+        }
+        Entity::Solid { points, fill, .. } => {
+            let fill = resolve_fill(project, &record.entity, fill)?;
+            let Some(first) = points.first() else {
+                return Err(RenderError::MissingBBox {
+                    entity_id: record.entity.id().as_str().to_owned(),
+                });
+            };
+            let mut data = Data::new().move_to((first[0], svg_y(first[1])));
+            for point in points.iter().skip(1) {
+                data = data.line_to((point[0], svg_y(point[1])));
+            }
+            group = group.add(
+                Path::new()
+                    .set("d", data.close())
+                    .set("fill", fill)
+                    .set("stroke", "none"),
+            );
+        }
+        Entity::CurveSolid {
+            center,
+            radius,
+            flatness,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            solid_param,
+            fill,
+            ..
+        } => {
+            let fill = resolve_fill(project, &record.entity, fill)?;
+            group = group.add(curve_solid_path(
+                CurveSolidGeometry {
+                    center: *center,
+                    radius_x: radius.abs(),
+                    radius_y: radius.abs() * flatness.abs(),
+                    rotation_deg: *rotation_deg,
+                    start_deg: *start_deg,
+                    end_deg: *end_deg,
+                    solid_param: *solid_param,
+                },
+                &fill,
+            ));
         }
         Entity::BlockRef {
             block,
@@ -282,6 +418,7 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                         .set("y1", svg_y(at[1]))
                         .set("x2", at[0] + size)
                         .set("y2", svg_y(at[1]))
+                        .set("transform", rotate_attr(*rotation_deg, *at))
                         .set("stroke", stroke.color.clone())
                         .set("stroke-width", stroke.width_attr()),
                 )
@@ -291,6 +428,7 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                         .set("y1", svg_y(at[1] - size))
                         .set("x2", at[0])
                         .set("y2", svg_y(at[1] + size))
+                        .set("transform", rotate_attr(*rotation_deg, *at))
                         .set("stroke", stroke.color.clone())
                         .set("stroke-width", stroke.width_attr()),
                 )
@@ -310,6 +448,43 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
     Ok(group)
 }
 
+fn stroked_line(start: Point, end: Point, stroke: &Stroke) -> Line {
+    Line::new()
+        .set("x1", start[0])
+        .set("y1", svg_y(start[1]))
+        .set("x2", end[0])
+        .set("y2", svg_y(end[1]))
+        .set("fill", "none")
+        .set("stroke", stroke.color.clone())
+        .set("stroke-width", stroke.width_attr())
+}
+
+fn dimension_arrow(tip: Point, toward: Point, size: f64, color: &str) -> Path {
+    let dx = toward[0] - tip[0];
+    let dy = toward[1] - tip[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f64::EPSILON || !size.is_finite() || size <= 0.0 {
+        return Path::new();
+    }
+    let ux = dx / length;
+    let uy = dy / length;
+    let base = [tip[0] + ux * size, tip[1] + uy * size];
+    let half = size * 0.35;
+    let left = [base[0] - uy * half, base[1] + ux * half];
+    let right = [base[0] + uy * half, base[1] - ux * half];
+    Path::new()
+        .set(
+            "d",
+            Data::new()
+                .move_to((tip[0], svg_y(tip[1])))
+                .line_to((left[0], svg_y(left[1])))
+                .line_to((right[0], svg_y(right[1])))
+                .close(),
+        )
+        .set("fill", color)
+        .set("stroke", "none")
+}
+
 fn resolve_layer<'a>(project: &'a ProjectSource, entity: &Entity) -> RenderResult<&'a LayerDef> {
     project
         .layers
@@ -323,22 +498,54 @@ fn resolve_layer<'a>(project: &'a ProjectSource, entity: &Entity) -> RenderResul
 
 fn resolve_stroke(
     project: &ProjectSource,
-    entity_id: &str,
+    entity: &Entity,
     layer: &LayerDef,
 ) -> RenderResult<Stroke> {
-    let color =
-        project
+    let entity_id = entity.id().as_str();
+    let (color_id, line_type_id, width) = if let Some(pen_id) = entity.pen() {
+        let pen = project
             .styles
-            .colors
-            .get(&layer.color)
-            .ok_or_else(|| RenderError::MissingColor {
+            .pens
+            .get(pen_id)
+            .ok_or_else(|| RenderError::MissingPen {
                 entity_id: entity_id.to_owned(),
-                color: layer.color.clone(),
+                pen: pen_id.to_owned(),
             })?;
+        (&pen.color, &pen.line_type, pen.line_width)
+    } else {
+        (&layer.color, &layer.line_type, layer.line_width)
+    };
+    let color = project
+        .styles
+        .colors
+        .get(color_id)
+        .ok_or_else(|| RenderError::MissingColor {
+            entity_id: entity_id.to_owned(),
+            color: color_id.clone(),
+        })?;
+    let line_type = project.styles.line_types.get(line_type_id).ok_or_else(|| {
+        RenderError::MissingLineType {
+            entity_id: entity_id.to_owned(),
+            line_type: line_type_id.clone(),
+        }
+    })?;
     Ok(Stroke {
         color: color.rgb.clone(),
-        width: layer.line_width,
+        width,
+        dash: line_type.dash.clone(),
     })
+}
+
+fn resolve_fill(project: &ProjectSource, entity: &Entity, fill: &str) -> RenderResult<String> {
+    project
+        .styles
+        .colors
+        .get(fill)
+        .map(|color| color.rgb.clone())
+        .ok_or_else(|| RenderError::MissingColor {
+            entity_id: entity.id().as_str().to_owned(),
+            color: fill.to_owned(),
+        })
 }
 
 fn text_node(
@@ -386,7 +593,8 @@ fn text_node_with_anchor(
 }
 
 fn text_length(value: &str, style: &TextStyleDef) -> f64 {
-    ((value.chars().count() as f64) * style.width + style.spacing).max(0.0)
+    let count = value.chars().count();
+    ((count as f64) * style.width + (count.saturating_sub(1) as f64) * style.spacing).max(0.0)
 }
 
 fn path_from_points(points: &[Point], close: bool, stroke: &Stroke) -> Path {
@@ -413,9 +621,19 @@ fn arc_path(center: Point, radius: f64, start_deg: f64, end_deg: f64, stroke: &S
     let delta = (end_deg - start_deg).abs();
     let large_arc = if delta > 180.0 { 1 } else { 0 };
     let sweep = if end_deg >= start_deg { 0 } else { 1 };
-    let data = Data::new()
-        .move_to((start[0], svg_y(start[1])))
-        .elliptical_arc_to((radius, radius, 0, large_arc, sweep, end[0], svg_y(end[1])));
+    let mut data = Data::new().move_to((start[0], svg_y(start[1])));
+    if delta >= 360.0 - 1e-9 {
+        let midpoint = polar_point(
+            center,
+            radius,
+            start_deg + if end_deg >= start_deg { 180.0 } else { -180.0 },
+        );
+        data = data
+            .elliptical_arc_to((radius, radius, 0, 1, sweep, midpoint[0], svg_y(midpoint[1])))
+            .elliptical_arc_to((radius, radius, 0, 1, sweep, start[0], svg_y(start[1])));
+    } else {
+        data = data.elliptical_arc_to((radius, radius, 0, large_arc, sweep, end[0], svg_y(end[1])));
+    }
     Path::new()
         .set("d", data)
         .set("fill", "none")
@@ -453,6 +671,120 @@ fn ellipse_arc_path(
         .set("fill", "none")
         .set("stroke", stroke.color.clone())
         .set("stroke-width", stroke.width_attr())
+}
+
+struct CurveSolidGeometry {
+    center: Point,
+    radius_x: f64,
+    radius_y: f64,
+    rotation_deg: f64,
+    start_deg: f64,
+    end_deg: f64,
+    solid_param: f64,
+}
+
+fn curve_solid_path(geometry: CurveSolidGeometry, fill: &str) -> Path {
+    let CurveSolidGeometry {
+        center,
+        radius_x,
+        radius_y,
+        rotation_deg,
+        start_deg,
+        end_deg,
+        solid_param,
+    } = geometry;
+    let full = (end_deg - start_deg).abs() >= 360.0 - 1e-9;
+    let start = cad_model::ellipse_point(center, radius_x, radius_y, rotation_deg, start_deg);
+    let end = cad_model::ellipse_point(center, radius_x, radius_y, rotation_deg, end_deg);
+    let delta = (end_deg - start_deg).abs();
+    let large_arc = i32::from(delta > 180.0);
+    let sweep = i32::from(end_deg < start_deg);
+    let mut data = Data::new().move_to((start[0], svg_y(start[1])));
+    if full {
+        let midpoint =
+            cad_model::ellipse_point(center, radius_x, radius_y, rotation_deg, start_deg + 180.0);
+        data = data
+            .elliptical_arc_to((
+                radius_x,
+                radius_y,
+                normalize_zero(-rotation_deg),
+                1,
+                sweep,
+                midpoint[0],
+                svg_y(midpoint[1]),
+            ))
+            .elliptical_arc_to((
+                radius_x,
+                radius_y,
+                normalize_zero(-rotation_deg),
+                1,
+                sweep,
+                start[0],
+                svg_y(start[1]),
+            ));
+    } else {
+        data = data.elliptical_arc_to((
+            radius_x,
+            radius_y,
+            normalize_zero(-rotation_deg),
+            large_arc,
+            sweep,
+            end[0],
+            svg_y(end[1]),
+        ));
+    }
+    if solid_param > 0.0 && solid_param < radius_x {
+        let ratio = solid_param / radius_x;
+        let inner_x = solid_param;
+        let inner_y = radius_y * ratio;
+        let inner_end = cad_model::ellipse_point(center, inner_x, inner_y, rotation_deg, end_deg);
+        let inner_start =
+            cad_model::ellipse_point(center, inner_x, inner_y, rotation_deg, start_deg);
+        data = data.line_to((inner_end[0], svg_y(inner_end[1])));
+        if full {
+            let inner_midpoint =
+                cad_model::ellipse_point(center, inner_x, inner_y, rotation_deg, start_deg + 180.0);
+            data = data
+                .elliptical_arc_to((
+                    inner_x,
+                    inner_y,
+                    normalize_zero(-rotation_deg),
+                    1,
+                    1 - sweep,
+                    inner_midpoint[0],
+                    svg_y(inner_midpoint[1]),
+                ))
+                .elliptical_arc_to((
+                    inner_x,
+                    inner_y,
+                    normalize_zero(-rotation_deg),
+                    1,
+                    1 - sweep,
+                    inner_start[0],
+                    svg_y(inner_start[1]),
+                ));
+        } else {
+            data = data.elliptical_arc_to((
+                inner_x,
+                inner_y,
+                normalize_zero(-rotation_deg),
+                large_arc,
+                1 - sweep,
+                inner_start[0],
+                svg_y(inner_start[1]),
+            ));
+        }
+        data = data.close();
+    } else if full {
+        data = data.close();
+    } else {
+        data = data.line_to((center[0], svg_y(center[1]))).close();
+    }
+    Path::new()
+        .set("d", data)
+        .set("fill", fill)
+        .set("fill-rule", "evenodd")
+        .set("stroke", "none")
 }
 
 fn points_attr(points: &[Point]) -> String {
@@ -519,11 +851,20 @@ fn text_anchor(align: &TextAlign) -> &'static str {
 struct Stroke {
     color: String,
     width: f64,
+    dash: Vec<f64>,
 }
 
 impl Stroke {
     fn width_attr(&self) -> String {
         format!("{}mm", cad_model::format_decimal_mm(self.width))
+    }
+
+    fn dash_attr(&self) -> String {
+        self.dash
+            .iter()
+            .map(|value| cad_model::format_decimal_mm(*value))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -763,6 +1104,38 @@ mod tests {
     }
 
     #[test]
+    fn group_visibility_and_lock_are_applied_without_changing_layer_flags() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).expect("example should load");
+        project.layers.groups.insert(
+            "group-a".to_owned(),
+            cad_model::LayerGroupDef {
+                name: "Group A".to_owned(),
+                order: 0,
+                scale_denominator: 100.0,
+                visible: false,
+                locked: true,
+            },
+        );
+        {
+            let layer = project.layers.layers.get_mut("0-1").expect("fixture layer");
+            layer.group = Some("group-a".to_owned());
+            layer.visible = true;
+            layer.locked = false;
+        }
+
+        let svg = render_project_svg(&project).expect("svg should render");
+
+        assert!(svg.contains("data-layer-locked=\"true\""));
+        assert!(svg.contains("data-layer-visible=\"false\""));
+        assert!(svg.contains("style=\"display:none\""));
+        let layer = project.layers.layers.get("0-1").expect("fixture layer");
+        assert!(layer.visible);
+        assert!(!layer.locked);
+    }
+
+    #[test]
     fn renders_representative_entities_snapshot() {
         let temp = fixture_project();
         let project = cad_model::load_project(temp.path()).expect("fixture should load");
@@ -772,28 +1145,32 @@ mod tests {
         insta::assert_snapshot!(svg, @r##"
 <svg data-drawing="plan_1f" data-paper-height-mm="297" data-paper-width-mm="420" height="100%" preserveAspectRatio="xMinYMin meet" viewBox="-2625 -31825 46750 34450" width="100%" xmlns="http://www.w3.org/2000/svg">
 <g id="plan_1f">
-<g data-bbox="0,0,910,0" data-entity-id="ent_01JZ0000000000000000000000" data-layer="0-1">
+<g data-bbox="0,0,910,0" data-entity-id="ent_01JZ0000000000000000000000" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
 <line fill="none" stroke="#000000" stroke-width="0.25mm" x1="0" x2="910" y1="0" y2="0"/>
 </g>
-<g data-bbox="-500,-500,500,500" data-entity-id="ent_01JZ0000000000000000000001" data-layer="0-1">
+<g data-bbox="-500,-500,500,500" data-entity-id="ent_01JZ0000000000000000000001" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
 <path d="M500,0 A500,500,0,0,0,0,-500" fill="none" stroke="#000000" stroke-width="0.25mm"/>
 </g>
-<g data-bbox="100,200,600,450" data-entity-id="ent_01JZ0000000000000000000002" data-layer="0-1">
+<g data-bbox="100,200,600,450" data-entity-id="ent_01JZ0000000000000000000002" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
 <text fill="#000000" font-family="Hiragino Sans" font-size="250" lengthAdjust="spacingAndGlyphs" text-anchor="start" textLength="500" transform="rotate(0 100 -200)" x="100" y="-200">
 
 note
 </text>
 </g>
-<g data-bbox="0,0,910,370" data-entity-id="ent_01JZ0000000000000000000003" data-layer="0-1">
+<g data-bbox="0,0,910,370" data-entity-id="ent_01JZ0000000000000000000003" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
+<line fill="none" stroke="#000000" stroke-width="0.25mm" x1="0" x2="0" y1="-40" y2="-120"/>
+<line fill="none" stroke="#000000" stroke-width="0.25mm" x1="910" x2="910" y1="-40" y2="-120"/>
 <line fill="none" stroke="#000000" stroke-width="0.25mm" x1="0" x2="910" y1="-120" y2="-120"/>
-<text fill="#000000" font-family="Hiragino Sans" font-size="250" lengthAdjust="spacingAndGlyphs" text-anchor="middle" textLength="375" transform="rotate(0 455 -120)" x="455" y="-120">
+<path d="M0,-120 L120,-162 L120,-78 z" fill="#000000" stroke="none"/>
+<path d="M910,-120 L790,-78 L790,-162 z" fill="#000000" stroke="none"/>
+<text fill="#000000" font-family="Hiragino Sans" font-size="250" lengthAdjust="spacingAndGlyphs" text-anchor="middle" textLength="750" transform="rotate(0 455 -120)" x="455" y="-120">
 
-910
+910 mm
 </text>
 </g>
-<g data-bbox="455,0,455,0" data-entity-id="ent_01JZ0000000000000000000004" data-layer="0-1">
-<line stroke="#000000" stroke-width="0.25mm" x1="355" x2="555" y1="0" y2="0"/>
-<line stroke="#000000" stroke-width="0.25mm" x1="455" x2="455" y1="100" y2="-100"/>
+<g data-bbox="452.5,-2.5,457.5,2.5" data-entity-id="ent_01JZ0000000000000000000004" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
+<line stroke="#000000" stroke-width="0.25mm" transform="rotate(0 455 0)" x1="355" x2="555" y1="0" y2="0"/>
+<line stroke="#000000" stroke-width="0.25mm" transform="rotate(0 455 0)" x1="455" x2="455" y1="100" y2="-100"/>
 <text fill="#000000" font-size="250" text-anchor="middle" transform="rotate(0 455 0)" x="455" y="-150">
 
 door_910
@@ -824,6 +1201,26 @@ door_910
         assert!(svg.contains("transform=\"rotate(-30 10 -20)\""));
         assert!(svg.contains("A8,3,-45,0,0"));
         assert!(svg.contains("data-bbox="));
+    }
+
+    #[test]
+    fn full_curve_solid_ring_uses_two_arcs_for_each_boundary() {
+        let path = curve_solid_path(
+            CurveSolidGeometry {
+                center: [0.0, 0.0],
+                radius_x: 10.0,
+                radius_y: 5.0,
+                rotation_deg: 0.0,
+                start_deg: 0.0,
+                end_deg: 360.0,
+                solid_param: 4.0,
+            },
+            "#000000",
+        )
+        .to_string();
+
+        assert_eq!(path.matches('A').count(), 4);
+        assert!(path.contains("fill-rule=\"evenodd\""));
     }
 
     #[test]

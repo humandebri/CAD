@@ -71,6 +71,31 @@ test("serializes writes and keeps only the latest pending selection", async () =
   expect(failed).toEqual([]);
 });
 
+test("publishes selection clearing after an older write finishes", async () => {
+  const calls: string[] = [];
+  const selected = deferred<AiContextState>();
+  const cleared = deferred<AiContextState>();
+  const invoke: InvokeAiContext = async (_command, args) => {
+    const selectedEntityId = args.selectedEntityId;
+    if (typeof selectedEntityId !== "string") {
+      throw new Error("selectedEntityId must be a string");
+    }
+    calls.push(selectedEntityId);
+    return selectedEntityId === "A" ? selected.promise : cleared.promise;
+  };
+  const queue = new LatestAiContextWriteQueue(invoke);
+  const completed: string[] = [];
+
+  queue.enqueue(request("A"), () => completed.push("A"), () => undefined);
+  queue.enqueue(request(""), () => completed.push("cleared"), () => undefined);
+
+  expect(calls).toEqual(["A"]);
+  selected.resolve(readyState("A"));
+  await expect.poll(() => calls).toEqual(["A", ""]);
+  cleared.resolve({ status: "no_entity_selected", message: "no entity selected" });
+  await expect.poll(() => completed).toEqual(["cleared"]);
+});
+
 function request(selectedEntityId: string) {
   return {
     projectPath: "/tmp/project",

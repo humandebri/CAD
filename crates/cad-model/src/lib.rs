@@ -126,13 +126,33 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LayerRules {
+    #[serde(default)]
+    pub groups: BTreeMap<String, LayerGroupDef>,
+    #[serde(default)]
+    pub active_layer: Option<String>,
     pub layers: BTreeMap<String, LayerDef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayerGroupDef {
+    pub name: String,
+    pub order: u16,
+    pub scale_denominator: f64,
+    pub visible: bool,
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LayerDef {
     pub name: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub order: u16,
+    #[serde(default)]
+    pub locked: bool,
     pub visible: bool,
     pub printable: bool,
     pub color: String,
@@ -145,6 +165,8 @@ pub struct LayerDef {
 pub struct StyleRules {
     pub colors: BTreeMap<String, ColorDef>,
     pub line_types: BTreeMap<String, LineTypeDef>,
+    #[serde(default)]
+    pub pens: BTreeMap<String, PenStyleDef>,
     pub text_styles: BTreeMap<String, TextStyleDef>,
     pub dimension_styles: BTreeMap<String, DimensionStyleDef>,
 }
@@ -160,6 +182,14 @@ pub struct ColorDef {
 #[serde(deny_unknown_fields)]
 pub struct LineTypeDef {
     pub dash: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PenStyleDef {
+    pub color: String,
+    pub line_type: String,
+    pub line_width: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -214,6 +244,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         p1: Point,
         p2: Point,
     },
@@ -221,6 +253,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         points: Vec<Point>,
         closed: bool,
     },
@@ -228,6 +262,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         center: Point,
         radius: f64,
         start_deg: f64,
@@ -237,6 +273,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         center: Point,
         radius: f64,
     },
@@ -244,6 +282,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         center: Point,
         radius_x: f64,
         radius_y: f64,
@@ -255,6 +295,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         style: String,
         at: Point,
         rotation_deg: f64,
@@ -266,6 +308,8 @@ pub enum Entity {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         style: String,
         p1: Point,
         p2: Point,
@@ -276,10 +320,53 @@ pub enum Entity {
         text_mirror_y: bool,
         value: Option<String>,
     },
+    Point {
+        schema_version: String,
+        id: EntityId,
+        layer: String,
+        #[serde(default)]
+        pen: Option<String>,
+        at: Point,
+        #[serde(default)]
+        temporary: bool,
+        #[serde(default)]
+        marker_code: Option<u32>,
+        #[serde(default)]
+        rotation_deg: f64,
+        #[serde(default = "default_entity_scale")]
+        scale: f64,
+    },
+    Solid {
+        schema_version: String,
+        id: EntityId,
+        layer: String,
+        #[serde(default)]
+        pen: Option<String>,
+        points: Vec<Point>,
+        fill: String,
+    },
+    CurveSolid {
+        schema_version: String,
+        id: EntityId,
+        layer: String,
+        #[serde(default)]
+        pen: Option<String>,
+        center: Point,
+        radius: f64,
+        flatness: f64,
+        rotation_deg: f64,
+        start_deg: f64,
+        end_deg: f64,
+        solid_param: f64,
+        encoding_code: u16,
+        fill: String,
+    },
     BlockRef {
         schema_version: String,
         id: EntityId,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         block: String,
         at: Point,
         rotation_deg: f64,
@@ -298,6 +385,9 @@ impl Entity {
             | Self::Ellipse { id, .. }
             | Self::Text { id, .. }
             | Self::Dimension { id, .. }
+            | Self::Point { id, .. }
+            | Self::Solid { id, .. }
+            | Self::CurveSolid { id, .. }
             | Self::BlockRef { id, .. } => id,
         }
     }
@@ -312,6 +402,9 @@ impl Entity {
             | Self::Ellipse { schema_version, .. }
             | Self::Text { schema_version, .. }
             | Self::Dimension { schema_version, .. }
+            | Self::Point { schema_version, .. }
+            | Self::Solid { schema_version, .. }
+            | Self::CurveSolid { schema_version, .. }
             | Self::BlockRef { schema_version, .. } => schema_version,
         }
     }
@@ -326,9 +419,32 @@ impl Entity {
             | Self::Ellipse { layer, .. }
             | Self::Text { layer, .. }
             | Self::Dimension { layer, .. }
+            | Self::Point { layer, .. }
+            | Self::Solid { layer, .. }
+            | Self::CurveSolid { layer, .. }
             | Self::BlockRef { layer, .. } => layer,
         }
     }
+
+    #[must_use]
+    pub fn pen(&self) -> Option<&str> {
+        match self {
+            Self::Line { pen, .. }
+            | Self::Polyline { pen, .. }
+            | Self::Arc { pen, .. }
+            | Self::Circle { pen, .. }
+            | Self::Ellipse { pen, .. }
+            | Self::Text { pen, .. }
+            | Self::Dimension { pen, .. }
+            | Self::Point { pen, .. }
+            | Self::BlockRef { pen, .. } => pen.as_deref(),
+            Self::Solid { pen, .. } | Self::CurveSolid { pen, .. } => pen.as_deref(),
+        }
+    }
+}
+
+fn default_entity_scale() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -407,7 +523,38 @@ pub fn entity_bbox(entity: &Entity) -> Option<BBox> {
             *start_deg,
             *end_deg,
         ),
-        Entity::Text { at, .. } | Entity::BlockRef { at, .. } => BBox::from_points(&[*at]),
+        Entity::Solid { points, .. } => BBox::from_points(points),
+        Entity::CurveSolid {
+            center,
+            radius,
+            flatness,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            ..
+        } => ellipse_bbox(
+            *center,
+            radius.abs(),
+            radius.abs() * flatness.abs(),
+            *rotation_deg,
+            *start_deg,
+            *end_deg,
+        ),
+        Entity::Text { at, .. } => BBox::from_points(&[*at]),
+        Entity::Point { at, scale, .. } => {
+            let radius = 2.5 * scale.abs();
+            BBox::from_points(&[
+                [at[0] - radius, at[1] - radius],
+                [at[0] + radius, at[1] + radius],
+            ])
+        }
+        Entity::BlockRef { at, scale, .. } => {
+            let radius = 2.5 * scale.abs();
+            BBox::from_points(&[
+                [at[0] - radius, at[1] - radius],
+                [at[0] + radius, at[1] + radius],
+            ])
+        }
     }
 }
 

@@ -40,6 +40,20 @@ test("reviews generated artifacts", async ({ page }) => {
   );
 });
 
+test("layer workspace hides and restores visible geometry", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+  const entity = page.locator('.drawing-stage [data-layer="0-1"]').first();
+  await expect(entity).toBeAttached();
+  await expect.poll(() => entity.evaluate((element) => (element as SVGElement).style.display)).toBe("");
+  await page.getByRole("button", { name: "Hide 0-1" }).click();
+  await expect.poll(() => entity.evaluate((element) => (element as SVGElement).style.display)).toBe("none");
+  await page.getByRole("button", { name: "Show 0-1" }).click();
+  await expect.poll(() => entity.evaluate((element) => (element as SVGElement).style.display)).toBe("");
+  await page.getByRole("searchbox", { name: "Filter layers" }).fill("missing");
+  await expect(page.getByRole("button", { name: "Hide 0-1" })).toHaveCount(0);
+});
+
 test("wheel zooms beyond 800 percent and previous view restores the burst", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Sheet" }).click();

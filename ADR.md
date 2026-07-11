@@ -105,6 +105,11 @@ block_ref
 - 線幅は色/レイヤ定義から解決し、エンティティごとの `line_width` override はMVPで入れない。
 - 文字スタイルと寸法スタイルはstyle ID参照にする。
 
+Post-MVPのPhase 9Bでは、JWW境界形式の忠実度を上げるためentity別の
+optional pen参照を追加する。未指定entityは従来どおりlayer定義へfallback
+する。layer group、表示順、縮尺、表示状態、lock、active layerも
+`layers.toml`の正本属性として保持する。
+
 ### Checker
 
 - `cadc check` は標準で厳格モードにする。
@@ -120,6 +125,7 @@ block_ref
 - PDF直接出力、DXF export、JWW import/export、DWG import/exportはPost-MVP。
 - MVPに意味付き図面diff + SVG重ね表示を入れる。
 - diffはNDJSONの永続IDを使う。図形生成時にIDを発行し、座標や属性変更ではIDを変えない。
+- semantic diff JSON schema `0.2` はentity差分に加えてproject、sheet、layer、pen、style、block定義の設定差分を型付きで表現する。
 - SVGには `data-entity-id`、`data-layer`、`data-bbox` などのメタ情報を埋める。
 - 見た目diffでは追加、削除、変更、線幅変更、文字bbox重なり、用紙外を扱う。
 
@@ -129,6 +135,10 @@ block_ref
 - CAD側にoperationログ、独自Undo、独自トランザクションは入れない。
 - 事故防止はGit、`cadc format`、`cadc check`、`cadc render`、`cadc diff`、人間レビューに寄せる。
 - AI編集後にタイムラグなく確認したい要求は重要。MVPでは生成済みSVG/JSONをviewerで見る。Post-MVPでファイル監視、`cadc serve`、またはdesktop app統合により低遅延プレビューを実現する。
+
+Phase 9CではDesktop GUIもNDJSONを直接編集する。AI編集とGUI編集の上書き競合を
+避けるため、操作開始時のdrawing byte revisionを保存時に照合し、不一致なら変更を
+拒否して再読込する。GUI独自のoperation log、undo、backupは追加しない。
 
 ### Viewer
 
@@ -197,3 +207,11 @@ lucide-preact
 - MVPは「CADとして編集できるGUI」ではなく、「AIが編集したNDJSON図面を厳格に検査し、SVGで確認し、意味付き差分をレビューする環境」になる。
 - 低遅延プレビュー要求は強いが、MVPではローカルAPIを入れないため、自動再生成やファイル監視はPost-MVPで扱う。
 - JWW/DXF/PDF/DWGを境界形式に回すことで、正本スキーマ、checker、SVG renderer、diffに集中できる。
+
+## Post-MVP Decision: JWW Codec And Experimental Export
+
+- JWWは正本にせず、NDJSON/TOMLとの境界形式として扱う。
+- importとversion 600 exportは共有Rust codecを使い、外部CAD processへ依存しない。
+- JWW再import時のstable entity IDと無劣化往復は保証しない。
+- exportはstrictを既定とし、lossy変換は明示指定とreportを必須にする。
+- Windows版Jw_cadとライセンス確認済みsolid fixtureで検証するまでExperimentalと表示する。

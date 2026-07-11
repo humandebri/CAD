@@ -1,21 +1,21 @@
 [package]
-name = "cad-import-jww"
+name = "cad-edit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cad-jww-codec.workspace = true
+blake3.workspace = true
+cad-check.workspace = true
 cad-model.workspace = true
+geo.workspace = true
+rstar.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
-cad-check.workspace = true
-cad-render-svg.workspace = true
-insta.workspace = true
 tempfile.workspace = true

@@ -311,13 +311,46 @@ Status: implemented
 - AI context書込をlatest-only直列queueへ通し、連続選択時の逆順完了を防ぐ。
 - Git HEAD展開はNUL区切りpathを使い、日本語project pathを保持する。
 
-### Phase 9: Low-latency Preview
+### Phase 9A: Low-latency Live Preview
 
-- ファイル監視を追加する。
-- NDJSON/TOML変更時に `check/render/diff` を自動再実行する。
-- desktop commandの再実行をdebounceする。
-- viewerのartifact更新を低遅延化する。
+Status: implemented
+
+- desktopで正本TOML/NDJSONの変更を250ms debounceで監視する。
+- 変更時に既存 `run_review` をlatest-only直列queueで自動再実行する。
+- `build/`、`.git/`、editor一時ファイルは監視対象外にする。
+- 一時的な読込失敗では最後の正常artifactを維持し、次の変更で自動回復する。
+- 同一project・view modeではzoom、previous view、有効なentity選択を維持する。
+- toolbarへlive review状態を表示し、手動 `Re-run Review` は復旧用に残す。
+
+### Phase 9B: JWW Fidelity, Layer Workspace, Experimental Export
+
+Status: implemented, pending Windows Jw_cad and licensed solid fixture validation
+
+- JWW reader/writerを共有する `cad-jww-codec` を追加し、version 600 exportを実装する。
+- entity別pen、layer group、表示順、縮尺、表示・lock状態、active layerを正本schemaへ追加する。
+- JWW point、polygon solid、curve solidをimport/render/check/diff/exportへ追加する。
+- 16x16レイヤパレット、検索、使用中filter、group切替、単独表示、lock、active layerを追加する。
+- layer操作を `toml_edit` で `rules/layers.toml` へ原子的に保存する。
+- `cadc export-jww` とDesktopの `Export JWW (Experimental)` を追加する。
+- strict exportは表現不能要素をblockerにし、lossy exportは欠落・代替をreportへ記録する。
+- JWW再import時のentity ID維持は保証しない。
+- Windows版Jw_cad実機確認と、ライセンス確認済みsolid fixtureの検証完了までExperimentalを維持する。
+
+### Phase 9C: Direct Drafting And Entity Editing
+
+Status: implemented
+
+- current drawing切替とdrawing単位のrender/diff/edit stateを追加する。
+- `cad-edit`でrevision付きNDJSON編集、原子的publish、checker回帰防止を実装する。
+- property編集、数値/drag移動、複製、削除を追加する。
+- line、polyline、circle、arc、text、dimension、pointの新規作図を追加する。
+- endpoint、midpoint、line intersection snapを追加する。
+- AIや外部editorとの競合は`revision_conflict`で拒否する。
+
+### Phase 9D: Comment Workflow
+
 - コメント作成とstatus変更を追加する。
+- コメントNDJSONの競合と原子的書込を定義する。
 
 ### Phase 10: Desktop Distribution
 
@@ -327,7 +360,7 @@ Status: implemented
 
 - DXF exportを追加する。
 - PDF exportを追加する。
-- JWW exportを追加する。
+- JWW exportの互換検証を完了し、Experimental表示を解除する。
 - DWG対応は商用SDK境界を調査してから判断する。
 
 ### Phase 12: QCAD Integration

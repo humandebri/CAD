@@ -8,7 +8,7 @@ import {
   type DiffReport,
   type CheckReport,
 } from "../../src/artifacts";
-import { type InvokeReview, loadArtifactsFromDesktop } from "../../src/desktop-loader";
+import { type InvokeReview, loadReviewSnapshotFromDesktop } from "../../src/desktop-loader";
 
 const checkReport: CheckReport = {
   schema_version: "0.1",
@@ -17,7 +17,7 @@ const checkReport: CheckReport = {
 };
 
 const diffReport: DiffReport = {
-  schema_version: "0.1",
+  schema_version: "0.2",
   status: "ok",
   changes: [
     {
@@ -28,11 +28,15 @@ const diffReport: DiffReport = {
     },
   ],
   warnings: [],
+  configuration_changes: [],
 };
 
 test("loads desktop artifacts through run_review invoke", async () => {
   const calls: { command: string; args: Record<string, unknown> }[] = [];
   const review: DesktopReviewArtifacts = {
+    project_name: "reviewed-project",
+    drawing_names: ["plan_1f"],
+    current_drawing: "plan_1f",
     sheet_svg: "<svg><g /></svg>",
     diff_svg: null,
     check: checkReport,
@@ -47,35 +51,47 @@ test("loads desktop artifacts through run_review invoke", async () => {
       },
     ],
     diff_unavailable: null,
+    layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
+    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [] },
   };
   const invoke: InvokeReview = async (command, args) => {
     calls.push({ command, args });
     return review;
   };
 
-  const artifacts = await loadArtifactsFromDesktop("/tmp/project", (svg) => `safe:${svg}`, invoke);
+  const snapshot = await loadReviewSnapshotFromDesktop(
+    "/tmp/project",
+    (svg) => `safe:${svg}`,
+    invoke,
+  );
 
   expect(calls).toEqual([{ command: "run_review", args: { projectPath: "/tmp/project" } }]);
-  expect(artifacts.sheetSvg).toBe("safe:<svg><g /></svg>");
-  expect(artifacts.diffSvg).toBe("safe:<svg><g /></svg>");
-  expect(artifacts.diff.changes).toHaveLength(1);
-  expect(artifacts.comments).toHaveLength(1);
+  expect(snapshot.projectName).toBe("reviewed-project");
+  expect(snapshot.artifacts.sheetSvg).toBe("safe:<svg><g /></svg>");
+  expect(snapshot.artifacts.diffSvg).toBe("");
+  expect(snapshot.artifacts.diff.changes).toHaveLength(1);
+  expect(snapshot.artifacts.comments).toHaveLength(1);
 });
 
 test("marks diff unavailable when desktop command has no diff report", async () => {
   const review: DesktopReviewArtifacts = {
+    project_name: "reviewed-project",
+    drawing_names: ["plan_1f"],
+    current_drawing: "plan_1f",
     sheet_svg: "<svg />",
     diff_svg: null,
     check: checkReport,
     diff: null,
     comments: [],
     diff_unavailable: "project has no tracked files in Git",
+    layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
+    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [] },
   };
   const invoke: InvokeReview = async () => review;
 
-  const artifacts = await loadArtifactsFromDesktop("/tmp/project", (svg) => svg, invoke);
+  const snapshot = await loadReviewSnapshotFromDesktop("/tmp/project", (svg) => svg, invoke);
 
-  expect(artifacts.diff.status).toBe("warning");
-  expect(artifacts.diff.changes).toEqual([]);
-  expect(artifacts.diffUnavailable).toBe("project has no tracked files in Git");
+  expect(snapshot.artifacts.diff.status).toBe("warning");
+  expect(snapshot.artifacts.diff.changes).toEqual([]);
+  expect(snapshot.artifacts.diffUnavailable).toBe("project has no tracked files in Git");
 });

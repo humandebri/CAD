@@ -103,12 +103,40 @@ impl<'a> Checker<'a> {
     }
 
     fn check(&mut self) {
+        if self.project.drawings.is_empty() {
+            self.push_diagnostic(
+                "drawings",
+                "project.missing_drawing",
+                None,
+                "project must contain at least one drawing".to_owned(),
+            );
+        }
         self.check_layer_definitions();
+        self.check_style_definitions();
+        self.check_sheets();
         self.check_entities();
     }
 
     fn check_layer_definitions(&mut self) {
+        if let Some(active_layer) = &self.project.layers.active_layer
+            && !self.project.layers.layers.contains_key(active_layer)
+        {
+            self.push_project(
+                "reference.undefined_active_layer",
+                Some("active_layer".to_owned()),
+                format!("active_layer references undefined layer {active_layer:?}"),
+            );
+        }
         for (layer_id, layer) in &self.project.layers.layers {
+            if let Some(group) = &layer.group
+                && !self.project.layers.groups.contains_key(group)
+            {
+                self.push_project(
+                    "reference.undefined_layer_group",
+                    Some(format!("layers.{layer_id}.group")),
+                    format!("layer {layer_id:?} references undefined group {group:?}"),
+                );
+            }
             if !self.project.styles.colors.contains_key(&layer.color) {
                 self.push_project(
                     "reference.undefined_color",
@@ -134,11 +162,161 @@ impl<'a> Checker<'a> {
                     ),
                 );
             }
-            if layer.line_width <= 0.0 {
+            if !layer.line_width.is_finite() || layer.line_width <= 0.0 {
                 self.push_project(
                     "layer.invalid_line_width",
                     Some(format!("layers.{layer_id}.line_width")),
                     format!("layer {layer_id:?} has non-positive line_width"),
+                );
+            }
+        }
+        for (group_id, group) in &self.project.layers.groups {
+            if !group.scale_denominator.is_finite() || group.scale_denominator <= 0.0 {
+                self.push_project(
+                    "layer_group.invalid_scale_denominator",
+                    Some(format!("groups.{group_id}.scale_denominator")),
+                    format!("layer group {group_id:?} has a non-finite or non-positive scale"),
+                );
+            }
+        }
+        for (pen_id, pen) in &self.project.styles.pens {
+            if !self.project.styles.colors.contains_key(&pen.color) {
+                self.push_project(
+                    "reference.undefined_pen_color",
+                    Some(format!("pens.{pen_id}.color")),
+                    format!("pen {pen_id:?} references undefined color {:?}", pen.color),
+                );
+            }
+            if !self.project.styles.line_types.contains_key(&pen.line_type) {
+                self.push_project(
+                    "reference.undefined_pen_line_type",
+                    Some(format!("pens.{pen_id}.line_type")),
+                    format!(
+                        "pen {pen_id:?} references undefined line type {:?}",
+                        pen.line_type
+                    ),
+                );
+            }
+            if !pen.line_width.is_finite() || pen.line_width <= 0.0 {
+                self.push_project(
+                    "pen.invalid_line_width",
+                    Some(format!("pens.{pen_id}.line_width")),
+                    format!("pen {pen_id:?} has non-positive line_width"),
+                );
+            }
+        }
+    }
+
+    fn check_style_definitions(&mut self) {
+        for (color_id, color) in &self.project.styles.colors {
+            if !is_rgb_hex(&color.rgb) {
+                self.push_style(
+                    "style.invalid_rgb",
+                    Some(format!("colors.{color_id}.rgb")),
+                    format!("color {color_id:?} must use #RRGGBB"),
+                );
+            }
+            if !color.print_width.is_finite() || color.print_width <= 0.0 {
+                self.push_style(
+                    "style.invalid_print_width",
+                    Some(format!("colors.{color_id}.print_width")),
+                    format!("color {color_id:?} has a non-finite or non-positive print width"),
+                );
+            }
+        }
+        for (line_type_id, line_type) in &self.project.styles.line_types {
+            if line_type
+                .dash
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                self.push_style(
+                    "style.invalid_dash",
+                    Some(format!("line_types.{line_type_id}.dash")),
+                    format!(
+                        "line type {line_type_id:?} contains a non-finite or non-positive dash"
+                    ),
+                );
+            }
+        }
+        for (style_id, style) in &self.project.styles.text_styles {
+            if style.font_family.trim().is_empty()
+                || !style.height.is_finite()
+                || style.height <= 0.0
+                || !style.width.is_finite()
+                || style.width <= 0.0
+                || !style.spacing.is_finite()
+                || style.spacing < 0.0
+            {
+                self.push_style(
+                    "style.invalid_text_style",
+                    Some(format!("text_styles.{style_id}")),
+                    format!("text style {style_id:?} has invalid font or metrics"),
+                );
+            }
+        }
+        for (style_id, style) in &self.project.styles.dimension_styles {
+            if !self
+                .project
+                .styles
+                .text_styles
+                .contains_key(&style.text_style)
+            {
+                self.push_style(
+                    "reference.undefined_dimension_text_style",
+                    Some(format!("dimension_styles.{style_id}.text_style")),
+                    format!(
+                        "dimension style {style_id:?} references undefined text style {:?}",
+                        style.text_style
+                    ),
+                );
+            }
+            if !style.arrow_size.is_finite()
+                || style.arrow_size <= 0.0
+                || !style.extension_gap.is_finite()
+                || style.extension_gap < 0.0
+                || style.unit.trim().is_empty()
+            {
+                self.push_style(
+                    "style.invalid_dimension_style",
+                    Some(format!("dimension_styles.{style_id}")),
+                    format!("dimension style {style_id:?} has invalid metrics or unit"),
+                );
+            }
+        }
+    }
+
+    fn check_sheets(&mut self) {
+        for drawing in &self.project.drawings {
+            let file = format!("drawings/{}/sheet.toml", drawing.name);
+            if !matches!(
+                drawing.sheet.paper.as_str(),
+                "A0" | "A1" | "A2" | "A3" | "A4"
+            ) {
+                self.push_diagnostic(
+                    &file,
+                    "sheet.invalid_paper",
+                    Some("paper".to_owned()),
+                    format!(
+                        "unsupported paper {:?}; expected A0 through A4",
+                        drawing.sheet.paper
+                    ),
+                );
+            }
+            if parse_scale(&drawing.sheet.scale).is_none() {
+                self.push_diagnostic(
+                    &file,
+                    "sheet.invalid_scale",
+                    Some("scale".to_owned()),
+                    "scale must be a finite positive ratio such as 1:100".to_owned(),
+                );
+            }
+            if drawing.sheet.origin.iter().any(|value| !value.is_finite()) {
+                self.push_diagnostic(
+                    &file,
+                    "sheet.invalid_origin",
+                    Some("origin".to_owned()),
+                    "origin coordinates must be finite".to_owned(),
                 );
             }
         }
@@ -185,6 +363,17 @@ impl<'a> Checker<'a> {
                 format!("entity references undefined layer {layer:?}"),
             );
         }
+        if let Some(pen) = record.entity.pen()
+            && !self.project.styles.pens.contains_key(pen)
+        {
+            self.push_entity(
+                file,
+                record,
+                "reference.undefined_pen",
+                Some("pen"),
+                format!("entity references undefined pen {pen:?}"),
+            );
+        }
 
         match &record.entity {
             Entity::Text { style, .. } => {
@@ -220,11 +409,23 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            Entity::Solid { fill, .. } | Entity::CurveSolid { fill, .. } => {
+                if !self.project.styles.colors.contains_key(fill) {
+                    self.push_entity(
+                        file,
+                        record,
+                        "reference.undefined_fill",
+                        Some("fill"),
+                        format!("solid entity references undefined fill color {fill:?}"),
+                    );
+                }
+            }
             Entity::Line { .. }
             | Entity::Polyline { .. }
             | Entity::Arc { .. }
             | Entity::Circle { .. }
-            | Entity::Ellipse { .. } => {}
+            | Entity::Ellipse { .. }
+            | Entity::Point { .. } => {}
         }
     }
 
@@ -260,7 +461,7 @@ impl<'a> Checker<'a> {
                 end_deg,
                 ..
             } => {
-                if *radius <= EPSILON_MM {
+                if !radius.is_finite() || *radius <= EPSILON_MM {
                     self.push_entity(
                         file,
                         record,
@@ -269,18 +470,24 @@ impl<'a> Checker<'a> {
                         "arc radius is zero or below epsilon".to_owned(),
                     );
                 }
-                if (*start_deg - *end_deg).abs() <= EPSILON_MM {
+                let span = (*end_deg - *start_deg).abs();
+                if !start_deg.is_finite()
+                    || !end_deg.is_finite()
+                    || span <= EPSILON_MM
+                    || span > 360.0 + EPSILON_MM
+                {
                     self.push_entity(
                         file,
                         record,
                         "geometry.invalid_arc",
                         Some("end_deg"),
-                        "arc start_deg and end_deg are effectively equal".to_owned(),
+                        "arc span must be finite, greater than zero, and at most 360 degrees"
+                            .to_owned(),
                     );
                 }
             }
             Entity::Circle { radius, .. } => {
-                if *radius <= EPSILON_MM {
+                if !radius.is_finite() || *radius <= EPSILON_MM {
                     self.push_entity(
                         file,
                         record,
@@ -322,7 +529,141 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            Entity::Text { .. } | Entity::Dimension { .. } | Entity::BlockRef { .. } => {}
+            Entity::Point { scale, .. } => {
+                if !scale.is_finite() || *scale <= 0.0 {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_point",
+                        Some("scale"),
+                        "point scale must be finite and positive".to_owned(),
+                    );
+                }
+            }
+            Entity::Solid { points, .. } => {
+                if !(3..=4).contains(&points.len()) {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_solid",
+                        Some("points"),
+                        "solid must contain three or four points".to_owned(),
+                    );
+                }
+                if polygon_is_degenerate(points) {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.degenerate_solid",
+                        Some("points"),
+                        "solid points must be distinct and enclose a non-zero area".to_owned(),
+                    );
+                }
+            }
+            Entity::CurveSolid {
+                radius,
+                flatness,
+                start_deg,
+                end_deg,
+                solid_param,
+                ..
+            } => {
+                if !radius.is_finite()
+                    || !flatness.is_finite()
+                    || *radius <= EPSILON_MM
+                    || flatness.abs() <= EPSILON_MM
+                {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_curve_solid",
+                        Some("radius"),
+                        "curve solid radius and flatness must be finite and non-zero".to_owned(),
+                    );
+                }
+                let span = (*end_deg - *start_deg).abs();
+                if !span.is_finite() || span <= EPSILON_MM || span > 360.0 + EPSILON_MM {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_curve_solid",
+                        Some("end_deg"),
+                        "curve solid span must be greater than zero and at most 360 degrees"
+                            .to_owned(),
+                    );
+                }
+                if !solid_param.is_finite() || *solid_param < 0.0 || *solid_param >= radius.abs() {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_curve_solid",
+                        Some("solid_param"),
+                        "curve solid inner parameter must be non-negative and below radius"
+                            .to_owned(),
+                    );
+                }
+            }
+            Entity::Text { rotation_deg, .. } => {
+                self.check_finite_entity_value(file, record, "rotation_deg", *rotation_deg);
+            }
+            Entity::Dimension {
+                p1,
+                p2,
+                offset,
+                text_rotation_deg,
+                ..
+            } => {
+                if distance(*p1, *p2) <= EPSILON_MM {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.zero_dimension",
+                        Some("p2"),
+                        "dimension points must not coincide".to_owned(),
+                    );
+                }
+                self.check_finite_entity_value(file, record, "offset", *offset);
+                self.check_finite_entity_value(
+                    file,
+                    record,
+                    "text_rotation_deg",
+                    *text_rotation_deg,
+                );
+            }
+            Entity::BlockRef {
+                rotation_deg,
+                scale,
+                ..
+            } => {
+                self.check_finite_entity_value(file, record, "rotation_deg", *rotation_deg);
+                if !scale.is_finite() || *scale <= 0.0 {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_block_scale",
+                        Some("scale"),
+                        "block scale must be finite and positive".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_finite_entity_value(
+        &mut self,
+        file: &str,
+        record: &EntityRecord,
+        field: &str,
+        value: f64,
+    ) {
+        if !value.is_finite() {
+            self.push_entity(
+                file,
+                record,
+                "geometry.non_finite",
+                Some(field),
+                format!("{field} must be finite"),
+            );
         }
     }
 
@@ -431,9 +772,17 @@ impl<'a> Checker<'a> {
     }
 
     fn push_project(&mut self, code: &str, field: Option<String>, message: String) {
+        self.push_diagnostic("rules/layers.toml", code, field, message);
+    }
+
+    fn push_style(&mut self, code: &str, field: Option<String>, message: String) {
+        self.push_diagnostic("rules/styles.toml", code, field, message);
+    }
+
+    fn push_diagnostic(&mut self, file: &str, code: &str, field: Option<String>, message: String) {
         self.diagnostics.push(CheckDiagnostic {
             severity: Severity::Error,
-            file: "rules/layers.toml".to_owned(),
+            file: file.to_owned(),
             line: None,
             entity_id: None,
             field,
@@ -543,6 +892,44 @@ fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+fn is_rgb_hex(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn parse_scale(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once(':').or_else(|| value.split_once('/'))?;
+    let numerator = numerator.trim().parse::<f64>().ok()?;
+    let denominator = denominator.trim().parse::<f64>().ok()?;
+    (numerator.is_finite() && denominator.is_finite() && numerator > 0.0 && denominator > 0.0)
+        .then_some(numerator / denominator)
+}
+
+fn polygon_is_degenerate(points: &[[f64; 2]]) -> bool {
+    if points.len() < 3
+        || points
+            .iter()
+            .any(|point| point.iter().any(|value| !value.is_finite()))
+    {
+        return true;
+    }
+    let mut unique = BTreeSet::new();
+    for point in points {
+        unique.insert((point[0].to_bits(), point[1].to_bits()));
+    }
+    if unique.len() < 3 {
+        return true;
+    }
+    let area_twice: f64 = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a[0] * b[1] - b[0] * a[1])
+        .sum();
+    area_twice.abs() <= EPSILON_MM * EPSILON_MM
+}
+
 fn has_self_intersection(points: &[[f64; 2]], closed: bool) -> bool {
     let mut segments: Vec<([f64; 2], [f64; 2])> = points
         .windows(2)
@@ -575,8 +962,20 @@ fn segments_intersect(a: ([f64; 2], [f64; 2]), b: ([f64; 2], [f64; 2])) -> bool 
     let d3 = direction(b.0, b.1, a.0);
     let d4 = direction(b.0, b.1, a.1);
 
-    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    let crosses = ((d1 > EPSILON_MM && d2 < -EPSILON_MM) || (d1 < -EPSILON_MM && d2 > EPSILON_MM))
+        && ((d3 > EPSILON_MM && d4 < -EPSILON_MM) || (d3 < -EPSILON_MM && d4 > EPSILON_MM));
+    crosses
+        || (d1.abs() <= EPSILON_MM && point_on_segment(b.0, a))
+        || (d2.abs() <= EPSILON_MM && point_on_segment(b.1, a))
+        || (d3.abs() <= EPSILON_MM && point_on_segment(a.0, b))
+        || (d4.abs() <= EPSILON_MM && point_on_segment(a.1, b))
+}
+
+fn point_on_segment(point: [f64; 2], segment: ([f64; 2], [f64; 2])) -> bool {
+    point[0] >= segment.0[0].min(segment.1[0]) - EPSILON_MM
+        && point[0] <= segment.0[0].max(segment.1[0]) + EPSILON_MM
+        && point[1] >= segment.0[1].min(segment.1[1]) - EPSILON_MM
+        && point[1] <= segment.0[1].max(segment.1[1]) + EPSILON_MM
 }
 
 fn direction(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {

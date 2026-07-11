@@ -43,6 +43,26 @@ enum Command {
         #[arg(long, value_name = "PROJECT_DIR")]
         out: PathBuf,
     },
+    #[command(about = "Export a CAD drawing to experimental JWW version 600")]
+    ExportJww {
+        #[arg(value_name = "PROJECT")]
+        project: PathBuf,
+
+        #[arg(long, value_name = "NAME")]
+        drawing: String,
+
+        #[arg(long, value_name = "FILE.jww")]
+        out: PathBuf,
+
+        #[arg(long)]
+        allow_lossy: bool,
+
+        #[arg(long)]
+        force: bool,
+
+        #[arg(long, value_name = "REPORT.json")]
+        report: Option<PathBuf>,
+    },
     #[command(about = "Compare CAD source projects by stable entity IDs")]
     Diff {
         #[arg(value_name = "BASE")]
@@ -131,6 +151,48 @@ fn main() -> Result<()> {
                 report.warnings.len()
             );
         }
+        Some(Command::ExportJww {
+            project,
+            drawing,
+            out,
+            allow_lossy,
+            force,
+            report,
+        }) => {
+            if report
+                .as_ref()
+                .is_some_and(|report_path| paths_refer_to_same_file(&out, report_path))
+            {
+                return Err(miette!("--out and --report must refer to different files"));
+            }
+            let export = cad_export_jww::export_jww_file(
+                &project,
+                &drawing,
+                &out,
+                cad_export_jww::ExportOptions {
+                    allow_lossy,
+                    overwrite: force,
+                },
+            )
+            .into_diagnostic()?;
+            if let Some(report_path) = report {
+                let json = serde_json::to_string_pretty(&export).into_diagnostic()?;
+                write_text_file(&report_path, &format!("{json}\n"))?;
+            }
+            println!(
+                "JWW export {:?}: {} record(s), {} warning(s), {} blocker(s)",
+                export.status,
+                export.expanded_entities,
+                export.warnings.len(),
+                export.blockers.len()
+            );
+            if export.status == cad_export_jww::ExportStatus::Blocked {
+                return Err(miette!(
+                    "JWW export blocked by {} compatibility issue(s)",
+                    export.blockers.len()
+                ));
+            }
+        }
         Some(Command::Diff {
             base,
             head,
@@ -165,6 +227,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn paths_refer_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => {
+            let absolute = |path: &std::path::Path| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(path)
+                }
+            };
+            absolute(left) == absolute(right)
+        }
+    }
+}
+
 fn write_json_report(path: &PathBuf, report: &cad_check::CheckReport) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -188,4 +269,22 @@ fn write_text_file(path: &PathBuf, text: &str) -> Result<()> {
     fs::write(path, text)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_refer_to_same_file;
+    use std::path::Path;
+
+    #[test]
+    fn rejects_identical_export_and_report_paths() {
+        assert!(paths_refer_to_same_file(
+            Path::new("result.jww"),
+            Path::new("result.jww")
+        ));
+        assert!(!paths_refer_to_same_file(
+            Path::new("result.jww"),
+            Path::new("result.json")
+        ));
+    }
 }

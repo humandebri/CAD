@@ -8,12 +8,14 @@ use cad_model::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path as FsPath;
 use svg::Document;
 use svg::node::element::path::Data;
 use svg::node::element::{Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Text};
 
 pub const CRATE_NAME: &str = "cad-diff";
-pub const DIFF_SCHEMA_VERSION: &str = "0.1";
+pub const DIFF_SCHEMA_VERSION: &str = "0.2";
 
 #[must_use]
 pub fn crate_name() -> &'static str {
@@ -71,16 +73,37 @@ pub struct DiffWarning {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationChangeKind {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigurationChange {
+    pub path: String,
+    pub kind: ConfigurationChangeKind,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiffReport {
     pub schema_version: String,
     pub status: DiffStatus,
     pub changes: Vec<DiffChange>,
     pub warnings: Vec<DiffWarning>,
+    pub configuration_changes: Vec<ConfigurationChange>,
 }
 
 impl DiffReport {
     #[must_use]
-    pub fn new(changes: Vec<DiffChange>, warnings: Vec<DiffWarning>) -> Self {
+    pub fn new(
+        changes: Vec<DiffChange>,
+        warnings: Vec<DiffWarning>,
+        configuration_changes: Vec<ConfigurationChange>,
+    ) -> Self {
         let status = if warnings.is_empty() {
             DiffStatus::Ok
         } else {
@@ -91,6 +114,7 @@ impl DiffReport {
             status,
             changes,
             warnings,
+            configuration_changes,
         }
     }
 }
@@ -172,7 +196,158 @@ pub fn diff_projects(base: &ProjectSource, head: &ProjectSource) -> DiffReport {
         }
     }
 
-    DiffReport::new(changes, warnings)
+    DiffReport::new(changes, warnings, configuration_changes(base, head))
+}
+
+fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<ConfigurationChange> {
+    let mut changes = Vec::new();
+    collect_json_changes(
+        "project",
+        &serde_json::to_value(&base.project).expect("project config is serializable"),
+        &serde_json::to_value(&head.project).expect("project config is serializable"),
+        &mut changes,
+    );
+    collect_json_changes(
+        "layers",
+        &serde_json::to_value(&base.layers).expect("layer rules are serializable"),
+        &serde_json::to_value(&head.layers).expect("layer rules are serializable"),
+        &mut changes,
+    );
+    collect_json_changes(
+        "styles",
+        &serde_json::to_value(&base.styles).expect("style rules are serializable"),
+        &serde_json::to_value(&head.styles).expect("style rules are serializable"),
+        &mut changes,
+    );
+    let base_sheets = base
+        .drawings
+        .iter()
+        .map(|drawing| (&drawing.name, &drawing.sheet))
+        .collect::<BTreeMap<_, _>>();
+    let head_sheets = head
+        .drawings
+        .iter()
+        .map(|drawing| (&drawing.name, &drawing.sheet))
+        .collect::<BTreeMap<_, _>>();
+    for name in base_sheets
+        .keys()
+        .chain(head_sheets.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let before = base_sheets
+            .get(name)
+            .map(|sheet| serde_json::to_value(sheet).expect("sheet is serializable"));
+        let after = head_sheets
+            .get(name)
+            .map(|sheet| serde_json::to_value(sheet).expect("sheet is serializable"));
+        collect_optional_json_changes(
+            &format!("drawings.{name}.sheet"),
+            before.as_ref(),
+            after.as_ref(),
+            &mut changes,
+        );
+    }
+    let base_blocks = block_file_signatures(&base.root);
+    let head_blocks = block_file_signatures(&head.root);
+    for path in base_blocks
+        .keys()
+        .chain(head_blocks.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let before = base_blocks
+            .get(path)
+            .map(|value| serde_json::Value::String(value.clone()));
+        let after = head_blocks
+            .get(path)
+            .map(|value| serde_json::Value::String(value.clone()));
+        collect_optional_json_changes(
+            &format!("blocks.{path}"),
+            before.as_ref(),
+            after.as_ref(),
+            &mut changes,
+        );
+    }
+    changes
+}
+
+fn block_file_signatures(root: &FsPath) -> BTreeMap<String, String> {
+    fn visit(root: &FsPath, current: &FsPath, output: &mut BTreeMap<String, String>) {
+        let Ok(entries) = fs::read_dir(current) else {
+            return;
+        };
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, output);
+            } else if let Ok(bytes) = fs::read(&path)
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                output.insert(
+                    relative.to_string_lossy().replace('\\', "/"),
+                    blake3::hash(&bytes).to_hex().to_string(),
+                );
+            }
+        }
+    }
+    let blocks = root.join("blocks");
+    let mut output = BTreeMap::new();
+    visit(&blocks, &blocks, &mut output);
+    output
+}
+
+fn collect_optional_json_changes(
+    path: &str,
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+    output: &mut Vec<ConfigurationChange>,
+) {
+    match (before, after) {
+        (Some(before), Some(after)) => collect_json_changes(path, before, after, output),
+        (Some(before), None) => output.push(ConfigurationChange {
+            path: path.to_owned(),
+            kind: ConfigurationChangeKind::Removed,
+            before: Some(before.clone()),
+            after: None,
+        }),
+        (None, Some(after)) => output.push(ConfigurationChange {
+            path: path.to_owned(),
+            kind: ConfigurationChangeKind::Added,
+            before: None,
+            after: Some(after.clone()),
+        }),
+        (None, None) => {}
+    }
+}
+
+fn collect_json_changes(
+    path: &str,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    output: &mut Vec<ConfigurationChange>,
+) {
+    if before == after {
+        return;
+    }
+    if let (serde_json::Value::Object(before), serde_json::Value::Object(after)) = (before, after) {
+        for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            collect_optional_json_changes(
+                &format!("{path}.{key}"),
+                before.get(key),
+                after.get(key),
+                output,
+            );
+        }
+        return;
+    }
+    output.push(ConfigurationChange {
+        path: path.to_owned(),
+        kind: ConfigurationChangeKind::Modified,
+        before: Some(before.clone()),
+        after: Some(after.clone()),
+    });
 }
 
 pub fn diff_projects_json(
@@ -304,6 +479,10 @@ fn change_reasons(
     if entity_style_signature(base) != entity_style_signature(head) {
         reasons.insert(ChangeReason::StyleChanged);
     }
+    if resolved_style_signature(base_project, base) != resolved_style_signature(head_project, head)
+    {
+        reasons.insert(ChangeReason::StyleChanged);
+    }
     if entity_text_signature(base) != entity_text_signature(head) {
         reasons.insert(ChangeReason::TextChanged);
     }
@@ -312,6 +491,41 @@ fn change_reasons(
     }
 
     reasons.into_iter().collect()
+}
+
+fn resolved_style_signature(project: &ProjectSource, entity: &Entity) -> String {
+    let layer = project.layers.layers.get(entity.layer());
+    let pen = entity.pen().and_then(|id| project.styles.pens.get(id));
+    let color_id = pen.map_or_else(
+        || layer.map(|value| value.color.as_str()),
+        |value| Some(value.color.as_str()),
+    );
+    let line_type_id = pen.map_or_else(
+        || layer.map(|value| value.line_type.as_str()),
+        |value| Some(value.line_type.as_str()),
+    );
+    let color = color_id.and_then(|id| project.styles.colors.get(id));
+    let line_type = line_type_id.and_then(|id| project.styles.line_types.get(id));
+    let annotation = match entity {
+        Entity::Text { style, .. } => {
+            serde_json::to_string(&project.styles.text_styles.get(style)).ok()
+        }
+        Entity::Dimension { style, .. } => {
+            project
+                .styles
+                .dimension_styles
+                .get(style)
+                .and_then(|dimension| {
+                    serde_json::to_string(&(
+                        dimension,
+                        project.styles.text_styles.get(&dimension.text_style),
+                    ))
+                    .ok()
+                })
+        }
+        _ => None,
+    };
+    format!("{layer:?}:{pen:?}:{color:?}:{line_type:?}:{annotation:?}")
 }
 
 fn entity_geometry_signature(entity: &Entity) -> String {
@@ -343,6 +557,29 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             mirror_y,
             ..
         } => format!("text:{at:?}:{rotation_deg}:{mirror_y}"),
+        Entity::Point {
+            at,
+            temporary,
+            marker_code,
+            rotation_deg,
+            scale,
+            ..
+        } => format!("point:{at:?}:{temporary}:{marker_code:?}:{rotation_deg}:{scale}"),
+        Entity::Solid { points, fill, .. } => format!("solid:{points:?}:{fill}"),
+        Entity::CurveSolid {
+            center,
+            radius,
+            flatness,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            solid_param,
+            encoding_code,
+            fill,
+            ..
+        } => format!(
+            "curve_solid:{center:?}:{radius}:{flatness}:{rotation_deg}:{start_deg}:{end_deg}:{solid_param}:{encoding_code}:{fill}"
+        ),
         Entity::Dimension {
             p1,
             p2,
@@ -362,10 +599,11 @@ fn entity_geometry_signature(entity: &Entity) -> String {
 }
 
 fn entity_style_signature(entity: &Entity) -> String {
-    match entity {
-        Entity::Text { style, .. } | Entity::Dimension { style, .. } => style.clone(),
-        _ => String::new(),
-    }
+    let annotation = match entity {
+        Entity::Text { style, .. } | Entity::Dimension { style, .. } => style.as_str(),
+        _ => "",
+    };
+    format!("{annotation}:{}", entity.pen().unwrap_or_default())
 }
 
 fn entity_text_signature(entity: &Entity) -> String {
@@ -381,10 +619,18 @@ fn line_width(project: &ProjectSource, entity: &Entity) -> Option<String> {
         return None;
     }
     project
-        .layers
-        .layers
-        .get(entity.layer())
-        .map(|layer| cad_model::format_decimal_mm(layer.line_width))
+        .styles
+        .pens
+        .get(entity.pen().unwrap_or_default())
+        .map(|pen| pen.line_width)
+        .or_else(|| {
+            project
+                .layers
+                .layers
+                .get(entity.layer())
+                .map(|layer| layer.line_width)
+        })
+        .map(cad_model::format_decimal_mm)
 }
 
 fn push_head_warnings(
@@ -425,6 +671,9 @@ fn is_outside_paper(project: &ProjectSource, drawing_name: &str, entity: &Entity
 
 fn paper_model_size(sheet: &cad_model::SheetConfig) -> Option<(f64, f64)> {
     let (paper_width, paper_height) = match sheet.paper.as_str() {
+        "A0" => (841.0, 1189.0),
+        "A1" => (594.0, 841.0),
+        "A2" => (420.0, 594.0),
         "A3" => (297.0, 420.0),
         "A4" => (210.0, 297.0),
         _ => return None,
@@ -453,6 +702,7 @@ fn text_overlap_warnings(
 ) -> Vec<DiffWarning> {
     let texts = records
         .iter()
+        .filter(|record| entity_is_effectively_visible(project, &record.entity))
         .filter_map(|record| text_bbox(project, record).map(|bbox| (record, bbox)))
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
@@ -474,6 +724,18 @@ fn text_overlap_warnings(
         }
     }
     warnings
+}
+
+fn entity_is_effectively_visible(project: &ProjectSource, entity: &Entity) -> bool {
+    let Some(layer) = project.layers.layers.get(entity.layer()) else {
+        return true;
+    };
+    layer.visible
+        && layer
+            .group
+            .as_ref()
+            .and_then(|id| project.layers.groups.get(id))
+            .is_none_or(|group| group.visible)
 }
 
 fn text_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
@@ -621,14 +883,19 @@ fn render_overlay_entity(
     opacity: f64,
     class_name: &str,
 ) -> Group {
+    let layer_visible = entity_is_effectively_visible(project, &record.entity);
     let mut group = Group::new()
         .set("class", class_name)
         .set("data-entity-id", record.entity.id().as_str())
         .set("data-layer", record.entity.layer())
+        .set("data-layer-visible", layer_visible)
         .set("opacity", opacity)
         .set("stroke", color)
         .set("fill", "none")
         .set("stroke-width", "0.35mm");
+    if !layer_visible {
+        group = group.set("style", "display:none");
+    }
     if let Some(bbox) = visual_bbox(project, record) {
         group = group.set("data-bbox", bbox_attr(bbox));
     }
@@ -797,8 +1064,58 @@ fn render_overlay_entity(
                 );
             }
         }
+        Entity::Point {
+            at,
+            rotation_deg,
+            scale,
+            ..
+        } => {
+            let size = (2.5 * scale.abs()).max(0.5);
+            group = group
+                .add(
+                    Line::new()
+                        .set("x1", at[0] - size)
+                        .set("y1", svg_y(at[1]))
+                        .set("x2", at[0] + size)
+                        .set("y2", svg_y(at[1]))
+                        .set("transform", rotate_attr(*rotation_deg, *at)),
+                )
+                .add(
+                    Line::new()
+                        .set("x1", at[0])
+                        .set("y1", svg_y(at[1] - size))
+                        .set("x2", at[0])
+                        .set("y2", svg_y(at[1] + size))
+                        .set("transform", rotate_attr(*rotation_deg, *at)),
+                );
+        }
+        Entity::Solid { points, .. } => {
+            group = group.add(path_from_points(points, true).set("fill", color));
+        }
+        Entity::CurveSolid {
+            center,
+            radius,
+            flatness,
+            rotation_deg,
+            start_deg,
+            end_deg,
+            ..
+        } => {
+            group = group.add(ellipse_arc_path(
+                *center,
+                radius.abs(),
+                radius.abs() * flatness.abs(),
+                *rotation_deg,
+                *start_deg,
+                *end_deg,
+            ));
+        }
         Entity::BlockRef {
-            block, at, scale, ..
+            block,
+            at,
+            rotation_deg,
+            scale,
+            ..
         } => {
             let size = 100.0 * scale;
             group = group
@@ -807,14 +1124,16 @@ fn render_overlay_entity(
                         .set("x1", at[0] - size)
                         .set("y1", svg_y(at[1]))
                         .set("x2", at[0] + size)
-                        .set("y2", svg_y(at[1])),
+                        .set("y2", svg_y(at[1]))
+                        .set("transform", rotate_attr(*rotation_deg, *at)),
                 )
                 .add(
                     Line::new()
                         .set("x1", at[0])
                         .set("y1", svg_y(at[1] - size))
                         .set("x2", at[0])
-                        .set("y2", svg_y(at[1] + size)),
+                        .set("y2", svg_y(at[1] + size))
+                        .set("transform", rotate_attr(*rotation_deg, *at)),
                 )
                 .add(
                     Text::new("")
@@ -867,7 +1186,8 @@ fn text_node(
 }
 
 fn text_length(value: &str, style: &TextStyleDef) -> f64 {
-    ((value.chars().count() as f64) * style.width + style.spacing).max(0.0)
+    let count = value.chars().count();
+    ((count as f64) * style.width + (count.saturating_sub(1) as f64) * style.spacing).max(0.0)
 }
 
 fn text_anchor(align: &TextAlign) -> &'static str {
@@ -940,12 +1260,20 @@ fn arc_path(center: Point, radius: f64, start_deg: f64, end_deg: f64) -> Path {
     let delta = (end_deg - start_deg).abs();
     let large_arc = if delta > 180.0 { 1 } else { 0 };
     let sweep = if end_deg >= start_deg { 0 } else { 1 };
-    Path::new().set(
-        "d",
-        Data::new()
-            .move_to((start[0], svg_y(start[1])))
-            .elliptical_arc_to((radius, radius, 0, large_arc, sweep, end[0], svg_y(end[1]))),
-    )
+    let mut data = Data::new().move_to((start[0], svg_y(start[1])));
+    if delta >= 360.0 - 1e-9 {
+        let midpoint = polar_point(
+            center,
+            radius,
+            start_deg + if end_deg >= start_deg { 180.0 } else { -180.0 },
+        );
+        data = data
+            .elliptical_arc_to((radius, radius, 0, 1, sweep, midpoint[0], svg_y(midpoint[1])))
+            .elliptical_arc_to((radius, radius, 0, 1, sweep, start[0], svg_y(start[1])));
+    } else {
+        data = data.elliptical_arc_to((radius, radius, 0, large_arc, sweep, end[0], svg_y(end[1])));
+    }
+    Path::new().set("d", data)
 }
 
 fn ellipse_arc_path(
@@ -1032,7 +1360,7 @@ mod tests {
         assert_change(
             &report,
             "ent_01JZ0000000000000000000001",
-            ChangeKind::Unchanged,
+            ChangeKind::Modified,
         );
         assert_change(
             &report,
@@ -1053,7 +1381,7 @@ mod tests {
 
         insta::assert_snapshot!(json, @r#"
 {
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "status": "warning",
   "changes": [
     {
@@ -1062,14 +1390,17 @@ mod tests {
       "kind": "modified",
       "reasons": [
         "geometry_changed",
+        "style_changed",
         "line_width_changed"
       ]
     },
     {
       "entity_id": "ent_01JZ0000000000000000000001",
       "drawing": "plan_1f",
-      "kind": "unchanged",
-      "reasons": []
+      "kind": "modified",
+      "reasons": [
+        "style_changed"
+      ]
     },
     {
       "entity_id": "ent_01JZ0000000000000000000002",
@@ -1116,6 +1447,14 @@ mod tests {
       "drawing": "plan_1f",
       "message": "text bounding boxes overlap"
     }
+  ],
+  "configuration_changes": [
+    {
+      "path": "layers.layers.0-1.line_width",
+      "kind": "modified",
+      "before": 0.25,
+      "after": 0.35
+    }
   ]
 }
 "#);
@@ -1132,7 +1471,7 @@ mod tests {
 
         insta::assert_snapshot!(json, @r#"
 {
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "status": "ok",
   "changes": [
     {
@@ -1145,7 +1484,8 @@ mod tests {
       ]
     }
   ],
-  "warnings": []
+  "warnings": [],
+  "configuration_changes": []
 }
 "#);
     }
@@ -1178,7 +1518,7 @@ mod tests {
         let svg = diff_projects_svg(&base, &head);
 
         assert!(svg.contains("data-bbox=\"10,20,95,50\""));
-        assert!(svg.contains("data-bbox=\"-12.5,0,112.5,50\""));
+        assert!(svg.contains("data-bbox=\"-15,0,115,50\""));
         assert!(svg.contains("font-size=\"30\""));
         assert!(svg.contains("textLength=\"85\""));
         assert!(!svg.contains("data-bbox=\"10,20,310,270\""));

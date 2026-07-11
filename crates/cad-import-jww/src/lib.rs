@@ -1,7 +1,18 @@
 //! crates/cad-import-jww: one-way JWW boundary importer.
 //! It reads a small, tested subset of JWW records and writes the repo CAD source layout.
 
-use encoding_rs::SHIFT_JIS;
+use cad_jww_codec::{
+    DecodedArc as Arc, DecodedBase as EntityBase, DecodedBlock as Block,
+    DecodedBlockDefinition as BlockDef, DecodedCircleSolid as CircleSolid,
+    DecodedDimension as Dimension, DecodedDocument as JwwDocument, DecodedEntity as JwwEntity,
+    DecodedLine as Line, DecodedPoint as Point, DecodedSolid as Solid, DecodedText as Text,
+    read_document,
+};
+#[cfg(test)]
+use cad_jww_codec::{
+    DecodedHeader as JwwHeader, DecodedLayer as LayerHeader, DecodedLayerGroup as LayerGroupHeader,
+    Reader,
+};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use rustix::io::Errno;
 use serde::Serialize;
@@ -10,13 +21,11 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::f64::consts::PI;
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
 pub const CRATE_NAME: &str = "cad-import-jww";
-const JWW_SIGNATURE: &[u8; 8] = b"JwwData.";
 const CAD_SCHEMA_VERSION: &str = "0.1";
 const IMPORT_EPSILON_MM: f64 = 0.001;
 const IMPORT_ANGLE_EPSILON_RAD: f64 = 1e-9;
@@ -58,6 +67,8 @@ pub enum ImportError {
     UnknownEntityClass(String),
     #[error("invalid JWW block definition count {0}")]
     InvalidBlockDefinitionCount(u32),
+    #[error("JWW entity references out-of-range layer group {layer_group} or layer {layer}")]
+    InvalidLayerAddress { layer_group: u32, layer: u32 },
     #[error("JWW {kind} limit exceeded ({limit})")]
     ExpansionLimitExceeded { kind: &'static str, limit: usize },
     #[error("generated CAD entity does not have valid geometry")]
@@ -68,6 +79,27 @@ pub enum ImportError {
     EmptyImport,
     #[error("failed to serialize import output")]
     Serialize(#[from] serde_json::Error),
+}
+
+impl From<cad_jww_codec::CodecError> for ImportError {
+    fn from(error: cad_jww_codec::CodecError) -> Self {
+        match error {
+            cad_jww_codec::CodecError::InvalidSignature => Self::InvalidSignature,
+            cad_jww_codec::CodecError::UnexpectedEof(field) => Self::UnexpectedEof(field),
+            cad_jww_codec::CodecError::EntityListNotFound => Self::EntityListNotFound,
+            cad_jww_codec::CodecError::UnknownClassPid(pid) => Self::UnknownClassPid(pid),
+            cad_jww_codec::CodecError::UnknownEntityClass(class_name) => {
+                Self::UnknownEntityClass(class_name)
+            }
+            cad_jww_codec::CodecError::InvalidBlockDefinitionCount(count) => {
+                Self::InvalidBlockDefinitionCount(count)
+            }
+            other => Self::Write {
+                path: PathBuf::from("JWW codec"),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, other),
+            },
+        }
+    }
 }
 
 pub type ImportResult<T> = Result<T, ImportError>;
@@ -93,216 +125,6 @@ pub struct ImportWarning {
     pub record_type: String,
 }
 
-#[derive(Debug, Clone)]
-struct JwwDocument {
-    header: JwwHeader,
-    entities: Vec<JwwEntity>,
-    block_defs: Vec<BlockDef>,
-}
-
-#[derive(Debug, Clone)]
-struct JwwHeader {
-    version: u32,
-    memo: String,
-    paper_size: u32,
-    layer_groups: [LayerGroupHeader; 16],
-}
-
-#[derive(Debug, Clone, Default)]
-struct LayerGroupHeader {
-    layers: [LayerHeader; 16],
-    name: String,
-    scale: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LayerHeader {
-    name: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct EntityBase {
-    pen_style: u8,
-    pen_color: u16,
-    pen_width: u16,
-    layer: u16,
-    layer_group: u16,
-}
-
-#[derive(Debug, Clone)]
-enum JwwEntity {
-    Line(Line),
-    Arc(Arc),
-    Point(Point),
-    Text(Text),
-    Solid(Solid),
-    CircleSolid(CircleSolid),
-    Block(Block),
-    Dimension(Dimension),
-}
-
-#[derive(Debug, Clone)]
-struct Line {
-    base: EntityBase,
-    start: [f64; 2],
-    end: [f64; 2],
-}
-
-#[derive(Debug, Clone)]
-struct Arc {
-    base: EntityBase,
-    center: [f64; 2],
-    radius: f64,
-    start_rad: f64,
-    sweep_rad: f64,
-    tilt_rad: f64,
-    flatness: f64,
-    is_full_circle: bool,
-}
-
-#[derive(Debug, Clone)]
-struct Point {
-    base: EntityBase,
-}
-
-#[derive(Debug, Clone)]
-struct Text {
-    base: EntityBase,
-    start: [f64; 2],
-    size_x: f64,
-    size_y: f64,
-    spacing: f64,
-    angle: f64,
-    mirror_y: bool,
-    font_name: String,
-    content: String,
-}
-
-#[derive(Debug, Clone)]
-struct Solid {
-    base: EntityBase,
-}
-
-#[derive(Debug, Clone)]
-struct CircleSolid {
-    base: EntityBase,
-}
-
-#[derive(Debug, Clone)]
-struct Block {
-    base: EntityBase,
-    ref_x: f64,
-    ref_y: f64,
-    scale_x: f64,
-    scale_y: f64,
-    rotation: f64,
-    def_number: u32,
-}
-
-#[derive(Debug, Clone)]
-struct BlockDef {
-    number: u32,
-    name: String,
-    entities: Vec<JwwEntity>,
-}
-
-#[derive(Debug, Clone)]
-struct Dimension {
-    base: EntityBase,
-    line: Line,
-    text: Text,
-}
-
-struct Reader<'a> {
-    cursor: Cursor<&'a [u8]>,
-}
-
-impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            cursor: Cursor::new(data),
-        }
-    }
-
-    fn bytes_read(&self) -> usize {
-        self.cursor.position() as usize
-    }
-
-    fn skip(&mut self, len: usize) -> ImportResult<()> {
-        let pos = self.bytes_read();
-        let end = pos
-            .checked_add(len)
-            .ok_or(ImportError::UnexpectedEof("offset"))?;
-        if end > self.cursor.get_ref().len() {
-            return Err(ImportError::UnexpectedEof("bytes"));
-        }
-        self.cursor.set_position(end as u64);
-        Ok(())
-    }
-
-    fn read_u8(&mut self) -> ImportResult<u8> {
-        Ok(self.read_exact::<1>()?[0])
-    }
-
-    fn read_u16(&mut self) -> ImportResult<u16> {
-        Ok(u16::from_le_bytes(self.read_exact::<2>()?))
-    }
-
-    fn read_u32(&mut self) -> ImportResult<u32> {
-        Ok(u32::from_le_bytes(self.read_exact::<4>()?))
-    }
-
-    fn read_f64(&mut self) -> ImportResult<f64> {
-        Ok(f64::from_le_bytes(self.read_exact::<8>()?))
-    }
-
-    fn read_bytes(&mut self, len: usize) -> ImportResult<Vec<u8>> {
-        let mut buf = vec![0_u8; len];
-        self.read_exact_into(&mut buf)?;
-        Ok(buf)
-    }
-
-    fn read_cstring(&mut self) -> ImportResult<String> {
-        let len_byte = self.read_u8()?;
-        let len = if len_byte < 0xFF {
-            len_byte as usize
-        } else {
-            let word_len = self.read_u16()?;
-            if word_len < 0xFFFF {
-                word_len as usize
-            } else {
-                self.read_u32()? as usize
-            }
-        };
-        if len == 0 {
-            return Ok(String::new());
-        }
-        let bytes = self.read_bytes(len)?;
-        let (decoded, _, _) = SHIFT_JIS.decode(&bytes);
-        Ok(decoded.trim_end_matches('\0').to_owned())
-    }
-
-    fn read_exact<const N: usize>(&mut self) -> ImportResult<[u8; N]> {
-        let mut buf = [0_u8; N];
-        self.read_exact_into(&mut buf)?;
-        Ok(buf)
-    }
-
-    fn read_exact_into(&mut self, buf: &mut [u8]) -> ImportResult<()> {
-        let pos = self.bytes_read();
-        let end = pos
-            .checked_add(buf.len())
-            .ok_or(ImportError::UnexpectedEof("offset"))?;
-        let src = self.cursor.get_ref();
-        if end > src.len() {
-            return Err(ImportError::UnexpectedEof("bytes"));
-        }
-        buf.copy_from_slice(&src[pos..end]);
-        self.cursor.set_position(end as u64);
-        Ok(())
-    }
-}
-
 pub fn import_jww_file(
     input_path: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
@@ -318,7 +140,7 @@ pub fn import_jww_file(
         path: input_path.to_path_buf(),
         source,
     })?;
-    let document = parse_document(&data)?;
+    let document = read_document(&data)?;
     let parent = out_dir
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -352,381 +174,6 @@ fn publish_project(staging_dir: &Path, out_dir: &Path) -> ImportResult<()> {
             }
         }
     })
-}
-
-fn parse_document(data: &[u8]) -> ImportResult<JwwDocument> {
-    let header = parse_header(data)?;
-    let entity_list_offset =
-        find_entity_list_offset(data, header.version).ok_or(ImportError::EntityListNotFound)?;
-    let mut reader = Reader::new(&data[entity_list_offset..]);
-    let entities = parse_entity_list(&mut reader, header.version)?;
-    let block_data_start = entity_list_offset + reader.bytes_read();
-    let block_data = &data[block_data_start..];
-    let block_defs = if block_data.is_empty() || block_data == [0, 0] {
-        Vec::new()
-    } else {
-        parse_block_def_list(block_data, header.version)?
-    };
-    Ok(JwwDocument {
-        header,
-        entities,
-        block_defs,
-    })
-}
-
-fn parse_header(data: &[u8]) -> ImportResult<JwwHeader> {
-    if data.len() < JWW_SIGNATURE.len() || &data[..JWW_SIGNATURE.len()] != JWW_SIGNATURE {
-        return Err(ImportError::InvalidSignature);
-    }
-    let mut reader = Reader::new(data);
-    reader.skip(JWW_SIGNATURE.len())?;
-    let version = reader.read_u32()?;
-    let memo = reader.read_cstring()?;
-    let paper_size = reader.read_u32()?;
-    let _write_layer_group = reader.read_u32()?;
-    let mut layer_groups = std::array::from_fn(|_| LayerGroupHeader {
-        layers: std::array::from_fn(|_| LayerHeader::default()),
-        ..LayerGroupHeader::default()
-    });
-    for group in &mut layer_groups {
-        let _state = reader.read_u32()?;
-        let _write_layer = reader.read_u32()?;
-        group.scale = reader.read_f64()?;
-        let _protect = reader.read_u32()?;
-        for layer in &mut group.layers {
-            let _state = reader.read_u32()?;
-            let _protect = reader.read_u32()?;
-            layer.name.clear();
-        }
-    }
-    if parse_layer_names(&mut reader, version, &mut layer_groups).is_err() {
-        apply_default_layer_names(&mut layer_groups);
-    } else {
-        apply_default_layer_names_for_blanks(&mut layer_groups);
-    }
-    Ok(JwwHeader {
-        version,
-        memo,
-        paper_size,
-        layer_groups,
-    })
-}
-
-fn parse_layer_names(
-    reader: &mut Reader<'_>,
-    version: u32,
-    layer_groups: &mut [LayerGroupHeader; 16],
-) -> ImportResult<()> {
-    if version < 300 {
-        return Err(ImportError::UnexpectedEof("layer names"));
-    }
-    reader.skip((14 + 5 + 1 + 1) * 4)?;
-    reader.skip(16 + 8 + 4 + 4 + 8 + 16 + 16)?;
-    for group in layer_groups.iter_mut() {
-        for layer in group.layers.iter_mut() {
-            layer.name = reader.read_cstring()?;
-        }
-    }
-    for group in layer_groups.iter_mut() {
-        group.name = reader.read_cstring()?;
-    }
-    Ok(())
-}
-
-fn apply_default_layer_names(layer_groups: &mut [LayerGroupHeader; 16]) {
-    for (group_index, group) in layer_groups.iter_mut().enumerate() {
-        group.name = format!("Group{group_index:X}");
-        for (layer_index, layer) in group.layers.iter_mut().enumerate() {
-            layer.name = format!("{group_index:X}-{layer_index:X}");
-        }
-    }
-}
-
-fn apply_default_layer_names_for_blanks(layer_groups: &mut [LayerGroupHeader; 16]) {
-    for (group_index, group) in layer_groups.iter_mut().enumerate() {
-        if group.name.is_empty() {
-            group.name = format!("Group{group_index:X}");
-        }
-        for (layer_index, layer) in group.layers.iter_mut().enumerate() {
-            if layer.name.is_empty() {
-                layer.name = format!("{group_index:X}-{layer_index:X}");
-            }
-        }
-    }
-}
-
-fn find_entity_list_offset(data: &[u8], version: u32) -> Option<usize> {
-    let expected_schema = version as u16;
-    let mut fallback_offset = None;
-    if data.len() < 128 {
-        return None;
-    }
-    for i in 100..data.len().saturating_sub(20) {
-        if data[i] != 0xFF || data[i + 1] != 0xFF {
-            continue;
-        }
-        let schema = u16::from_le_bytes([data[i + 2], data[i + 3]]);
-        let name_len = u16::from_le_bytes([data[i + 4], data[i + 5]]) as usize;
-        if !(8..=32).contains(&name_len) || i + 6 + name_len > data.len() {
-            continue;
-        }
-        let class_name = &data[i + 6..i + 6 + name_len];
-        if !class_name.starts_with(b"CData") || i < 2 {
-            continue;
-        }
-        let offset = i - 2;
-        if schema == expected_schema {
-            return Some(offset);
-        }
-        if fallback_offset.is_none() {
-            fallback_offset = Some(offset);
-        }
-    }
-    fallback_offset
-}
-
-fn parse_entity_list(reader: &mut Reader<'_>, version: u32) -> ImportResult<Vec<JwwEntity>> {
-    let count = reader.read_u16()? as usize;
-    let mut entities = Vec::with_capacity(count);
-    let mut pid_to_class_name = BTreeMap::<u32, String>::new();
-    let mut next_pid: u32 = 1;
-    for _ in 0..count {
-        let (entity, new_pid) =
-            parse_entity_with_pid_tracking(reader, version, &mut pid_to_class_name, next_pid)?;
-        next_pid = new_pid;
-        if let Some(entity) = entity {
-            entities.push(entity);
-        }
-    }
-    Ok(entities)
-}
-
-fn parse_entity_with_pid_tracking(
-    reader: &mut Reader<'_>,
-    version: u32,
-    pid_to_class_name: &mut BTreeMap<u32, String>,
-    mut next_pid: u32,
-) -> ImportResult<(Option<JwwEntity>, u32)> {
-    let class_id = reader.read_u16()?;
-    let class_name = if class_id == 0xFFFF {
-        let _schema_version = reader.read_u16()?;
-        let name_len = reader.read_u16()? as usize;
-        let name = String::from_utf8_lossy(&reader.read_bytes(name_len)?).to_string();
-        pid_to_class_name.insert(next_pid, name.clone());
-        next_pid += 1;
-        name
-    } else if class_id == 0x8000 {
-        return Ok((None, next_pid));
-    } else {
-        let class_pid = (class_id & 0x7FFF) as u32;
-        pid_to_class_name
-            .get(&class_pid)
-            .cloned()
-            .ok_or(ImportError::UnknownClassPid(class_pid))?
-    };
-    let entity = match class_name.as_str() {
-        "CDataSen" => Some(JwwEntity::Line(parse_line(reader, version)?)),
-        "CDataEnko" => Some(JwwEntity::Arc(parse_arc(reader, version)?)),
-        "CDataTen" => Some(JwwEntity::Point(parse_point(reader, version)?)),
-        "CDataMoji" => Some(JwwEntity::Text(parse_text(reader, version)?)),
-        "CDataSolid" => Some(parse_solid(reader, version)?),
-        "CDataBlock" => Some(JwwEntity::Block(parse_block(reader, version)?)),
-        "CDataSunpou" => Some(JwwEntity::Dimension(parse_dimension(reader, version)?)),
-        _ => return Err(ImportError::UnknownEntityClass(class_name)),
-    };
-    next_pid += 1;
-    Ok((entity, next_pid))
-}
-
-fn parse_entity_base(reader: &mut Reader<'_>, version: u32) -> ImportResult<EntityBase> {
-    let _group = reader.read_u32()?;
-    let pen_style = reader.read_u8()?;
-    let pen_color = reader.read_u16()?;
-    let pen_width = if version >= 351 {
-        reader.read_u16()?
-    } else {
-        0
-    };
-    let layer = reader.read_u16()?;
-    let layer_group = reader.read_u16()?;
-    let _flag = reader.read_u16()?;
-    Ok(EntityBase {
-        pen_style,
-        pen_color,
-        pen_width,
-        layer,
-        layer_group,
-    })
-}
-
-fn parse_line(reader: &mut Reader<'_>, version: u32) -> ImportResult<Line> {
-    let base = parse_entity_base(reader, version)?;
-    Ok(Line {
-        base,
-        start: [reader.read_f64()?, reader.read_f64()?],
-        end: [reader.read_f64()?, reader.read_f64()?],
-    })
-}
-
-fn parse_arc(reader: &mut Reader<'_>, version: u32) -> ImportResult<Arc> {
-    let base = parse_entity_base(reader, version)?;
-    let center = [reader.read_f64()?, reader.read_f64()?];
-    let radius = reader.read_f64()?;
-    let start_rad = reader.read_f64()?;
-    let sweep_rad = reader.read_f64()?;
-    let tilt_rad = reader.read_f64()?;
-    let flatness = reader.read_f64()?;
-    Ok(Arc {
-        base,
-        center,
-        radius,
-        start_rad,
-        sweep_rad,
-        tilt_rad,
-        flatness,
-        is_full_circle: reader.read_u32()? != 0,
-    })
-}
-
-fn parse_point(reader: &mut Reader<'_>, version: u32) -> ImportResult<Point> {
-    let base = parse_entity_base(reader, version)?;
-    let _x = reader.read_f64()?;
-    let _y = reader.read_f64()?;
-    let _is_temporary = reader.read_u32()?;
-    if base.pen_style == 100 {
-        let _code = reader.read_u32()?;
-        let _angle = reader.read_f64()?;
-        let _scale = reader.read_f64()?;
-    }
-    Ok(Point { base })
-}
-
-fn parse_text(reader: &mut Reader<'_>, version: u32) -> ImportResult<Text> {
-    let base = parse_entity_base(reader, version)?;
-    let start = [reader.read_f64()?, reader.read_f64()?];
-    let _end = [reader.read_f64()?, reader.read_f64()?];
-    let _text_type = reader.read_u32()?;
-    let size_x = reader.read_f64()?;
-    let size_y = reader.read_f64()?;
-    let spacing = reader.read_f64()?;
-    let angle = reader.read_f64()?;
-    let font_name = reader.read_cstring()?;
-    let content = reader.read_cstring()?;
-    Ok(Text {
-        base,
-        start,
-        size_x,
-        size_y,
-        spacing,
-        angle,
-        mirror_y: false,
-        font_name,
-        content,
-    })
-}
-
-fn parse_solid(reader: &mut Reader<'_>, version: u32) -> ImportResult<JwwEntity> {
-    let base = parse_entity_base(reader, version)?;
-    let _start_x = reader.read_f64()?;
-    let _start_y = reader.read_f64()?;
-    let _end_x = reader.read_f64()?;
-    let _end_y = reader.read_f64()?;
-    let _dpoint2_x = reader.read_f64()?;
-    let _dpoint2_y = reader.read_f64()?;
-    let _dpoint3_x = reader.read_f64()?;
-    let _dpoint3_y = reader.read_f64()?;
-    if base.pen_color == 10 {
-        let _color = reader.read_u32()?;
-    }
-    if base.pen_style >= 101 {
-        Ok(JwwEntity::CircleSolid(CircleSolid { base }))
-    } else {
-        Ok(JwwEntity::Solid(Solid { base }))
-    }
-}
-
-fn parse_block(reader: &mut Reader<'_>, version: u32) -> ImportResult<Block> {
-    let base = parse_entity_base(reader, version)?;
-    Ok(Block {
-        base,
-        ref_x: reader.read_f64()?,
-        ref_y: reader.read_f64()?,
-        scale_x: reader.read_f64()?,
-        scale_y: reader.read_f64()?,
-        rotation: reader.read_f64()?,
-        def_number: reader.read_u32()?,
-    })
-}
-
-fn parse_block_def_list(data: &[u8], version: u32) -> ImportResult<Vec<BlockDef>> {
-    let mut reader = Reader::new(data);
-    let count = reader.read_u32()?;
-    if count > 10_000 {
-        return Err(ImportError::InvalidBlockDefinitionCount(count));
-    }
-
-    let mut block_defs = Vec::with_capacity(count as usize);
-    let mut class_map = BTreeMap::<u32, String>::new();
-    let mut next_id = 1_u32;
-    for _ in 0..count {
-        let (block_def, new_next_id) =
-            parse_block_def_with_tracking(&mut reader, version, &mut class_map, next_id)?;
-        next_id = new_next_id;
-        if let Some(block_def) = block_def {
-            block_defs.push(block_def);
-        }
-    }
-    Ok(block_defs)
-}
-
-fn parse_block_def_with_tracking(
-    reader: &mut Reader<'_>,
-    version: u32,
-    class_map: &mut BTreeMap<u32, String>,
-    mut next_id: u32,
-) -> ImportResult<(Option<BlockDef>, u32)> {
-    let class_id = reader.read_u16()?;
-    if class_id == 0xFFFF {
-        let _schema = reader.read_u16()?;
-        let name_len = reader.read_u16()? as usize;
-        let class_name = String::from_utf8_lossy(&reader.read_bytes(name_len)?).to_string();
-        class_map.insert(next_id, class_name);
-        next_id += 1;
-    } else if class_id == 0x8000 {
-        return Ok((None, next_id));
-    }
-
-    let _base = parse_entity_base(reader, version)?;
-    let number = reader.read_u32()?;
-    let _is_referenced = reader.read_u32()? != 0;
-    reader.skip(4)?;
-    let name = reader.read_cstring()?;
-    let entities = parse_entity_list(reader, version)?;
-
-    Ok((
-        Some(BlockDef {
-            number,
-            name,
-            entities,
-        }),
-        next_id,
-    ))
-}
-
-fn parse_dimension(reader: &mut Reader<'_>, version: u32) -> ImportResult<Dimension> {
-    let base = parse_entity_base(reader, version)?;
-    let line = parse_line(reader, version)?;
-    let text = parse_text(reader, version)?;
-    if version >= 420 {
-        let _sxf_mode = reader.read_u16()?;
-        for _ in 0..2 {
-            let _aux_line = parse_line(reader, version)?;
-        }
-        for _ in 0..4 {
-            let _aux_point = parse_point(reader, version)?;
-        }
-    }
-    Ok(Dimension { base, line, text })
 }
 
 fn write_project(
@@ -782,7 +229,7 @@ fn write_project(
     )?;
     write_text(
         &write_dir.join("rules/layers.toml"),
-        &layers_toml(&converted),
+        &layers_toml(&converted, document),
     )?;
     write_text(
         &write_dir.join("rules/styles.toml"),
@@ -837,7 +284,10 @@ fn write_text(path: &Path, text: &str) -> ImportResult<()> {
 struct ConvertedProject {
     entities: Vec<String>,
     layer_bases: BTreeMap<String, EntityBase>,
+    used_layer_groups: BTreeSet<u16>,
     layer_names: BTreeMap<String, String>,
+    pen_bases: BTreeMap<String, EntityBase>,
+    fill_colors: BTreeMap<String, String>,
     text_styles: BTreeMap<String, TextStyleRequirement>,
     dimension_styles: BTreeMap<String, String>,
     warnings: Vec<ImportWarning>,
@@ -856,6 +306,8 @@ struct ConversionContext<'a> {
     entities: Vec<String>,
     layer_bases: BTreeMap<String, EntityBase>,
     layer_names: BTreeMap<String, String>,
+    pen_bases: BTreeMap<String, EntityBase>,
+    fill_colors: BTreeMap<String, String>,
     text_styles: BTreeMap<String, TextStyleRequirement>,
     dimension_styles: BTreeMap<String, String>,
     warnings: Vec<ImportWarning>,
@@ -991,6 +443,20 @@ fn convert_entities_with_limits(
     document: &JwwDocument,
     limits: ConversionLimits,
 ) -> ImportResult<ConvertedProject> {
+    if document.header.write_layer_group > 15 {
+        return Err(ImportError::InvalidLayerAddress {
+            layer_group: document.header.write_layer_group,
+            layer: 0,
+        });
+    }
+    for (layer_group, group) in document.header.layer_groups.iter().enumerate() {
+        if group.write_layer > 15 {
+            return Err(ImportError::InvalidLayerAddress {
+                layer_group: layer_group as u32,
+                layer: group.write_layer,
+            });
+        }
+    }
     let mut context = ConversionContext {
         document,
         block_defs: document
@@ -1001,6 +467,8 @@ fn convert_entities_with_limits(
         entities: Vec::new(),
         layer_bases: BTreeMap::new(),
         layer_names: BTreeMap::new(),
+        pen_bases: BTreeMap::new(),
+        fill_colors: BTreeMap::new(),
         text_styles: BTreeMap::new(),
         dimension_styles: BTreeMap::new(),
         warnings: Vec::new(),
@@ -1017,6 +485,12 @@ fn convert_entities_with_limits(
             &mut block_stack,
         )?;
     }
+    let used_layer_groups = context
+        .layer_bases
+        .values()
+        .map(|base| base.layer_group.min(15))
+        .collect();
+    remember_declared_layers(&mut context);
     if context.layer_bases.is_empty() {
         let base = EntityBase::default();
         context.layer_names.insert(layer_id(base), "0-0".to_owned());
@@ -1025,11 +499,38 @@ fn convert_entities_with_limits(
     Ok(ConvertedProject {
         entities: context.entities,
         layer_bases: context.layer_bases,
+        used_layer_groups,
         layer_names: context.layer_names,
+        pen_bases: context.pen_bases,
+        fill_colors: context.fill_colors,
         text_styles: context.text_styles,
         dimension_styles: context.dimension_styles,
         warnings: context.warnings,
     })
+}
+
+fn remember_declared_layers(context: &mut ConversionContext<'_>) {
+    for (group_index, group) in context.document.header.layer_groups.iter().enumerate() {
+        for (layer_index, layer) in group.layers.iter().enumerate() {
+            let is_active = context.document.header.write_layer_group as usize == group_index
+                && group.write_layer as usize == layer_index;
+            let default_name = format!("{group_index:X}-{layer_index:X}");
+            if layer.name == default_name && layer.state == 2 && layer.protect == 0 && !is_active {
+                continue;
+            }
+            let base = EntityBase {
+                layer: layer_index as u16,
+                layer_group: group_index as u16,
+                ..EntityBase::default()
+            };
+            let id = layer_id(base);
+            context.layer_bases.entry(id.clone()).or_insert(base);
+            context
+                .layer_names
+                .entry(id)
+                .or_insert_with(|| layer.name.clone());
+        }
+    }
 }
 
 fn convert_entity(
@@ -1038,6 +539,22 @@ fn convert_entity(
     transform: &Transform2D,
     block_stack: &mut Vec<u32>,
 ) -> ImportResult<()> {
+    let base = match entity {
+        JwwEntity::Line(entity) => entity.base,
+        JwwEntity::Arc(entity) => entity.base,
+        JwwEntity::Point(entity) => entity.base,
+        JwwEntity::Text(entity) => entity.base,
+        JwwEntity::Solid(entity) => entity.base,
+        JwwEntity::CircleSolid(entity) => entity.base,
+        JwwEntity::Block(entity) => entity.base,
+        JwwEntity::Dimension(entity) => entity.base,
+    };
+    if base.layer_group > 15 || base.layer > 15 {
+        return Err(ImportError::InvalidLayerAddress {
+            layer_group: u32::from(base.layer_group),
+            layer: u32::from(base.layer),
+        });
+    }
     context.consume_expansion_step()?;
     match entity {
         JwwEntity::Line(line) => {
@@ -1065,21 +582,27 @@ fn convert_entity(
             let dimension = transform_dimension(dimension, transform);
             push_dimension(context, &dimension)?;
         }
-        JwwEntity::Point(point) => context.warnings.push(unsupported(
-            "CDataTen",
-            point.base,
-            "point import is not in the CAD source entity set",
-        )),
-        JwwEntity::Solid(solid) => context.warnings.push(unsupported(
-            "CDataSolid",
-            solid.base,
-            "solid fill import is not supported",
-        )),
-        JwwEntity::CircleSolid(solid) => context.warnings.push(unsupported(
-            "CDataSolid",
-            solid.base,
-            "circle solid fill import is not supported",
-        )),
+        JwwEntity::Point(point) => {
+            let point = transform_point_entity(point, transform);
+            push_point(context, &point)?;
+        }
+        JwwEntity::Solid(solid) => {
+            let solid = transform_solid(solid, transform);
+            push_solid(context, &solid)?;
+        }
+        JwwEntity::CircleSolid(solid) => {
+            if !transform.is_uniform_for_curve() {
+                context.warnings.push(import_warning(
+                    "unsupported_scaled_curve",
+                    "CDataSolid",
+                    solid.base,
+                    "non-uniform or sheared block transform cannot preserve curve solid",
+                ));
+            } else {
+                let solid = transform_circle_solid(solid, transform);
+                push_circle_solid(context, &solid)?;
+            }
+        }
         JwwEntity::Block(block) => {
             if !block_is_finite(block) {
                 context.warnings.push(geometry_skipped(
@@ -1111,6 +634,7 @@ fn push_line(context: &mut ConversionContext<'_>, line: &Line) -> ImportResult<(
         &mut context.warnings,
         line.base,
     );
+    remember_pen(&mut context.pen_bases, line.base);
     context.ensure_output_capacity()?;
     context.entities.push(entity_line_json(
         next_id(&mut context.id_index),
@@ -1152,6 +676,7 @@ fn push_arc(context: &mut ConversionContext<'_>, arc: &Arc) -> ImportResult<()> 
         &mut context.warnings,
         arc.base,
     );
+    remember_pen(&mut context.pen_bases, arc.base);
     context.ensure_output_capacity()?;
     context.entities.push(entity_curve_json(
         next_id(&mut context.id_index),
@@ -1177,6 +702,7 @@ fn push_text(context: &mut ConversionContext<'_>, text: &Text) -> ImportResult<(
         &mut context.warnings,
         text.base,
     );
+    remember_pen(&mut context.pen_bases, text.base);
     let style_id = record_text_style(context, text);
     context.ensure_output_capacity()?;
     context.entities.push(entity_text_json(
@@ -1212,6 +738,7 @@ fn push_dimension(context: &mut ConversionContext<'_>, dimension: &Dimension) ->
         &mut context.warnings,
         dimension.base,
     );
+    remember_pen(&mut context.pen_bases, dimension.base);
     let style_id = record_dimension_style(context, &dimension.text);
     context.ensure_output_capacity()?;
     context.entities.push(entity_dimension_json(
@@ -1219,6 +746,110 @@ fn push_dimension(context: &mut ConversionContext<'_>, dimension: &Dimension) ->
         &layer_id(dimension.base),
         &style_id,
         dimension,
+    ));
+    Ok(())
+}
+
+fn push_point(context: &mut ConversionContext<'_>, point: &Point) -> ImportResult<()> {
+    if !point_entity_is_finite(point) || point.scale <= 0.0 {
+        context.warnings.push(geometry_skipped(
+            "CDataTen",
+            point.base,
+            "point contains a non-finite coordinate, rotation, or scale",
+        ));
+        return Ok(());
+    }
+    if point
+        .marker_code
+        .is_some_and(|code| !known_marker_code(code))
+    {
+        context.warnings.push(import_warning(
+            "unsupported_marker",
+            "CDataTen",
+            point.base,
+            &format!(
+                "point marker code {} is preserved and rendered as a generic marker",
+                point.marker_code.expect("marker code checked")
+            ),
+        ));
+    }
+    remember_layer(
+        context.document,
+        &mut context.layer_bases,
+        &mut context.layer_names,
+        &mut context.warnings,
+        point.base,
+    );
+    remember_pen(&mut context.pen_bases, point.base);
+    context.ensure_output_capacity()?;
+    context.entities.push(entity_point_json(
+        next_id(&mut context.id_index),
+        &layer_id(point.base),
+        point,
+    ));
+    Ok(())
+}
+
+fn known_marker_code(code: u32) -> bool {
+    (1..=11).contains(&code) || code >= u32::MAX - 6
+}
+
+fn push_solid(context: &mut ConversionContext<'_>, solid: &Solid) -> ImportResult<()> {
+    if !solid.points.iter().all(|point| point_is_finite(*point)) {
+        context.warnings.push(geometry_skipped(
+            "CDataSolid",
+            solid.base,
+            "solid contains a non-finite point",
+        ));
+        return Ok(());
+    }
+    remember_layer(
+        context.document,
+        &mut context.layer_bases,
+        &mut context.layer_names,
+        &mut context.warnings,
+        solid.base,
+    );
+    remember_pen(&mut context.pen_bases, solid.base);
+    let fill = remember_fill(&mut context.fill_colors, solid.base, solid.color);
+    context.ensure_output_capacity()?;
+    context.entities.push(entity_solid_json(
+        next_id(&mut context.id_index),
+        &layer_id(solid.base),
+        solid,
+        &fill,
+    ));
+    Ok(())
+}
+
+fn push_circle_solid(context: &mut ConversionContext<'_>, solid: &CircleSolid) -> ImportResult<()> {
+    if !circle_solid_is_finite(solid)
+        || solid.radius.abs() <= IMPORT_EPSILON_MM
+        || solid.flatness.abs() <= IMPORT_EPSILON_MM
+        || solid.sweep_rad.abs() <= IMPORT_ANGLE_EPSILON_RAD
+    {
+        context.warnings.push(geometry_skipped(
+            "CDataSolid",
+            solid.base,
+            "curve solid geometry is invalid or below import epsilon",
+        ));
+        return Ok(());
+    }
+    remember_layer(
+        context.document,
+        &mut context.layer_bases,
+        &mut context.layer_names,
+        &mut context.warnings,
+        solid.base,
+    );
+    remember_pen(&mut context.pen_bases, solid.base);
+    let fill = remember_fill(&mut context.fill_colors, solid.base, solid.color);
+    context.ensure_output_capacity()?;
+    context.entities.push(entity_curve_solid_json(
+        next_id(&mut context.id_index),
+        &layer_id(solid.base),
+        solid,
+        &fill,
     ));
     Ok(())
 }
@@ -1310,31 +941,83 @@ fn transform_dimension(dimension: &Dimension, transform: &Transform2D) -> Dimens
     }
 }
 
+fn transform_point_entity(point: &Point, transform: &Transform2D) -> Point {
+    let axis = transform.apply_vector([point.rotation.cos(), point.rotation.sin()]);
+    Point {
+        base: point.base,
+        at: transform.apply_point(point.at),
+        temporary: point.temporary,
+        marker_code: point.marker_code,
+        rotation: axis[1].atan2(axis[0]),
+        scale: point.scale * transform.average_scale().abs(),
+    }
+}
+
+fn transform_solid(solid: &Solid, transform: &Transform2D) -> Solid {
+    Solid {
+        base: solid.base,
+        points: solid.points.map(|point| transform.apply_point(point)),
+        color: solid.color,
+    }
+}
+
+fn transform_circle_solid(solid: &CircleSolid, transform: &Transform2D) -> CircleSolid {
+    let axis = transform.apply_vector([solid.tilt_rad.cos(), solid.tilt_rad.sin()]);
+    let sign = if transform.determinant() < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    CircleSolid {
+        base: solid.base,
+        center: transform.apply_point(solid.center),
+        radius: solid.radius * transform.average_scale().abs(),
+        flatness: solid.flatness,
+        tilt_rad: axis[1].atan2(axis[0]),
+        start_rad: sign * solid.start_rad,
+        sweep_rad: sign * solid.sweep_rad,
+        solid_param: solid.solid_param * transform.average_scale().abs(),
+        color: solid.color,
+    }
+}
+
 fn remember_layer(
     document: &JwwDocument,
     layer_bases: &mut BTreeMap<String, EntityBase>,
     layer_names: &mut BTreeMap<String, String>,
-    warnings: &mut Vec<ImportWarning>,
+    _warnings: &mut Vec<ImportWarning>,
     base: EntityBase,
 ) {
     let id = layer_id(base);
-    if let Some(first) = layer_bases.get(&id) {
-        if first.pen_color != base.pen_color
-            || first.pen_style != base.pen_style
-            || first.pen_width != base.pen_width
-        {
-            warnings.push(ImportWarning {
-                code: "layer_style_conflict".to_owned(),
-                message: format!(
-                    "{id} has multiple JWW pen styles; first style is used because CAD source has no entity-level line style override"
-                ),
-                record_type: "style".to_owned(),
-            });
-        }
+    if layer_bases.contains_key(&id) {
         return;
     }
     layer_names.insert(id.clone(), jww_layer_name(document, base));
     layer_bases.insert(id, base);
+}
+
+fn remember_pen(pens: &mut BTreeMap<String, EntityBase>, base: EntityBase) {
+    pens.entry(pen_id(base)).or_insert(base);
+}
+
+fn remember_fill(
+    colors: &mut BTreeMap<String, String>,
+    base: EntityBase,
+    arbitrary: Option<u32>,
+) -> String {
+    if let Some(rgb) = arbitrary {
+        let id = format!("jww_solid_rgb_{:06X}", rgb & 0x00ff_ffff);
+        colors
+            .entry(id.clone())
+            .or_insert_with(|| format!("#{:06X}", rgb & 0x00ff_ffff));
+        id
+    } else {
+        let id = color_id(base);
+        colors
+            .entry(id.clone())
+            .or_insert_with(|| pen_color_rgb(base.pen_color).to_owned());
+        id
+    }
 }
 
 fn jww_layer_name(document: &JwwDocument, base: EntityBase) -> String {
@@ -1346,10 +1029,6 @@ fn jww_layer_name(document: &JwwDocument, base: EntityBase) -> String {
         return format!("{group_index:X}-{layer_index:X}");
     }
     format!("{} {}", group.name, layer.name).trim().to_owned()
-}
-
-fn unsupported(record_type: &str, base: EntityBase, message: &str) -> ImportWarning {
-    import_warning("unsupported_record", record_type, base, message)
 }
 
 fn geometry_skipped(record_type: &str, base: EntityBase, message: &str) -> ImportWarning {
@@ -1365,6 +1044,22 @@ fn import_warning(code: &str, record_type: &str, base: EntityBase, message: &str
 }
 
 fn record_text_style(context: &mut ConversionContext<'_>, text: &Text) -> String {
+    if !text.font_name.is_empty() && text.font_name != "Hiragino Sans" {
+        let message = format!(
+            "font {:?} is substituted with Hiragino Sans",
+            text.font_name
+        );
+        if !context.warnings.iter().any(|warning| {
+            warning.code == "font_substituted" && warning.message.starts_with(&message)
+        }) {
+            context.warnings.push(import_warning(
+                "font_substituted",
+                "CDataMoji",
+                text.base,
+                &message,
+            ));
+        }
+    }
     let style = TextStyleRequirement {
         height: text_height(text),
         width: text.size_x.abs(),
@@ -1422,6 +1117,20 @@ fn dimension_is_finite(dimension: &Dimension) -> bool {
     line_is_finite(&dimension.line) && text_is_finite(&dimension.text)
 }
 
+fn point_entity_is_finite(point: &Point) -> bool {
+    point_is_finite(point.at) && point.rotation.is_finite() && point.scale.is_finite()
+}
+
+fn circle_solid_is_finite(solid: &CircleSolid) -> bool {
+    point_is_finite(solid.center)
+        && solid.radius.is_finite()
+        && solid.flatness.is_finite()
+        && solid.tilt_rad.is_finite()
+        && solid.start_rad.is_finite()
+        && solid.sweep_rad.is_finite()
+        && solid.solid_param.is_finite()
+}
+
 fn block_is_finite(block: &Block) -> bool {
     block.ref_x.is_finite()
         && block.ref_y.is_finite()
@@ -1452,6 +1161,7 @@ fn entity_line_json(id: String, layer: &str, line: &Line) -> String {
         "id": id,
         "type": "line",
         "layer": layer,
+        "pen": pen_id(line.base),
         "p1": line.start,
         "p2": line.end,
     })
@@ -1467,6 +1177,7 @@ fn entity_curve_json(id: String, layer: &str, arc: &Arc) -> String {
             "id": id,
             "type": "circle",
             "layer": layer,
+            "pen": pen_id(arc.base),
             "center": arc.center,
             "radius": arc.radius.abs(),
         })
@@ -1477,6 +1188,7 @@ fn entity_curve_json(id: String, layer: &str, arc: &Arc) -> String {
             "id": id,
             "type": "arc",
             "layer": layer,
+            "pen": pen_id(arc.base),
             "center": arc.center,
             "radius": arc.radius.abs(),
             "start_deg": start_deg,
@@ -1495,6 +1207,7 @@ fn entity_curve_json(id: String, layer: &str, arc: &Arc) -> String {
             "id": id,
             "type": "ellipse",
             "layer": layer,
+            "pen": pen_id(arc.base),
             "center": arc.center,
             "radius_x": arc.radius.abs(),
             "radius_y": arc.radius.abs() * arc.flatness,
@@ -1512,6 +1225,7 @@ fn entity_text_json(id: String, layer: &str, style: &str, text: &Text) -> String
         "id": id,
         "type": "text",
         "layer": layer,
+        "pen": pen_id(text.base),
         "style": style,
         "at": text.start,
         "rotation_deg": text.angle,
@@ -1527,6 +1241,7 @@ fn entity_dimension_json(id: String, layer: &str, style: &str, dimension: &Dimen
         "id": id,
         "type": "dimension",
         "layer": layer,
+        "pen": pen_id(dimension.base),
         "style": style,
         "p1": dimension.line.start,
         "p2": dimension.line.end,
@@ -1534,6 +1249,55 @@ fn entity_dimension_json(id: String, layer: &str, style: &str, dimension: &Dimen
         "text_rotation_deg": dimension.text.angle,
         "text_mirror_y": dimension.text.mirror_y,
         "value": non_empty_string(&dimension.text.content),
+    })
+    .to_string()
+}
+
+fn entity_point_json(id: String, layer: &str, point: &Point) -> String {
+    json!({
+        "schema_version": CAD_SCHEMA_VERSION,
+        "id": id,
+        "type": "point",
+        "layer": layer,
+        "pen": pen_id(point.base),
+        "at": point.at,
+        "temporary": point.temporary,
+        "marker_code": point.marker_code,
+        "rotation_deg": point.rotation.to_degrees(),
+        "scale": point.scale.abs(),
+    })
+    .to_string()
+}
+
+fn entity_solid_json(id: String, layer: &str, solid: &Solid, fill: &str) -> String {
+    json!({
+        "schema_version": CAD_SCHEMA_VERSION,
+        "id": id,
+        "type": "solid",
+        "layer": layer,
+        "pen": pen_id(solid.base),
+        "points": solid.points,
+        "fill": fill,
+    })
+    .to_string()
+}
+
+fn entity_curve_solid_json(id: String, layer: &str, solid: &CircleSolid, fill: &str) -> String {
+    json!({
+        "schema_version": CAD_SCHEMA_VERSION,
+        "id": id,
+        "type": "curve_solid",
+        "layer": layer,
+        "pen": pen_id(solid.base),
+        "center": solid.center,
+        "radius": solid.radius.abs(),
+        "flatness": solid.flatness.abs(),
+        "rotation_deg": solid.tilt_rad.to_degrees(),
+        "start_deg": solid.start_rad.to_degrees(),
+        "end_deg": (solid.start_rad + solid.sweep_rad).to_degrees(),
+        "solid_param": solid.solid_param.abs(),
+        "encoding_code": solid.base.pen_style,
+        "fill": fill,
     })
     .to_string()
 }
@@ -1574,6 +1338,13 @@ fn line_type_id(base: EntityBase) -> String {
     format!("jww_line_{}", base.pen_style)
 }
 
+fn pen_id(base: EntityBase) -> String {
+    format!(
+        "jww_pen_c{}_l{}_w{}",
+        base.pen_color, base.pen_style, base.pen_width
+    )
+}
+
 fn text_style_id(style: TextStyleRequirement) -> String {
     format!(
         "jww_text_h{}_w{}_s{}",
@@ -1596,8 +1367,44 @@ fn style_suffix(value: f64) -> String {
     format_mm(value.abs()).replace('.', "_")
 }
 
-fn layers_toml(project: &ConvertedProject) -> String {
+fn layers_toml(project: &ConvertedProject, document: &JwwDocument) -> String {
     let mut out = String::new();
+    let active_layer = format!(
+        "jww_g{:X}_l{:X}",
+        document.header.write_layer_group.min(15),
+        document.header.layer_groups[document.header.write_layer_group.min(15) as usize]
+            .write_layer
+            .min(15)
+    );
+    if project.layer_bases.contains_key(&active_layer) {
+        out.push_str(&format!("active_layer = \"{active_layer}\"\n\n"));
+    }
+    let mut used_groups = project
+        .layer_bases
+        .values()
+        .map(|base| base.layer_group.min(15))
+        .collect::<BTreeSet<_>>();
+    for (group_index, group) in document.header.layer_groups.iter().enumerate() {
+        let default_name = format!("Group{group_index:X}");
+        if group.name != default_name
+            || group.state != 2
+            || group.protect != 0
+            || (group.scale - 1.0).abs() > f64::EPSILON
+            || document.header.write_layer_group as usize == group_index
+        {
+            used_groups.insert(group_index as u16);
+        }
+    }
+    for group_index in used_groups {
+        let group = &document.header.layer_groups[group_index as usize];
+        out.push_str(&format!(
+            "[groups.jww_g{group_index:X}]\nname = \"{}\"\norder = {group_index}\nscale_denominator = {}\nvisible = {}\nlocked = {}\n\n",
+            toml_escape(&group.name),
+            format_mm(group.scale.max(1.0)),
+            group.state != 0,
+            group.state == 1 || group.protect != 0,
+        ));
+    }
     for (id, base) in &project.layer_bases {
         let name = project
             .layer_names
@@ -1605,8 +1412,12 @@ fn layers_toml(project: &ConvertedProject) -> String {
             .filter(|name| !name.is_empty())
             .map_or(id.as_str(), String::as_str);
         out.push_str(&format!(
-            "[layers.\"{id}\"]\nname = \"{}\"\nvisible = true\nprintable = true\ncolor = \"{}\"\nline_type = \"{}\"\nline_width = {}\n\n",
+            "[layers.\"{id}\"]\nname = \"{}\"\ngroup = \"jww_g{:X}\"\norder = {}\nlocked = {}\nvisible = {}\nprintable = true\ncolor = \"{}\"\nline_type = \"{}\"\nline_width = {}\n\n",
             toml_escape(name),
+            base.layer_group.min(15),
+            base.layer.min(15),
+            layer_locked(document, *base),
+            layer_visible(document, *base),
             color_id(*base),
             line_type_id(*base),
             format_mm(line_width(*base))
@@ -1615,14 +1426,47 @@ fn layers_toml(project: &ConvertedProject) -> String {
     out
 }
 
+fn layer_visible(document: &JwwDocument, base: EntityBase) -> bool {
+    let group = &document.header.layer_groups[base.layer_group.min(15) as usize];
+    let layer = &group.layers[base.layer.min(15) as usize];
+    group.state != 0 && layer.state != 0
+}
+
+fn layer_locked(document: &JwwDocument, base: EntityBase) -> bool {
+    let group = &document.header.layer_groups[base.layer_group.min(15) as usize];
+    let layer = &group.layers[base.layer.min(15) as usize];
+    group.state == 1 || group.protect != 0 || layer.state == 1 || layer.protect != 0
+}
+
 fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{:04X}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn styles_toml(project: &ConvertedProject) -> String {
     let mut colors = BTreeSet::new();
     let mut line_types = BTreeSet::new();
-    for base in project.layer_bases.values() {
+    for base in project
+        .layer_bases
+        .values()
+        .chain(project.pen_bases.values())
+    {
         colors.insert(base.pen_color);
         line_types.insert(base.pen_style);
     }
@@ -1633,11 +1477,30 @@ fn styles_toml(project: &ConvertedProject) -> String {
             pen_color_rgb(color)
         ));
     }
+    for (id, rgb) in &project.fill_colors {
+        if !out.contains(&format!("[colors.{id}]")) {
+            out.push_str(&format!(
+                "[colors.{id}]\nrgb = \"{rgb}\"\nprint_width = 0.25\n\n"
+            ));
+        }
+    }
     for line_type in line_types {
         out.push_str(&format!(
             "[line_types.jww_line_{line_type}]\ndash = [{}]\n\n",
             dash_pattern(line_type)
         ));
+    }
+    if project.pen_bases.is_empty() {
+        out.push_str("[pens]\n\n");
+    } else {
+        for (id, base) in &project.pen_bases {
+            out.push_str(&format!(
+                "[pens.{id}]\ncolor = \"{}\"\nline_type = \"{}\"\nline_width = {}\n\n",
+                color_id(*base),
+                line_type_id(*base),
+                format_mm(line_width(*base)),
+            ));
+        }
     }
     if project.text_styles.is_empty() {
         out.push_str("[text_styles]\n\n");
@@ -1728,8 +1591,8 @@ fn sheet_scale(
     project: &ConvertedProject,
 ) -> (String, Option<ImportWarning>) {
     let mut scales = BTreeSet::<String>::new();
-    for base in project.layer_bases.values() {
-        let scale = document.header.layer_groups[base.layer_group.min(15) as usize].scale;
+    for group_index in &project.used_layer_groups {
+        let scale = document.header.layer_groups[*group_index as usize].scale;
         if scale.is_finite() && scale > 0.0 {
             scales.insert(format_mm(scale));
         }
@@ -1822,7 +1685,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_signature() {
-        let error = parse_document(b"NotJwwData").expect_err("invalid JWW should fail");
+        let error = read_document(b"NotJwwData")
+            .map_err(ImportError::from)
+            .expect_err("invalid JWW should fail");
         assert!(matches!(error, ImportError::InvalidSignature));
     }
 
@@ -1837,7 +1702,9 @@ mod tests {
         data.extend_from_slice(class_name);
         let mut reader = Reader::new(&data);
 
-        let error = parse_entity_list(&mut reader, 600).expect_err("unknown class should fail");
+        let error = cad_jww_codec::read_entity_list(&mut reader, 600)
+            .map_err(ImportError::from)
+            .expect_err("unknown class should fail");
 
         assert!(matches!(error, ImportError::UnknownEntityClass(name) if name == "CDataUnknown"));
     }
@@ -1846,7 +1713,9 @@ mod tests {
     fn rejects_invalid_block_definition_count() {
         let data = 10_001u32.to_le_bytes();
 
-        let error = parse_block_def_list(&data, 600).expect_err("invalid count should fail");
+        let error = cad_jww_codec::read_block_definitions(&data, 600)
+            .map_err(ImportError::from)
+            .expect_err("invalid count should fail");
 
         assert!(matches!(
             error,
@@ -1981,20 +1850,83 @@ mod tests {
     }
 
     #[test]
-    fn converts_known_unsupported_records_to_warnings() {
+    fn converts_point_records() {
         let document = test_document(
             vec![JwwEntity::Point(Point {
                 base: EntityBase::default(),
+                at: [10.0, 20.0],
+                temporary: false,
+                marker_code: None,
+                rotation: 0.0,
+                scale: 1.0,
             })],
             Vec::new(),
         );
 
         let converted = convert_ok(&document);
 
-        assert!(converted.entities.is_empty());
-        assert_eq!(converted.warnings.len(), 1);
-        assert_eq!(converted.warnings[0].code, "unsupported_record");
-        assert_eq!(converted.warnings[0].record_type, "CDataTen");
+        assert_eq!(converted.entities.len(), 1);
+        assert!(converted.entities[0].contains("\"type\":\"point\""));
+        assert!(converted.warnings.is_empty());
+    }
+
+    #[test]
+    fn preserves_unknown_point_marker_with_warning() {
+        let document = test_document(
+            vec![JwwEntity::Point(Point {
+                base: EntityBase::default(),
+                at: [10.0, 20.0],
+                temporary: false,
+                marker_code: Some(999),
+                rotation: 0.0,
+                scale: 1.0,
+            })],
+            Vec::new(),
+        );
+
+        let converted = convert_ok(&document);
+
+        assert!(converted.entities[0].contains("\"marker_code\":999"));
+        assert!(converted.warnings.iter().any(|warning| {
+            warning.code == "unsupported_marker" && warning.record_type == "CDataTen"
+        }));
+    }
+
+    #[test]
+    fn converts_polygon_and_curve_solid_records() {
+        let document = test_document(
+            vec![
+                JwwEntity::Solid(Solid {
+                    base: EntityBase::default(),
+                    points: [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]],
+                    color: Some(1),
+                }),
+                JwwEntity::CircleSolid(CircleSolid {
+                    base: EntityBase::default(),
+                    center: [20.0, 20.0],
+                    radius: 10.0,
+                    flatness: 0.5,
+                    tilt_rad: PI / 4.0,
+                    start_rad: 0.0,
+                    sweep_rad: PI,
+                    solid_param: 2.0,
+                    color: Some(2),
+                }),
+            ],
+            Vec::new(),
+        );
+
+        let converted = convert_ok(&document);
+        let values = entity_values(&converted.entities);
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["type"], "solid");
+        assert_eq!(values[0]["points"].as_array().map(Vec::len), Some(4));
+        assert_eq!(values[1]["type"], "curve_solid");
+        assert_eq!(values[1]["flatness"], 0.5);
+        assert!((values[1]["rotation_deg"].as_f64().expect("rotation") - 45.0).abs() < 1e-9);
+        assert!((values[1]["end_deg"].as_f64().expect("end angle") - 180.0).abs() < 1e-9);
+        assert!(converted.warnings.is_empty());
     }
 
     #[test]
@@ -2309,6 +2241,29 @@ mod tests {
     }
 
     #[test]
+    fn preserves_named_or_non_default_empty_layers() {
+        let mut document = test_document(
+            vec![JwwEntity::Line(Line {
+                base: EntityBase::default(),
+                start: [0.0, 0.0],
+                end: [100.0, 0.0],
+            })],
+            Vec::new(),
+        );
+        document.header.layer_groups[2].name = "Equipment".to_owned();
+        document.header.layer_groups[2].layers[3].name = "Spare".to_owned();
+        document.header.layer_groups[2].layers[3].state = 1;
+        let converted = convert_ok(&document);
+        let layers = layers_toml(&converted, &document);
+
+        assert!(converted.layer_bases.contains_key("jww_g2_l3"));
+        assert!(layers.contains("[groups.jww_g2]"));
+        assert!(layers.contains("[layers.\"jww_g2_l3\"]"));
+        assert!(layers.contains("name = \"Spare\""));
+        assert!(layers.contains("locked = true"));
+    }
+
+    #[test]
     fn warns_for_mixed_layer_group_scale() {
         let mut document = test_document(
             vec![
@@ -2545,23 +2500,25 @@ mod tests {
         );
         insta::assert_snapshot!(
             format!(
-                "supported={}\nwarnings={}\nline={}\narc={}\ncircle={}\ntext={}\ndimension={}",
+                "supported={}\nwarnings={}\nline={}\narc={}\ncircle={}\ntext={}\npoint={}\ndimension={}",
                 report.supported_entities,
                 report.warnings.len(),
                 counts.get("line").copied().unwrap_or_default(),
                 counts.get("arc").copied().unwrap_or_default(),
                 counts.get("circle").copied().unwrap_or_default(),
                 counts.get("text").copied().unwrap_or_default(),
+                counts.get("point").copied().unwrap_or_default(),
                 counts.get("dimension").copied().unwrap_or_default()
             ),
             @r###"
-        supported=1682
-        warnings=58
-        line=1642
-        arc=4
-        circle=0
-        text=36
-        dimension=0
+supported=1686
+warnings=2
+line=1642
+arc=4
+circle=0
+text=36
+point=4
+dimension=0
         "###
         );
     }
@@ -2776,12 +2733,18 @@ mod tests {
                 version: 600,
                 memo: String::new(),
                 paper_size: 0,
+                write_layer_group: 0,
                 layer_groups: std::array::from_fn(|group_index| LayerGroupHeader {
                     layers: std::array::from_fn(|layer_index| LayerHeader {
                         name: format!("{group_index:X}-{layer_index:X}"),
+                        state: 2,
+                        ..LayerHeader::default()
                     }),
                     name: format!("Group{group_index:X}"),
                     scale: 1.0,
+                    state: 2,
+                    write_layer: 0,
+                    protect: 0,
                 }),
             },
             entities,

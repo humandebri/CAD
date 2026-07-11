@@ -13,13 +13,18 @@ tauri-build.workspace = true
 
 [dependencies]
 cad-check.workspace = true
+cad-edit.workspace = true
 cad-diff.workspace = true
+cad-export-jww.workspace = true
 cad-import-jww.workspace = true
 cad-model.workspace = true
 cad-render-svg.workspace = true
+blake3.workspace = true
 chrono.workspace = true
+notify-debouncer-mini.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tempfile.workspace = true
+toml_edit.workspace = true

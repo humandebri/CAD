@@ -1,21 +1,20 @@
 [package]
-name = "cad-import-jww"
+name = "cad-export-jww"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cad-check.workspace = true
 cad-jww-codec.workspace = true
 cad-model.workspace = true
+encoding_rs.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tempfile.workspace = true
-ulid.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-cad-check.workspace = true
-cad-render-svg.workspace = true
-insta.workspace = true
+cad-import-jww.workspace = true
 tempfile.workspace = true

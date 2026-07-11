@@ -23,15 +23,15 @@ button {
 .app-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-rows: 52px 1fr;
+  grid-template-rows: auto 1fr;
 }
 
 .topbar {
-  display: grid;
-  grid-template-columns: auto minmax(260px, 1fr) auto auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
-  padding: 0 14px;
+  padding: 8px 14px;
   border-bottom: 1px solid #cfd8d5;
   background: #f8faf9;
 }
@@ -55,7 +55,34 @@ button {
 
 .project-actions {
   min-width: 0;
+  flex: 1;
   gap: 8px;
+}
+
+.editor-tools {
+  margin: 0;
+  padding-right: 0;
+  padding-bottom: 0;
+  padding-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  overflow-x: auto;
+  border-top: 1px solid #dbe3e0;
+  padding-top: 6px;
+}
+
+.drawing-select {
+  min-width: 150px;
+  height: 30px;
+  margin-right: 5px;
+  border: 1px solid #c7d1ce;
+  background: #ffffff;
+  padding: 0 8px;
 }
 
 .tool-button {
@@ -83,6 +110,34 @@ button {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.live-review-status {
+  min-width: 102px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #53615d;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.live-review-status.is-watching {
+  color: #18704d;
+}
+
+.live-review-status.is-error {
+  color: #9a5a00;
+}
+
+.is-spinning {
+  animation: live-review-spin 0.8s linear infinite;
+}
+
+@keyframes live-review-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .mode-tabs {
@@ -163,7 +218,7 @@ button {
 .review-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: 330px minmax(0, 1fr) 300px;
+  grid-template-columns: 360px minmax(0, 1fr) 300px;
 }
 
 .side-panel,
@@ -248,6 +303,194 @@ h3 {
   display: grid;
   gap: 14px;
   padding: 14px;
+}
+
+.layer-workspace {
+  border-bottom: 1px solid #dbe3e0;
+  padding: 12px 14px;
+}
+
+.layer-heading,
+.layer-group-row,
+.layer-row,
+.export-dialog header,
+.export-dialog footer {
+  display: flex;
+  align-items: center;
+}
+
+.layer-heading {
+  justify-content: space-between;
+}
+
+.layer-heading h2 {
+  margin: 0;
+}
+
+.icon-button.compact {
+  width: 26px;
+  min-height: 26px;
+}
+
+.layer-filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.layer-filters input[type="search"],
+.field-label select {
+  width: 100%;
+  min-height: 30px;
+  border: 1px solid #c7d1ce;
+  background: #ffffff;
+  padding: 0 8px;
+  color: #25302d;
+}
+
+.layer-filters label,
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #53615d;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.layer-groups {
+  max-height: 300px;
+  overflow: auto;
+  margin-top: 9px;
+  border-top: 1px solid #dbe3e0;
+}
+
+.layer-group {
+  border-bottom: 1px solid #e2e8e6;
+}
+
+.layer-group-row {
+  min-height: 32px;
+  gap: 3px;
+}
+
+.layer-group-row strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-list {
+  padding: 0 0 4px 24px;
+}
+
+.layer-row {
+  min-height: 30px;
+  gap: 2px;
+}
+
+.layer-row.is-active {
+  background: #dcebe6;
+}
+
+.layer-name {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: #25302d;
+  cursor: pointer;
+  text-align: left;
+}
+
+.layer-name span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-name small {
+  color: #75817e;
+  font-variant-numeric: tabular-nums;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(21 28 26 / 42%);
+}
+
+.export-dialog {
+  width: min(460px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid #9eaca8;
+  background: #f8faf9;
+  box-shadow: 0 18px 50px rgb(20 30 27 / 22%);
+  padding: 18px;
+}
+
+.export-dialog header {
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #dbe3e0;
+  padding-bottom: 12px;
+}
+
+.export-dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.field-label {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+  color: #44514d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.checkbox-row {
+  margin-top: 14px;
+  font-size: 12px;
+}
+
+.export-issues {
+  max-height: 190px;
+  overflow: auto;
+  margin-top: 14px;
+  border-left: 3px solid #b16b00;
+  background: #fff8e2;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
+.export-issues p {
+  margin: 6px 0 0;
+}
+
+.export-dialog footer {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.tool-button.primary {
+  border-color: #1d6f64;
+  background: #1d6f64;
+  color: #ffffff;
 }
 
 .result-section {
@@ -410,6 +653,16 @@ h3 {
   background: rgba(29, 111, 100, 0.1);
 }
 
+.draft-overlay {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
 .empty-state {
   place-self: center;
   padding: 12px 16px;
@@ -452,13 +705,80 @@ h3 {
   color: #5d6a66;
 }
 
+.entity-editor {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  border-top: 1px solid #cfd8d5;
+  padding-top: 14px;
+}
+
+.property-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) minmax(0, 1.4fr);
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.property-row span {
+  overflow: hidden;
+  color: #53615d;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.property-row input,
+.property-row select,
+.translate-controls input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid #c7d1ce;
+  background: #ffffff;
+  padding: 0 6px;
+}
+
+.property-row input[type="checkbox"] {
+  width: 18px;
+  justify-self: start;
+}
+
+.entity-actions,
+.translate-controls {
+  display: flex;
+  align-items: end;
+  gap: 6px;
+}
+
+.entity-actions button,
+.translate-controls button {
+  min-height: 28px;
+  border: 1px solid #aebbb7;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.translate-controls label {
+  min-width: 0;
+  flex: 1;
+  color: #53615d;
+  font-size: 10px;
+}
+
+.editor-message {
+  margin: 0;
+  color: #53615d;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 980px) {
   .app-shell {
     grid-template-rows: auto 1fr;
   }
 
   .topbar {
-    grid-template-columns: 1fr;
     height: auto;
     padding: 10px;
   }

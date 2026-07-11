@@ -2,23 +2,38 @@
  * apps/viewer: generated CAD review artifacts are loaded from fixed build paths.
  * The viewer keeps SVG interactive by inlining it and reading data-entity-id.
  */
-import { render } from "preact";
+import { render, type ComponentChildren } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  Circle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Eye,
+  EyeOff,
   FileInput,
   FileJson2,
+  FileOutput,
   FolderOpen,
+  Minus,
   Layers3,
+  Lock,
   Maximize2,
   MousePointer2,
+  PenLine,
+  Plus,
   RefreshCw,
+  RotateCcw,
+  Ruler,
   Scan,
   ScanSearch,
   Undo2,
+  Unlock,
+  Waypoints,
+  Type as TypeIcon,
   ZoomIn,
   ZoomOut,
 } from "lucide-preact";
@@ -31,12 +46,37 @@ import {
   type DiffChange,
   type DiffReport,
   type DiffWarning,
+  type LiveReviewState,
+  type ExportReport,
+  type EditOperation,
+  type EditorEntity,
+  type LayerRulesPatch,
+  type LayerWorkspaceState,
   type ProjectState,
+  type ProjectWatchEvent,
+  type SnapCandidate,
+  emptyLayerWorkspace,
 } from "./artifacts";
 import { formatError } from "./app-errors";
+import { applyDrawingEdit, queryDrawingSnap } from "./desktop-editor";
 import { LatestAiContextWriteQueue } from "./desktop-ai-context";
 import { importJwwFromDesktop } from "./desktop-import";
-import { loadArtifactsFromDesktop } from "./desktop-loader";
+import { loadReviewSnapshotFromDesktop } from "./desktop-loader";
+import {
+  exportJwwFromDesktop,
+  LatestLayerRulesQueue,
+} from "./desktop-layers";
+import {
+  DrawingLoadGuard,
+  LatestReviewQueue,
+  isRelevantProjectSourcePath,
+  mergeProjectStateFromReview,
+  sheetSvgContainsEntity,
+  shouldPreserveView,
+  startProjectWatchWithCatchUp,
+  stopProjectWatch,
+  subscribeProjectWatch,
+} from "./desktop-live-review";
 import {
   beginWheelHistory,
   committedWheelPrevious,
@@ -67,7 +107,18 @@ import {
 
 type ViewMode = "sheet" | "diff";
 type LoadState = "idle" | "loading" | "ready" | "error";
-type DragMode = "pan" | "jw-gesture" | "zoom-area" | "right-wait";
+type DragMode = "pan" | "jw-gesture" | "zoom-area" | "right-wait" | "edit-move";
+type EditorMode =
+  | "select"
+  | "move"
+  | "copy"
+  | "line"
+  | "polyline"
+  | "circle"
+  | "arc"
+  | "text"
+  | "dimension"
+  | "point";
 
 type DragInteraction = {
   pointerId: number;
@@ -102,12 +153,23 @@ function App() {
   const [artifacts, setArtifacts] = useState<Artifacts | null>(null);
   const [projectState, setProjectState] = useState<ProjectState | null>(null);
   const [importMessage, setImportMessage] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportReport, setExportReport] = useState<ExportReport | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [liveReviewState, setLiveReviewState] = useState<LiveReviewState>({
+    status: "starting",
+  });
   const [aiContextState, setAiContextState] = useState<AiContextState>({
     status: "no_entity_selected",
     message: "no entity selected",
   });
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [selectedEntityId, setSelectedEntityId] = useState("");
+  const [editorMode, setEditorMode] = useState<EditorMode>("select");
+  const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
+  const [snapCandidate, setSnapCandidate] = useState<SnapCandidate | null>(null);
+  const [editMessage, setEditMessage] = useState("");
+  const [isEditSaving, setIsEditSaving] = useState(false);
   const [baseViewBox, setBaseViewBox] = useState<ViewBox | null>(null);
   const [currentViewBox, setCurrentViewBox] = useState<ViewBox | null>(null);
   const [previousViewBox, setPreviousViewBox] = useState<ViewBox | null>(null);
@@ -117,12 +179,63 @@ function App() {
   const drawingStageRef = useRef<HTMLDivElement>(null);
   const svgSurfaceRef = useRef<HTMLDivElement>(null);
   const currentViewBoxRef = useRef<ViewBox | null>(null);
+  const projectStateRef = useRef<ProjectState | null>(null);
+  const currentDrawingRef = useRef<string | null>(null);
+  const snapSequenceRef = useRef(0);
+  const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const watchActiveRef = useRef(false);
+  const watchErrorRef = useRef<string | null>(null);
+  const viewContextRef = useRef<string | null>(null);
+  const watchListenerReadyRef = useRef<Promise<() => void> | null>(null);
   const dragInteraction = useRef<DragInteraction | null>(null);
   const suppressClickUntil = useRef(0);
   const wheelHistoryStart = useRef<ViewBox | null>(null);
   const wheelHistoryTimer = useRef<number | null>(null);
   const aiContextWriteQueue = useMemo(() => new LatestAiContextWriteQueue(), []);
+  const previousLayerVisibilityRef = useRef<LayerWorkspaceState | null>(null);
+  const layerRulesQueue = useMemo(() => new LatestLayerRulesQueue(), []);
+  const drawingLoadGuard = useMemo(() => new DrawingLoadGuard(), []);
+  const reviewQueue = useMemo(
+    () =>
+      new LatestReviewQueue((projectPath) =>
+        loadReviewSnapshotFromDesktop(
+          projectPath,
+          sanitizeSvg,
+          undefined,
+          currentDrawingRef.current ?? undefined,
+        ),
+      ),
+    [],
+  );
   const isDesktop = isTauriRuntime();
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+    let disposed = false;
+    const subscription = subscribeProjectWatch((event) => handleProjectWatchEvent(event));
+    watchListenerReadyRef.current = subscription;
+    subscription.catch((error: unknown) => {
+      if (!disposed) {
+        const message = formatError(error, "failed to listen for project changes");
+        watchActiveRef.current = false;
+        watchErrorRef.current = message;
+        setLiveReviewState({
+          status: "error",
+          message,
+        });
+      }
+    });
+    return () => {
+      disposed = true;
+      watchActiveRef.current = false;
+      reviewQueue.reset();
+      watchListenerReadyRef.current = null;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+      void stopProjectWatch().catch(() => undefined);
+    };
+  }, [isDesktop, reviewQueue]);
 
   useEffect(() => {
     if (isDesktop) {
@@ -145,6 +258,7 @@ function App() {
 
   const activeSvg = viewMode === "sheet" ? artifacts?.sheetSvg : artifacts?.diffSvg;
   const activeBaseViewBox = useMemo(() => parseSvgViewBox(activeSvg), [activeSvg]);
+  const viewContext = `${projectState?.project_path ?? (isDesktop ? "desktop" : "web")}:${artifacts?.currentDrawing ?? "drawing"}:${viewMode}`;
   const zoomScale = useMemo(() => {
     if (baseViewBox === null || currentViewBox === null) {
       return 1;
@@ -165,30 +279,44 @@ function App() {
       ),
     };
   }, [artifacts, selectedEntityId]);
+  const selectedEditorEntity = useMemo(
+    () => artifacts?.editor.entities.find((entity) => entity.id === selectedEntityId) ?? null,
+    [artifacts, selectedEntityId],
+  );
 
   useEffect(() => {
+    const preserveView = shouldPreserveView(viewContextRef.current, viewContext);
+    viewContextRef.current = viewContext;
     setBaseViewBox(activeBaseViewBox);
-    setCurrentViewBox(activeBaseViewBox);
-    currentViewBoxRef.current = activeBaseViewBox;
-    setPreviousViewBox(null);
-    setIsPanning(false);
-    setIsZoomAreaActive(false);
-    setSelectionRect(null);
-    dragInteraction.current = null;
-    clearPendingWheelHistory();
-  }, [activeBaseViewBox]);
+    if (!preserveView || currentViewBoxRef.current === null) {
+      setCurrentViewBox(activeBaseViewBox);
+      currentViewBoxRef.current = activeBaseViewBox;
+      setPreviousViewBox(null);
+      setIsPanning(false);
+      setIsZoomAreaActive(false);
+      setSelectionRect(null);
+      dragInteraction.current = null;
+      clearPendingWheelHistory();
+    }
+  }, [activeBaseViewBox, viewContext]);
 
   useEffect(() => {
-    function cancelZoomArea(event: KeyboardEvent) {
+    function cancelActiveOperation(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setIsZoomAreaActive(false);
         setSelectionRect(null);
         dragInteraction.current = null;
+        setEditorMode("select");
+        setDraftPoints([]);
+        setSnapCandidate(null);
+      }
+      if (event.key === "Enter" && editorMode === "polyline") {
+        completePolyline();
       }
     }
-    window.addEventListener("keydown", cancelZoomArea);
-    return () => window.removeEventListener("keydown", cancelZoomArea);
-  }, []);
+    window.addEventListener("keydown", cancelActiveOperation);
+    return () => window.removeEventListener("keydown", cancelActiveOperation);
+  }, [editorMode, draftPoints, artifacts]);
 
   useEffect(() => () => clearPendingWheelHistory(), []);
 
@@ -219,15 +347,30 @@ function App() {
   }, [activeSvg, selectedEntityId]);
 
   useEffect(() => {
+    if (artifacts !== null) {
+      applyLayerWorkspaceToSvg(artifacts.layers);
+    }
+  }, [activeSvg, artifacts?.layers]);
+
+  useEffect(() => {
     if (!isDesktop || projectState === null || loadState !== "ready") {
       return;
     }
     if (selectedEntityId === "") {
-      setAiContextState({
-        status: "no_entity_selected",
-        message: "no entity selected",
-      });
-      return;
+      return aiContextWriteQueue.enqueue(
+        {
+          projectPath: projectState.project_path,
+          viewMode,
+          selectedEntityId: "",
+        },
+        setAiContextState,
+        (error: unknown) => {
+          setAiContextState({
+            status: "error",
+            message: formatError(error, "failed to clear AI context"),
+          });
+        },
+      );
     }
     return aiContextWriteQueue.enqueue(
       {
@@ -328,7 +471,11 @@ function App() {
     if (svg === null) {
       return null;
     }
-    const content = bboxFromElements(svg.querySelectorAll("[data-entity-id][data-bbox]"));
+    const content = bboxFromElements(
+      Array.from(svg.querySelectorAll("[data-entity-id][data-bbox]")).filter(
+        (element) => element.getAttribute("data-layer-visible") !== "false",
+      ),
+    );
     return content === null ? null : fittedCadBBoxViewBox(content);
   }
 
@@ -340,7 +487,9 @@ function App() {
     const matchedElements: Element[] = [];
     svg.querySelectorAll("[data-entity-id][data-bbox]").forEach((element) => {
       if (element.getAttribute("data-entity-id") === entityId) {
-        matchedElements.push(element);
+        if (element.getAttribute("data-layer-visible") !== "false") {
+          matchedElements.push(element);
+        }
       }
     });
     const content = bboxFromElements(matchedElements);
@@ -475,6 +624,29 @@ function App() {
   }
 
   function handlePointerDown(event: PointerEvent) {
+    if ((editorMode === "move" || editorMode === "copy") && viewMode === "sheet") {
+      const targetId = event.target instanceof Element
+        ? event.target.closest("[data-entity-id]")?.getAttribute("data-entity-id")
+        : null;
+      const point = clientPointToSvg({ x: event.clientX, y: event.clientY });
+      if (targetId === selectedEntityId && point !== null && drawingStageRef.current !== null) {
+        const cadPoint: [number, number] = [point.x, -point.y];
+        dragInteraction.current = {
+          pointerId: event.pointerId,
+          mode: "edit-move",
+          startClient: { x: event.clientX, y: event.clientY },
+          endClient: { x: event.clientX, y: event.clientY },
+          startViewBox: currentViewBoxRef.current ?? { minX: 0, minY: 0, width: 1, height: 1 },
+          moved: false,
+        };
+        setDraftPoints([cadPoint, cadPoint]);
+        drawingStageRef.current.setPointerCapture(event.pointerId);
+      }
+      return;
+    }
+    if (editorMode !== "select" && viewMode === "sheet") {
+      return;
+    }
     const current = currentViewBoxRef.current;
     const stage = drawingStageRef.current;
     if (current === null || stage === null || (event.button !== 0 && event.button !== 2)) {
@@ -530,6 +702,9 @@ function App() {
   }
 
   function handlePointerMove(event: PointerEvent) {
+    if (editorMode !== "select" && viewMode === "sheet") {
+      void updateSnapForPointer(event);
+    }
     let interaction = dragInteraction.current;
     if (interaction === null) {
       return;
@@ -557,6 +732,14 @@ function App() {
 
     const endClient = { x: event.clientX, y: event.clientY };
     interaction.endClient = endClient;
+    if (interaction.mode === "edit-move") {
+      const point = clientPointToSvg(endClient);
+      if (point !== null) {
+        interaction.moved = pointDistance(interaction.startClient, endClient) >= PAN_DRAG_THRESHOLD_PX;
+        setDraftPoints((current) => [current[0] ?? [point.x, -point.y], [point.x, -point.y]]);
+      }
+      return;
+    }
     if (interaction.mode === "pan") {
       const distance = pointDistance(interaction.startClient, endClient);
       if (!interaction.moved && distance < PAN_DRAG_THRESHOLD_PX) {
@@ -611,6 +794,24 @@ function App() {
       stage.releasePointerCapture(event.pointerId);
     }
 
+    if (interaction.mode === "edit-move") {
+      suppressCanvasClick();
+      const start = draftPoints[0];
+      const rawEnd = clientPointToSvg(interaction.endClient);
+      const end = snapCandidate?.point ?? (rawEnd === null ? undefined : [rawEnd.x, -rawEnd.y] as [number, number]);
+      if (interaction.moved && start !== undefined && end !== undefined && selectedEntityId !== "") {
+        void commitDrawingEdit({
+          kind: "translate",
+          entity_id: selectedEntityId,
+          delta: [end[0] - start[0], end[1] - start[1]],
+          duplicate: editorMode === "copy",
+        });
+      } else {
+        setDraftPoints([]);
+      }
+      return;
+    }
+
     if (interaction.mode === "pan") {
       if (interaction.moved) {
         suppressCanvasClick();
@@ -641,6 +842,10 @@ function App() {
     }
     if (interaction.mode === "pan" && interaction.moved) {
       replaceCurrentViewBox(interaction.startViewBox);
+    }
+    if (interaction.mode === "edit-move") {
+      setDraftPoints([]);
+      setSnapCandidate(null);
     }
     dragInteraction.current = null;
     setIsPanning(false);
@@ -721,6 +926,7 @@ function App() {
     setLoadState("loading");
     loadArtifacts()
       .then((loaded) => {
+        currentDrawingRef.current = loaded.currentDrawing;
         setArtifacts(loaded);
         setProjectState(null);
         setLoadState("ready");
@@ -737,6 +943,15 @@ function App() {
 
   async function openDesktopProject(projectPath: string, clearSelection = true) {
     setLoadState("loading");
+    setLiveReviewState({ status: "starting" });
+    watchActiveRef.current = false;
+    watchErrorRef.current = null;
+    reviewQueue.reset();
+    layerRulesQueue.reset();
+    previousLayerVisibilityRef.current = null;
+    projectStateRef.current = null;
+    currentDrawingRef.current = null;
+    drawingLoadGuard.reset(null);
     if (clearSelection) {
       setSelectedEntityId("");
     }
@@ -746,11 +961,35 @@ function App() {
 
   async function loadDesktopProjectState(state: ProjectState) {
     await invoke("save_last_project", { projectPath: state.project_path });
-    const loaded = await loadArtifactsFromDesktop(state.project_path, sanitizeSvg);
-    setProjectState(state);
-    setImportMessage(importWarningMessage(state));
-    setArtifacts(loaded);
+    const loaded = await loadReviewSnapshotFromDesktop(state.project_path, sanitizeSvg);
+    currentDrawingRef.current = loaded.artifacts.currentDrawing;
+    drawingLoadGuard.reset(loaded.artifacts.currentDrawing);
+    const reviewedState = mergeProjectStateFromReview(state, loaded);
+    projectStateRef.current = reviewedState;
+    setProjectState(reviewedState);
+    setImportMessage(importWarningMessage(reviewedState));
+    setArtifacts(loaded.artifacts);
     setLoadState("ready");
+    try {
+      const listenerReady = watchListenerReadyRef.current;
+      if (listenerReady === null) {
+        throw new Error("project watch listener is not ready");
+      }
+      await listenerReady;
+      await startProjectWatchWithCatchUp(state.project_path, (projectPath) => {
+        watchActiveRef.current = true;
+        watchErrorRef.current = null;
+        enqueueDesktopReview(projectPath);
+      });
+    } catch (error: unknown) {
+      const message = formatError(error, "failed to watch project");
+      watchActiveRef.current = false;
+      watchErrorRef.current = message;
+      setLiveReviewState({
+        status: "error",
+        message,
+      });
+    }
   }
 
   async function chooseProject() {
@@ -794,6 +1033,13 @@ function App() {
       return;
     }
     setLoadState("loading");
+    setLiveReviewState({ status: "starting" });
+    watchActiveRef.current = false;
+    watchErrorRef.current = null;
+    reviewQueue.reset();
+    projectStateRef.current = null;
+    layerRulesQueue.reset();
+    previousLayerVisibilityRef.current = null;
     setSelectedEntityId("");
     try {
       const state = await importJwwFromDesktop(selectedFile, selectedParent);
@@ -804,16 +1050,456 @@ function App() {
     }
   }
 
+  function applyLayerWorkspaceToSvg(state: LayerWorkspaceState) {
+    const groups = new Map(state.groups.map((group) => [group.id, group]));
+    const visibility = new Map(
+      state.layers.map((layer) => [
+        layer.id,
+        layer.visible && (groups.get(layer.group ?? "default")?.visible ?? true),
+      ]),
+    );
+    const locked = new Map(
+      state.layers.map((layer) => [
+        layer.id,
+        layer.locked || (groups.get(layer.group ?? "default")?.locked ?? false),
+      ]),
+    );
+    document.querySelectorAll(".drawing-stage [data-layer]").forEach((element) => {
+      const layerId = element.getAttribute("data-layer") ?? "";
+      const visible = visibility.get(layerId) ?? true;
+      if (element instanceof SVGElement) {
+        element.style.display = visible ? "" : "none";
+      }
+      element.setAttribute("data-layer-visible", String(visible));
+      element.setAttribute("data-layer-locked", String(locked.get(layerId) ?? false));
+    });
+  }
+
+  async function updateLayerWorkspace(
+    next: LayerWorkspaceState,
+    patch: LayerRulesPatch,
+    rememberVisibility = false,
+  ) {
+    if (artifacts === null) {
+      return;
+    }
+    if (rememberVisibility) {
+      previousLayerVisibilityRef.current = artifacts.layers;
+    }
+    setArtifacts((current) => (current === null ? current : { ...current, layers: next }));
+    applyLayerWorkspaceToSvg(next);
+    if (selectedEntityId !== "") {
+      const selected = currentSvgElement()?.querySelector(
+        `[data-entity-id="${selectedEntityId}"]`,
+      );
+      const selectedLayer = selected?.getAttribute("data-layer");
+      if (selectedLayer !== null && selectedLayer !== undefined) {
+        const layer = next.layers.find((candidate) => candidate.id === selectedLayer);
+        const group = next.groups.find(
+          (candidate) => candidate.id === (layer?.group ?? "default"),
+        );
+        if (layer?.visible === false || group?.visible === false) {
+          setSelectedEntityId("");
+        }
+      }
+    }
+    if (!isDesktop || projectState === null) {
+      return;
+    }
+    try {
+      const result = await layerRulesQueue.enqueue(projectState.project_path, {
+        ...patch,
+        expectedRevision: artifacts.layers.revision,
+      });
+      if (!result.isLatest) {
+        return;
+      }
+      if ("error" in result) {
+        setImportMessage(formatError(result.error, "failed to update layer rules"));
+        enqueueDesktopReview(projectState.project_path);
+        return;
+      }
+      setArtifacts((current) =>
+        current === null ? current : { ...current, layers: result.state },
+      );
+      applyLayerWorkspaceToSvg(result.state);
+    } catch (error: unknown) {
+      setImportMessage(formatError(error, "failed to update layer rules"));
+      enqueueDesktopReview(projectState.project_path);
+    }
+  }
+
+  async function restoreLayerVisibility() {
+    if (artifacts === null || previousLayerVisibilityRef.current === null) {
+      return;
+    }
+    const previous = previousLayerVisibilityRef.current;
+    previousLayerVisibilityRef.current = artifacts.layers;
+    await updateLayerWorkspace(
+      previous,
+      {
+        expectedRevision: artifacts.layers.revision,
+        layers: previous.layers.map((layer) => ({ id: layer.id, visible: layer.visible })),
+      },
+    );
+  }
+
+  async function performJwwExport(drawing: string, allowLossy: boolean) {
+    if (!isDesktop || projectState === null) {
+      return;
+    }
+    const outputPath = await save({
+      title: "Export JWW (Experimental)",
+      defaultPath: `${projectState.project_name}.jww`,
+      filters: [{ name: "JWW", extensions: ["jww"] }],
+    });
+    if (typeof outputPath !== "string") {
+      return;
+    }
+    setExportBusy(true);
+    try {
+      let report: ExportReport;
+      try {
+        report = await exportJwwFromDesktop(
+          projectState.project_path,
+          drawing,
+          outputPath,
+          allowLossy,
+          false,
+        );
+      } catch (error: unknown) {
+        const message = formatError(error, "JWW export failed");
+        if (!message.includes("output already exists")) {
+          throw error;
+        }
+        const overwrite = await confirm("Replace the existing JWW file?", {
+          title: "Export JWW",
+          kind: "warning",
+        });
+        if (!overwrite) {
+          return;
+        }
+        report = await exportJwwFromDesktop(
+          projectState.project_path,
+          drawing,
+          outputPath,
+          allowLossy,
+          true,
+        );
+      }
+      setExportReport(report);
+      if (report.status === "exported") {
+        setImportMessage(`JWW exported with ${report.warnings.length} warning(s).`);
+        setExportOpen(false);
+      }
+    } catch (error: unknown) {
+      setImportMessage(formatError(error, "JWW export failed"));
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
   function rerunReview() {
     if (isDesktop && projectState !== null) {
-      openDesktopProject(projectState.project_path, false).catch((error: unknown) => {
-        setSelectedEntityId("");
-        setErrorMessage(formatError(error, "unknown review error"));
-        setLoadState("error");
-      });
+      enqueueDesktopReview(projectState.project_path);
       return;
     }
     loadWebArtifacts();
+  }
+
+  function handleProjectWatchEvent(event: ProjectWatchEvent) {
+    const currentProject = projectStateRef.current;
+    if (currentProject === null || event.project_path !== currentProject.project_path) {
+      return;
+    }
+    if (event.kind === "error") {
+      const message = event.message ?? "project watcher failed";
+      watchActiveRef.current = false;
+      watchErrorRef.current = message;
+      reviewQueue.reset();
+      setLiveReviewState({
+        status: "error",
+        message,
+      });
+      return;
+    }
+    if (!event.paths.some(isRelevantProjectSourcePath)) {
+      return;
+    }
+    watchActiveRef.current = true;
+    watchErrorRef.current = null;
+    enqueueDesktopReview(currentProject.project_path);
+  }
+
+  function enqueueDesktopReview(projectPath: string) {
+    setLiveReviewState({ status: "refreshing" });
+    reviewQueue.enqueue(
+      projectPath,
+      (loaded) => {
+        if (projectStateRef.current?.project_path !== projectPath) {
+          return;
+        }
+        if (!drawingLoadGuard.acceptsCurrent(loaded.artifacts.currentDrawing)) {
+          return;
+        }
+        drawingLoadGuard.reset(loaded.artifacts.currentDrawing);
+        const reviewedState = mergeProjectStateFromReview(projectStateRef.current, loaded);
+        projectStateRef.current = reviewedState;
+        setProjectState(reviewedState);
+        currentDrawingRef.current = loaded.artifacts.currentDrawing;
+        setArtifacts(loaded.artifacts);
+        setSelectedEntityId((entityId) =>
+          entityId === "" || sheetSvgContainsEntity(loaded.artifacts.sheetSvg, entityId)
+            ? entityId
+            : "",
+        );
+        setLoadState("ready");
+        if (watchActiveRef.current) {
+          setLiveReviewState({ status: "watching" });
+        } else {
+          setLiveReviewState({
+            status: "error",
+            message: watchErrorRef.current ?? "project watcher is unavailable",
+          });
+        }
+      },
+      (error: unknown) => {
+        if (projectStateRef.current?.project_path !== projectPath) {
+          return;
+        }
+        setLiveReviewState({
+          status: "error",
+          message: formatError(error, "live review failed"),
+        });
+      },
+    );
+  }
+
+  async function changeDrawing(drawing: string) {
+    if (!isDesktop || projectState === null || drawing === artifacts?.currentDrawing) {
+      return;
+    }
+    setLoadState("loading");
+    setSelectedEntityId("");
+    setEditorMode("select");
+    setDraftPoints([]);
+    setSnapCandidate(null);
+    reviewQueue.reset();
+    const token = drawingLoadGuard.begin(drawing);
+    currentDrawingRef.current = drawing;
+    try {
+      const loaded = await loadReviewSnapshotFromDesktop(
+        projectState.project_path,
+        sanitizeSvg,
+        undefined,
+        drawing,
+      );
+      if (!drawingLoadGuard.accepts(token, loaded.artifacts.currentDrawing)) {
+        return;
+      }
+      drawingLoadGuard.reset(loaded.artifacts.currentDrawing);
+      currentDrawingRef.current = loaded.artifacts.currentDrawing;
+      setArtifacts(loaded.artifacts);
+      setLoadState("ready");
+      setPreviousViewBox(null);
+    } catch (error: unknown) {
+      const restoredDrawing = drawingLoadGuard.rollback(token);
+      if (restoredDrawing === undefined) {
+        return;
+      }
+      currentDrawingRef.current = restoredDrawing;
+      setErrorMessage(formatError(error, "failed to switch drawing"));
+      setLoadState("error");
+    }
+  }
+
+  function selectEditorMode(mode: EditorMode) {
+    setEditorMode(mode);
+    setDraftPoints([]);
+    setSnapCandidate(null);
+    if (mode !== "select") {
+      setViewMode("sheet");
+    }
+  }
+
+  function activeLayerEditable(): string | null {
+    if (!isDesktop || artifacts === null) {
+      return null;
+    }
+    const active = artifacts.layers.active_layer;
+    const layer = artifacts.layers.layers.find((candidate) => candidate.id === active);
+    const group = artifacts.layers.groups.find(
+      (candidate) => candidate.id === (layer?.group ?? "default"),
+    );
+    if (layer === undefined || !layer.visible || layer.locked || group?.visible === false || group?.locked === true) {
+      return null;
+    }
+    return layer.id;
+  }
+
+  async function commitDrawingEdit(operation: EditOperation) {
+    if (isEditSaving || !isDesktop || projectState === null || artifacts === null) {
+      return;
+    }
+    setIsEditSaving(true);
+    setEditMessage("Saving edit...");
+    try {
+      const result = await applyDrawingEdit(projectState.project_path, {
+        drawing: artifacts.currentDrawing,
+        expected_revision: artifacts.editor.revision,
+        operation,
+      });
+      setArtifacts((current) =>
+        current === null
+          ? current
+          : { ...current, editor: { ...current.editor, revision: result.revision } },
+      );
+      setSelectedEntityId(result.entity_id ?? "");
+      setDraftPoints([]);
+      setSnapCandidate(null);
+      setEditorMode("select");
+      setEditMessage(`${result.operation} saved`);
+      enqueueDesktopReview(projectState.project_path);
+    } catch (error: unknown) {
+      const message = formatError(error, "edit failed");
+      setEditMessage(message);
+      if (message.includes("revision_conflict")) {
+        enqueueDesktopReview(projectState.project_path);
+      }
+    } finally {
+      setIsEditSaving(false);
+    }
+  }
+
+  function updateSnapForPointer(event: PointerEvent) {
+    if (event.shiftKey || projectState === null || artifacts === null) {
+      setSnapCandidate(null);
+      return;
+    }
+    const svgPoint = clientPointToSvg({ x: event.clientX, y: event.clientY });
+    const stage = drawingStageRef.current;
+    const viewBox = currentViewBoxRef.current;
+    if (svgPoint === null || stage === null || viewBox === null) {
+      return;
+    }
+    const sequence = ++snapSequenceRef.current;
+    const tolerance = (viewBox.width / Math.max(stage.clientWidth, 1)) * 10;
+    if (snapTimerRef.current !== null) {
+      clearTimeout(snapTimerRef.current);
+    }
+    const request = {
+      projectPath: projectState.project_path,
+      drawing: artifacts.currentDrawing,
+      revision: artifacts.editor.revision,
+      point: [svgPoint.x, -svgPoint.y] as [number, number],
+    };
+    snapTimerRef.current = setTimeout(() => {
+      snapTimerRef.current = null;
+      void queryDrawingSnap(request.projectPath, request.drawing, request.revision, request.point, tolerance)
+        .then((candidate) => {
+          if (sequence === snapSequenceRef.current) setSnapCandidate(candidate);
+        })
+        .catch(() => {
+          if (sequence === snapSequenceRef.current) setSnapCandidate(null);
+        });
+    }, 16);
+  }
+
+  function clickedCadPoint(event: MouseEvent): [number, number] | null {
+    if (snapCandidate !== null && !event.shiftKey) {
+      return snapCandidate.point;
+    }
+    const point = clientPointToSvg({ x: event.clientX, y: event.clientY });
+    return point === null ? null : [point.x, -point.y];
+  }
+
+  function completePolyline() {
+    const layer = activeLayerEditable();
+    if (layer === null || draftPoints.length < 2) {
+      return;
+    }
+    void commitDrawingEdit({
+      kind: "create",
+      entity: { type: "polyline", layer, pen: null, points: draftPoints, closed: false },
+    });
+  }
+
+  function handleDraftClick(event: MouseEvent): boolean {
+    if (editorMode === "select" || viewMode !== "sheet") {
+      return false;
+    }
+    const point = clickedCadPoint(event);
+    if (point === null || artifacts === null) {
+      return true;
+    }
+    if (editorMode === "move" || editorMode === "copy") {
+      if (selectedEntityId === "") {
+        setEditMessage("Select an entity first");
+        return true;
+      }
+      if (draftPoints.length === 0) {
+        setDraftPoints([point]);
+        return true;
+      }
+      void commitDrawingEdit({
+        kind: "translate",
+        entity_id: selectedEntityId,
+        delta: [point[0] - draftPoints[0][0], point[1] - draftPoints[0][1]],
+        duplicate: editorMode === "copy",
+      });
+      return true;
+    }
+    const layer = activeLayerEditable();
+    if (layer === null) {
+      setEditMessage("Choose a visible, unlocked active layer");
+      return true;
+    }
+    if (editorMode === "point") {
+      void commitDrawingEdit({
+        kind: "create",
+        entity: { type: "point", layer, pen: null, at: point, temporary: false, marker_code: null, rotation_deg: 0, scale: 1 },
+      });
+      return true;
+    }
+    if (editorMode === "text") {
+      const value = window.prompt("Text");
+      if (value !== null && value !== "") {
+        const style = artifacts.editor.text_styles[0];
+        if (style === undefined) {
+          setEditMessage("No text style is defined");
+        } else {
+          void commitDrawingEdit({
+            kind: "create",
+            entity: { type: "text", layer, pen: null, style, at: point, rotation_deg: 0, mirror_y: false, value },
+          });
+        }
+      }
+      return true;
+    }
+    const points = [...draftPoints, point];
+    setDraftPoints(points);
+    if (editorMode === "polyline") {
+      return true;
+    }
+    const needed = editorMode === "arc" || editorMode === "dimension" ? 3 : 2;
+    if (points.length < needed) {
+      return true;
+    }
+    if (editorMode === "line") {
+      void commitDrawingEdit({ kind: "create", entity: { type: "line", layer, pen: null, p1: points[0], p2: points[1] } });
+    } else if (editorMode === "circle") {
+      void commitDrawingEdit({ kind: "create", entity: { type: "circle", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]) } });
+    } else if (editorMode === "arc") {
+      void commitDrawingEdit({ kind: "create", entity: { type: "arc", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]), start_deg: pointAngle(points[0], points[1]), end_deg: pointAngle(points[0], points[2]) } });
+    } else if (editorMode === "dimension") {
+      const style = artifacts.editor.dimension_styles[0];
+      if (style === undefined) {
+        setEditMessage("No dimension style is defined");
+      } else {
+        void commitDrawingEdit({ kind: "create", entity: { type: "dimension", layer, pen: null, style, p1: points[0], p2: points[1], offset: signedLineOffset(points[0], points[1], points[2]), text_rotation_deg: 0, text_mirror_y: false, value: null } });
+      }
+    }
+    return true;
   }
 
   function handleSvgClick(event: MouseEvent) {
@@ -823,6 +1509,10 @@ function App() {
       return;
     }
     if (!(event.target instanceof Element)) {
+      return;
+    }
+    if (handleDraftClick(event)) {
+      event.preventDefault();
       return;
     }
     const entityElement = event.target.closest("[data-entity-id]");
@@ -850,6 +1540,18 @@ function App() {
                 <FileInput size={17} aria-hidden="true" />
                 Import JWW
               </button>
+              <button
+                type="button"
+                class="tool-button"
+                disabled={projectState === null}
+                onClick={() => {
+                  setExportReport(null);
+                  setExportOpen(true);
+                }}
+              >
+                <FileOutput size={17} aria-hidden="true" />
+                Export JWW
+              </button>
             </>
           )}
           <button
@@ -861,8 +1563,33 @@ function App() {
             <RefreshCw size={17} aria-hidden="true" />
             Re-run Review
           </button>
+          {isDesktop && projectState !== null && <LiveReviewStatus state={liveReviewState} />}
           <span class="diff-source">HEAD vs working tree</span>
         </div>
+        {isDesktop && artifacts !== null && (
+          <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving}>
+            <select
+              class="drawing-select"
+              aria-label="Current drawing"
+              value={artifacts.currentDrawing}
+              onChange={(event) => void changeDrawing(event.currentTarget.value)}
+            >
+              {artifacts.drawingNames.map((drawing) => (
+                <option value={drawing} key={drawing}>{drawing}</option>
+              ))}
+            </select>
+            <EditorToolButton mode="select" active={editorMode} label="Select" icon={<MousePointer2 size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="move" active={editorMode} label="Move" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="copy" active={editorMode} label="Copy" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="line" active={editorMode} label="Line" icon={<Minus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="polyline" active={editorMode} label="Polyline" icon={<PenLine size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="circle" active={editorMode} label="Circle" icon={<Circle size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="arc" active={editorMode} label="Arc" icon={<RotateCcw size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="text" active={editorMode} label="Text" icon={<TypeIcon size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="dimension" active={editorMode} label="Dimension" icon={<Ruler size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="point" active={editorMode} label="Point" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+          </fieldset>
+        )}
         <div class="mode-tabs" aria-label="SVG mode">
           <button
             type="button"
@@ -950,15 +1677,25 @@ function App() {
           <PanelHeader
             artifacts={artifacts}
             importMessage={importMessage}
+            liveReviewState={liveReviewState}
             loadState={loadState}
             projectState={projectState}
           />
           {artifacts !== null && (
-            <ResultPanel
-              artifacts={artifacts}
-              selectedEntityId={selectedEntityId}
-              onSelectEntity={selectEntity}
-            />
+            <>
+              <LayerWorkspace
+                state={artifacts.layers}
+                canPersist={!isDesktop || projectState !== null}
+                canRestore={previousLayerVisibilityRef.current !== null}
+                onChange={updateLayerWorkspace}
+                onRestore={restoreLayerVisibility}
+              />
+              <ResultPanel
+                artifacts={artifacts}
+                selectedEntityId={selectedEntityId}
+                onSelectEntity={selectEntity}
+              />
+            </>
           )}
         </aside>
 
@@ -984,6 +1721,11 @@ function App() {
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
               onPointerCancel={handlePointerCancel}
+              onDblClick={() => {
+                if (editorMode === "polyline") {
+                  completePolyline();
+                }
+              }}
               onContextMenu={(event) => event.preventDefault()}
             >
               <div
@@ -992,6 +1734,13 @@ function App() {
                 onClick={handleSvgClick}
                 dangerouslySetInnerHTML={{ __html: activeSvg }}
               />
+              {isDesktop && viewMode === "sheet" && currentViewBox !== null && (
+                <DraftOverlay
+                  viewBox={currentViewBox}
+                  points={draftPoints}
+                  snap={snapCandidate}
+                />
+              )}
               {selectionRect !== null && (
                 <div
                   class="zoom-area-rect"
@@ -1016,21 +1765,508 @@ function App() {
           {selectedEntityId === "" || selectedSummary === null ? (
             <p class="muted">Select an entity on the paper or from a result list.</p>
           ) : (
-            <EntityDetails entityId={selectedEntityId} summary={selectedSummary} />
+            <>
+              <EntityDetails entityId={selectedEntityId} summary={selectedSummary} />
+              {isDesktop && artifacts !== null && selectedEditorEntity !== null && (
+                <EntityPropertyEditor
+                  key={`${selectedEditorEntity.id}:${artifacts.editor.revision}`}
+                  entity={selectedEditorEntity}
+                  layers={artifacts.layers}
+                  pens={artifacts.editor.pens}
+                  message={editMessage}
+                  onReplace={(entity) => void commitDrawingEdit({ kind: "replace", entity_id: entity.id, entity })}
+                  onTranslate={(delta, duplicate) => void commitDrawingEdit({ kind: "translate", entity_id: selectedEditorEntity.id, delta, duplicate })}
+                  onDelete={() => void confirm("Delete the selected entity?", { title: "Delete entity", kind: "warning" }).then((accepted) => {
+                    if (accepted) {
+                      return commitDrawingEdit({ kind: "delete", entity_id: selectedEditorEntity.id });
+                    }
+                  })}
+                />
+              )}
+            </>
           )}
         </aside>
       </section>
+      {exportOpen && artifacts !== null && (
+        <ExportJwwDialog
+          drawingNames={artifacts.drawingNames}
+          busy={exportBusy}
+          report={exportReport}
+          onCancel={() => setExportOpen(false)}
+          onExport={performJwwExport}
+        />
+      )}
     </main>
+  );
+}
+
+function EditorToolButton(props: {
+  mode: EditorMode;
+  active: EditorMode;
+  label: string;
+  icon: ComponentChildren;
+  onSelect: (mode: EditorMode) => void;
+}) {
+  return (
+    <button
+      type="button"
+      class={props.active === props.mode ? "icon-button is-active" : "icon-button"}
+      aria-label={props.label}
+      title={props.label}
+      aria-pressed={props.active === props.mode}
+      onClick={() => props.onSelect(props.mode)}
+    >
+      {props.icon}
+    </button>
+  );
+}
+
+function DraftOverlay(props: {
+  viewBox: ViewBox;
+  points: Array<[number, number]>;
+  snap: SnapCandidate | null;
+}) {
+  const points = props.points.map(([x, y]) => `${x},${-y}`).join(" ");
+  const snap = props.snap?.point;
+  const markerSize = props.viewBox.width / 180;
+  return (
+    <svg
+      class="draft-overlay"
+      viewBox={formatViewBox(props.viewBox)}
+      preserveAspectRatio="xMinYMin meet"
+      aria-hidden="true"
+    >
+      {props.points.length > 1 && (
+        <polyline points={points} fill="none" stroke="#007c89" stroke-width={markerSize / 4} />
+      )}
+      {props.points.map(([x, y], index) => (
+        <circle key={`${x}:${y}:${index}`} cx={x} cy={-y} r={markerSize / 3} fill="#007c89" />
+      ))}
+      {snap !== undefined && (
+        <g transform={`translate(${snap[0]} ${-snap[1]})`}>
+          <circle r={markerSize} fill="none" stroke="#d04a00" stroke-width={markerSize / 4} />
+          <path d={`M ${-markerSize} 0 H ${markerSize} M 0 ${-markerSize} V ${markerSize}`} stroke="#d04a00" stroke-width={markerSize / 4} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+type PropertyPath = Array<string | number>;
+
+function EntityPropertyEditor(props: {
+  entity: EditorEntity;
+  layers: LayerWorkspaceState;
+  pens: string[];
+  message: string;
+  onReplace: (entity: EditorEntity) => void;
+  onTranslate: (delta: [number, number], duplicate: boolean) => void;
+  onDelete: () => void;
+}) {
+  const [draft, setDraft] = useState<EditorEntity>(() => structuredClone(props.entity));
+  const [dx, setDx] = useState(0);
+  const [dy, setDy] = useState(0);
+  const layer = props.layers.layers.find((candidate) => candidate.id === props.entity.layer);
+  const group = props.layers.groups.find((candidate) => candidate.id === (layer?.group ?? "default"));
+  const editable = layer?.visible !== false && layer?.locked !== true && group?.visible !== false && group?.locked !== true;
+  const leaves = editableLeaves(draft);
+
+  useEffect(() => {
+    setDraft(structuredClone(props.entity));
+  }, [props.entity]);
+
+  function update(path: PropertyPath, value: unknown) {
+    setDraft((current) => setPathValue(current, path, value));
+  }
+
+  return (
+    <section class="entity-editor" aria-label="Entity properties">
+      <h3>{draft.type} properties</h3>
+      <label class="property-row">
+        <span>layer</span>
+        <select value={draft.layer} disabled={!editable} onChange={(event) => update(["layer"], event.currentTarget.value)}>
+          {props.layers.layers.map((candidate) => (
+            <option value={candidate.id} key={candidate.id}>{candidate.name}</option>
+          ))}
+        </select>
+      </label>
+      <label class="property-row">
+        <span>pen</span>
+        <select value={draft.pen ?? ""} disabled={!editable} onChange={(event) => update(["pen"], event.currentTarget.value || null)}>
+          <option value="">Layer default</option>
+          {props.pens.map((pen) => <option value={pen} key={pen}>{pen}</option>)}
+        </select>
+      </label>
+      {leaves.map((leaf) => (
+        <label class="property-row" key={leaf.path.join(".")}>
+          <span>{leaf.path.join(".")}</span>
+          {typeof leaf.value === "boolean" ? (
+            <input type="checkbox" checked={leaf.value} disabled={!editable} onChange={(event) => update(leaf.path, event.currentTarget.checked)} />
+          ) : (
+            <input
+              type={typeof leaf.value === "number" ? "number" : "text"}
+              step={typeof leaf.value === "number" ? "any" : undefined}
+              value={leaf.value === null ? "" : String(leaf.value)}
+              disabled={!editable}
+              onInput={(event) => {
+                const value = typeof leaf.value === "number"
+                  ? Number(event.currentTarget.value)
+                  : event.currentTarget.value;
+                update(leaf.path, value);
+              }}
+            />
+          )}
+        </label>
+      ))}
+      <div class="entity-actions">
+        <button type="button" disabled={!editable} onClick={() => props.onReplace(draft)}>Apply</button>
+        <button type="button" disabled={!editable} onClick={props.onDelete}>Delete</button>
+      </div>
+      <div class="translate-controls">
+        <label>dx<input type="number" step="any" value={dx} onInput={(event) => setDx(Number(event.currentTarget.value))} /></label>
+        <label>dy<input type="number" step="any" value={dy} onInput={(event) => setDy(Number(event.currentTarget.value))} /></label>
+        <button type="button" disabled={!editable} onClick={() => props.onTranslate([dx, dy], false)}>Move</button>
+        <button type="button" disabled={!editable} onClick={() => props.onTranslate([dx, dy], true)}>Copy</button>
+      </div>
+      {props.message !== "" && <p class="editor-message">{props.message}</p>}
+    </section>
+  );
+}
+
+function editableLeaves(entity: EditorEntity): Array<{ path: PropertyPath; value: string | number | boolean | null }> {
+  const output: Array<{ path: PropertyPath; value: string | number | boolean | null }> = [];
+  const ignored = new Set(["schema_version", "id", "type", "layer", "pen"]);
+  function visit(value: unknown, path: PropertyPath) {
+    if (path.length === 1 && ignored.has(String(path[0]))) {
+      return;
+    }
+    if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output.push({ path, value });
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, [...path, index]));
+      return;
+    }
+    if (typeof value === "object") {
+      Object.entries(value as Record<string, unknown>).forEach(([key, item]) => visit(item, [...path, key]));
+    }
+  }
+  Object.entries(entity).forEach(([key, value]) => visit(value, [key]));
+  return output;
+}
+
+function setPathValue(entity: EditorEntity, path: PropertyPath, value: unknown): EditorEntity {
+  const next = structuredClone(entity) as Record<string, unknown>;
+  let target: Record<string | number, unknown> | unknown[] = next;
+  path.slice(0, -1).forEach((segment) => {
+    target = (target as Record<string | number, Record<string | number, unknown> | unknown[]>)[segment];
+  });
+  (target as Record<string | number, unknown>)[path[path.length - 1]] = value;
+  return next as EditorEntity;
+}
+
+function LayerWorkspace(props: {
+  state: LayerWorkspaceState;
+  canPersist: boolean;
+  canRestore: boolean;
+  onChange: (
+    next: LayerWorkspaceState,
+    patch: LayerRulesPatch,
+    rememberVisibility?: boolean,
+  ) => void | Promise<void>;
+  onRestore: () => void | Promise<void>;
+}) {
+  const { state, canPersist, canRestore, onChange, onRestore } = props;
+  const [query, setQuery] = useState("");
+  const [usedOnly, setUsedOnly] = useState(true);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const normalizedQuery = query.trim().toLowerCase();
+
+  function layersForGroup(groupId: string) {
+    return state.layers.filter((layer) => (layer.group ?? "default") === groupId);
+  }
+
+  function toggleGroupExpanded(groupId: string) {
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }
+
+  function setLayerVisible(layerId: string, visible: boolean) {
+    const next = {
+      ...state,
+      layers: state.layers.map((layer) => (layer.id === layerId ? { ...layer, visible } : layer)),
+    };
+    void onChange(next, { expectedRevision: state.revision, layers: [{ id: layerId, visible }] });
+  }
+
+  function setLayerLocked(layerId: string, locked: boolean) {
+    const next = {
+      ...state,
+      layers: state.layers.map((layer) => (layer.id === layerId ? { ...layer, locked } : layer)),
+    };
+    void onChange(next, { expectedRevision: state.revision, layers: [{ id: layerId, locked }] });
+  }
+
+  function setGroupVisible(groupId: string, visible: boolean) {
+    const isSyntheticDefault = groupId === "default" && state.layers.every((layer) => !layer.group);
+    const childIds = isSyntheticDefault
+      ? new Set(layersForGroup(groupId).map((layer) => layer.id))
+      : new Set<string>();
+    const next = {
+      ...state,
+      groups: state.groups.map((group) => (group.id === groupId ? { ...group, visible } : group)),
+      layers: state.layers.map((layer) =>
+        childIds.has(layer.id) ? { ...layer, visible } : layer,
+      ),
+    };
+    void onChange(next, {
+      expectedRevision: state.revision,
+      groups: isSyntheticDefault ? [] : [{ id: groupId, visible }],
+      layers: Array.from(childIds, (id) => ({ id, visible })),
+    });
+  }
+
+  function setGroupLocked(groupId: string, locked: boolean) {
+    const isSyntheticDefault = groupId === "default" && state.layers.every((layer) => !layer.group);
+    const childIds = isSyntheticDefault
+      ? new Set(layersForGroup(groupId).map((layer) => layer.id))
+      : new Set<string>();
+    const next = {
+      ...state,
+      groups: state.groups.map((group) => (group.id === groupId ? { ...group, locked } : group)),
+      layers: state.layers.map((layer) =>
+        childIds.has(layer.id) ? { ...layer, locked } : layer,
+      ),
+    };
+    void onChange(next, {
+      expectedRevision: state.revision,
+      groups: isSyntheticDefault ? [] : [{ id: groupId, locked }],
+      layers: Array.from(childIds, (id) => ({ id, locked })),
+    });
+  }
+
+  function isolateLayer(layerId: string) {
+    const updates = state.layers.map((layer) => ({ id: layer.id, visible: layer.id === layerId }));
+    const next = {
+      ...state,
+      groups: state.groups.map((group) => ({
+        ...group,
+        visible: layersForGroup(group.id).some((layer) => layer.id === layerId),
+      })),
+      layers: state.layers.map((layer) => ({ ...layer, visible: layer.id === layerId })),
+    };
+    void onChange(
+      next,
+      {
+        expectedRevision: state.revision,
+        layers: updates,
+        groups: next.groups.map((group) => ({ id: group.id, visible: group.visible })),
+      },
+      true,
+    );
+  }
+
+  return (
+    <section class="layer-workspace" aria-label="Layers">
+      <div class="layer-heading">
+        <h2>
+          <Layers3 size={17} aria-hidden="true" />
+          Layers
+        </h2>
+        <button
+          type="button"
+          class="icon-button compact"
+          title="Restore visibility"
+          aria-label="Restore visibility"
+          disabled={!canRestore || !canPersist}
+          onClick={() => void onRestore()}
+        >
+          <RotateCcw size={15} aria-hidden="true" />
+        </button>
+      </div>
+      <div class="layer-filters">
+        <input
+          type="search"
+          value={query}
+          placeholder="Filter layers"
+          aria-label="Filter layers"
+          onInput={(event) => setQuery(event.currentTarget.value)}
+        />
+        <label>
+          <input
+            type="checkbox"
+            checked={usedOnly}
+            onChange={(event) => setUsedOnly(event.currentTarget.checked)}
+          />
+          Used only
+        </label>
+      </div>
+      <div class="layer-groups">
+        {state.groups.map((group) => {
+          const layers = layersForGroup(group.id).filter((layer) => {
+            if (usedOnly && layer.used_entity_count === 0) return false;
+            if (normalizedQuery === "") return true;
+            return `${layer.id} ${layer.name}`.toLowerCase().includes(normalizedQuery);
+          });
+          if (layers.length === 0 && (usedOnly || normalizedQuery !== "")) return null;
+          const isCollapsed = collapsed.has(group.id);
+          return (
+            <section class="layer-group" key={group.id}>
+              <div class="layer-group-row">
+                <button
+                  type="button"
+                  class="icon-button compact"
+                  aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${group.name}`}
+                  onClick={() => toggleGroupExpanded(group.id)}
+                >
+                  {isCollapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                </button>
+                <button
+                  type="button"
+                  class="icon-button compact"
+                  aria-label={`${group.visible ? "Hide" : "Show"} group ${group.name}`}
+                  disabled={!canPersist}
+                  onClick={() => setGroupVisible(group.id, !group.visible)}
+                >
+                  {group.visible ? <Eye size={15} /> : <EyeOff size={15} />}
+                </button>
+                <strong title={`1/${group.scale_denominator}`}>{group.name}</strong>
+                <button
+                  type="button"
+                  class="icon-button compact layer-lock"
+                  aria-label={`${group.locked ? "Unlock" : "Lock"} group ${group.name}`}
+                  disabled={!canPersist}
+                  onClick={() => setGroupLocked(group.id, !group.locked)}
+                >
+                  {group.locked ? <Lock size={14} /> : <Unlock size={14} />}
+                </button>
+              </div>
+              {!isCollapsed && (
+                <div class="layer-list">
+                  {layers.map((layer) => (
+                    <div class={state.active_layer === layer.id ? "layer-row is-active" : "layer-row"} key={layer.id}>
+                      <button
+                        type="button"
+                        class="icon-button compact"
+                        aria-label={`${layer.visible ? "Hide" : "Show"} ${layer.name}`}
+                        disabled={!canPersist}
+                        onClick={() => setLayerVisible(layer.id, !layer.visible)}
+                      >
+                        {layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}
+                      </button>
+                      <button
+                        type="button"
+                        class="layer-name"
+                        title={layer.id}
+                        disabled={!canPersist}
+                        onClick={() =>
+                          void onChange(
+                            { ...state, active_layer: layer.id },
+                            { expectedRevision: state.revision, activeLayer: layer.id },
+                          )
+                        }
+                      >
+                        <span>{layer.name}</span>
+                        <small>{layer.used_entity_count}</small>
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-button compact"
+                        aria-label={`Isolate ${layer.name}`}
+                        title="Isolate layer"
+                        disabled={!canPersist}
+                        onClick={() => isolateLayer(layer.id)}
+                      >
+                        <ScanSearch size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-button compact"
+                        aria-label={`${layer.locked ? "Unlock" : "Lock"} ${layer.name}`}
+                        disabled={!canPersist}
+                        onClick={() => setLayerLocked(layer.id, !layer.locked)}
+                      >
+                        {layer.locked ? <Lock size={14} /> : <Unlock size={14} />}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ExportJwwDialog(props: {
+  drawingNames: string[];
+  busy: boolean;
+  report: ExportReport | null;
+  onCancel: () => void;
+  onExport: (drawing: string, allowLossy: boolean) => void | Promise<void>;
+}) {
+  const { drawingNames, busy, report, onCancel, onExport } = props;
+  const [drawing, setDrawing] = useState(drawingNames[0] ?? "");
+  const [allowLossy, setAllowLossy] = useState(false);
+  return (
+    <div class="dialog-backdrop" role="presentation">
+      <section class="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
+        <header>
+          <div>
+            <p class="eyebrow">Experimental</p>
+            <h2 id="export-title">Export JWW</h2>
+          </div>
+          <button type="button" class="tool-button" disabled={busy} onClick={onCancel}>Close</button>
+        </header>
+        <label class="field-label">
+          Drawing
+          <select value={drawing} onChange={(event) => setDrawing(event.currentTarget.value)}>
+            {drawingNames.map((name) => <option value={name} key={name}>{name}</option>)}
+          </select>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" checked={allowLossy} onChange={(event) => setAllowLossy(event.currentTarget.checked)} />
+          Allow lossy export
+        </label>
+        {report?.status === "blocked" && (
+          <div class="export-issues">
+            <strong>{report.blockers.length} blocker(s)</strong>
+            {report.blockers.map((issue, index) => (
+              <p key={`${issue.code}-${index}`}><code>{issue.code}</code> {issue.message}</p>
+            ))}
+          </div>
+        )}
+        <footer>
+          <button
+            type="button"
+            class="tool-button primary"
+            disabled={busy || drawing === ""}
+            onClick={() => void onExport(drawing, allowLossy)}
+          >
+            <FileOutput size={16} aria-hidden="true" />
+            {busy ? "Exporting" : "Choose Destination"}
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
 function PanelHeader(props: {
   artifacts: Artifacts | null;
   importMessage: string;
+  liveReviewState: LiveReviewState;
   loadState: LoadState;
   projectState: ProjectState | null;
 }) {
-  const { artifacts, importMessage, loadState, projectState } = props;
+  const { artifacts, importMessage, liveReviewState, loadState, projectState } = props;
   const status = artifacts === null ? loadState : `${artifacts.check.status} / ${artifacts.diff.status}`;
   return (
     <div class="panel-header">
@@ -1039,6 +2275,9 @@ function PanelHeader(props: {
         <h1>{projectState?.project_name ?? "plan_1f"}</h1>
         {projectState !== null && <p class="project-path">{projectState.project_path}</p>}
         {importMessage !== "" && <p class="warning-line">{importMessage}</p>}
+        {liveReviewState.status === "error" && (
+          <p class="warning-line">Live review: {liveReviewState.message ?? "unknown error"}</p>
+        )}
       </div>
       <span class="status-chip">{status}</span>
     </div>
@@ -1059,6 +2298,33 @@ function AiContextStatusLine(props: { state: AiContextState }) {
     return <p class="warning-line">AI Context: write failed: {state.message ?? "unknown error"}</p>;
   }
   return <p class="warning-line">AI Context: no entity selected</p>;
+}
+
+function LiveReviewStatus(props: { state: LiveReviewState }) {
+  const { state } = props;
+  const label = `Live: ${state.status}`;
+  const icon =
+    state.status === "watching" ? (
+      <CheckCircle2 size={15} aria-hidden="true" />
+    ) : state.status === "error" ? (
+      <AlertTriangle size={15} aria-hidden="true" />
+    ) : (
+      <RefreshCw
+        size={15}
+        class={state.status === "refreshing" ? "is-spinning" : undefined}
+        aria-hidden="true"
+      />
+    );
+  return (
+    <span
+      class={`live-review-status is-${state.status}`}
+      title={state.message}
+      aria-live="polite"
+    >
+      {icon}
+      {label}
+    </span>
+  );
 }
 
 function ResultPanel(props: {
@@ -1217,12 +2483,64 @@ async function loadArtifacts(): Promise<Artifacts> {
     fetchJson(paths.diff),
     fetchText(paths.comments),
   ]);
+  const safeSheetSvg = sanitizeSvg(sheetSvg);
   return {
-    sheetSvg: sanitizeSvg(sheetSvg),
+    sheetSvg: safeSheetSvg,
     diffSvg: sanitizeSvg(diffSvg),
     check: parseCheckReport(checkValue),
     diff: parseDiffReport(diffValue),
     comments: parseComments(commentsText),
+    layers: layerWorkspaceFromSvg(safeSheetSvg),
+    drawingNames: ["plan_1f"],
+    currentDrawing: "plan_1f",
+    editor: {
+      drawing: "plan_1f",
+      revision: "web",
+      entities: [],
+      text_styles: [],
+      dimension_styles: [],
+      pens: [],
+    },
+  };
+}
+
+function layerWorkspaceFromSvg(svgText: string): LayerWorkspaceState {
+  const document = new DOMParser().parseFromString(svgText, "image/svg+xml");
+  if (document.querySelector("parsererror") !== null) {
+    return emptyLayerWorkspace;
+  }
+  const counts = new Map<string, number>();
+  document.querySelectorAll("[data-entity-id][data-layer]").forEach((element) => {
+    const layer = element.getAttribute("data-layer");
+    if (layer !== null && layer !== "") {
+      counts.set(layer, (counts.get(layer) ?? 0) + 1);
+    }
+  });
+  return {
+    revision: "web-artifact",
+    active_layer: null,
+    groups: [
+      {
+        id: "default",
+        name: "Default",
+        order: 0,
+        scale_denominator: 1,
+        visible: true,
+        locked: false,
+      },
+    ],
+    layers: Array.from(counts.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, used], order) => ({
+        id,
+        name: id,
+        group: "default",
+        order,
+        visible: true,
+        locked: false,
+        printable: true,
+        used_entity_count: used,
+      })),
   };
 }
 
@@ -1250,6 +2568,25 @@ function pointDistance(first: Point, second: Point): number {
   return Math.hypot(second.x - first.x, second.y - first.y);
 }
 
+function pointArrayDistance(first: [number, number], second: [number, number]): number {
+  return Math.hypot(second[0] - first[0], second[1] - first[1]);
+}
+
+function pointAngle(center: [number, number], point: [number, number]): number {
+  return (Math.atan2(point[1] - center[1], point[0] - center[0]) * 180) / Math.PI;
+}
+
+function signedLineOffset(
+  first: [number, number],
+  second: [number, number],
+  point: [number, number],
+): number {
+  const dx = second[0] - first[0];
+  const dy = second[1] - first[1];
+  const length = Math.hypot(dx, dy);
+  return length === 0 ? 0 : ((point[0] - first[0]) * -dy + (point[1] - first[1]) * dx) / length;
+}
+
 function parseSvgViewBox(svgText: string | undefined): ViewBox | null {
   if (svgText === undefined) {
     return null;
@@ -1275,12 +2612,18 @@ function sanitizeSvg(svgText: string): string {
   if (document.querySelector("parsererror") !== null) {
     throw new Error("SVG parse failed");
   }
-  document.querySelectorAll("script, foreignObject").forEach((element) => element.remove());
+  document.querySelectorAll("script, foreignObject, image, use, iframe, object, embed").forEach((element) => element.remove());
   document.querySelectorAll("*").forEach((element) => {
     Array.from(element.attributes).forEach((attribute) => {
       const attributeName = attribute.name.toLowerCase();
       const attributeValue = attribute.value.trim().toLowerCase();
-      if (attributeName.startsWith("on") || attributeValue.startsWith("javascript:")) {
+      if (
+        attributeName.startsWith("on")
+        || attributeName === "href"
+        || attributeName.endsWith(":href")
+        || attributeValue.includes("javascript:")
+        || attributeValue.includes("url(")
+      ) {
         element.removeAttribute(attribute.name);
       }
     });
@@ -1339,6 +2682,17 @@ function parseDiffReport(value: unknown): DiffReport {
     status: readString(value.status),
     changes: readArray(value.changes).map(parseDiffChange),
     warnings: readArray(value.warnings).map(parseDiffWarning),
+    configuration_changes: Array.isArray(value.configuration_changes)
+      ? value.configuration_changes.map((change) => {
+        if (!isRecord(change)) throw new Error("configuration change is not an object");
+        return {
+          path: readString(change.path),
+          kind: readString(change.kind) as "added" | "removed" | "modified",
+          before: change.before,
+          after: change.after,
+        };
+      })
+      : [],
   };
 }
 
