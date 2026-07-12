@@ -203,6 +203,15 @@ the public `Test1.jww` fixture are covered; solid compatibility still requires a
 licensed public fixture containing polygon, circle, ellipse, arc, and ring
 solids before it is considered complete.
 
+JWW blocks are intentionally one-way: import expands block references into
+ordinary CAD entities, and the source model does not retain block definitions.
+Consequently `block_ref` is a strict export blocker rather than a lossy
+reconstruction. Lossless block round-trip is outside the current source schema.
+Windows/Jw_cad compatibility is tracked in
+[`examples/jww-fixtures/COMPATIBILITY_CHECKLIST.md`](examples/jww-fixtures/COMPATIBILITY_CHECKLIST.md);
+completed runs use the templates under
+[`examples/jww-fixtures/validation/`](examples/jww-fixtures/validation/).
+
 ## Fixtures And Snapshots
 
 - Source fixtures live under `examples/house-small` and `examples/house-small-modified`.

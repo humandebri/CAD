@@ -947,6 +947,11 @@ mod tests {
         assert_eq!(report.status, ExportStatus::Exported);
 
         cad_import_jww::import_jww_file(&output, &reimported).expect("solid reimport");
+        let reimported_check = cad_check::check_project(&reimported);
+        assert!(
+            reimported_check.is_ok(),
+            "solid round-trip should remain checker-valid: {reimported_check:?}"
+        );
         let entities = fs::read_to_string(
             reimported
                 .join("drawings")

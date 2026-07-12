@@ -334,6 +334,7 @@ Status: implemented, pending Windows Jw_cad and licensed solid fixture validatio
 - `cadc export-jww` とDesktopの `Export JWW (Experimental)` を追加する。
 - strict exportは表現不能要素をblockerにし、lossy exportは欠落・代替をreportへ記録する。
 - JWW再import時のentity ID維持は保証しない。
+- JWW blockはimport時に通常entityへflattenし、`block_ref` exportはstrict blockerとして扱う。block定義の正本化は別計画とする。
 - Windows版Jw_cad実機確認と、ライセンス確認済みsolid fixtureの検証完了までExperimentalを維持する。
 
 ### Phase 9C: Direct Drafting And Entity Editing
