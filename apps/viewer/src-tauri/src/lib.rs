@@ -13,9 +13,10 @@ use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{Emitter, Manager, Runtime, State};
+use ulid::Ulid;
 
 const PROJECT_WATCH_EVENT: &str = "cad-project-watch";
 const PROJECT_WATCH_DEBOUNCE_MS: u64 = 250;
@@ -86,12 +87,50 @@ pub struct ProjectWatchEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentRecord {
+    #[serde(default = "default_schema_version")]
+    schema_version: String,
     id: String,
     drawing: String,
+    #[serde(default)]
+    anchor: Option<CommentAnchor>,
     #[serde(default)]
     entity_ids: Vec<String>,
     text: String,
     status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentAnchor {
+    x: f64,
+    y: f64,
+}
+
+fn default_schema_version() -> String {
+    "0.1".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentCreateRequest {
+    pub drawing: String,
+    pub expected_revision: String,
+    pub entity_id: String,
+    pub anchor: CommentAnchor,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentStatusRequest {
+    pub drawing: String,
+    pub expected_revision: String,
+    pub comment_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentMutationResult {
+    pub drawing: String,
+    pub revision: String,
+    pub comments: Vec<CommentRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +143,7 @@ pub struct ReviewArtifacts {
     check: cad_check::CheckReport,
     diff: Option<cad_diff::DiffReport>,
     comments: Vec<CommentRecord>,
+    comments_revision: String,
     diff_unavailable: Option<String>,
     layers: LayerWorkspaceState,
     editor: cad_edit::EditorDrawingState,
@@ -401,6 +441,176 @@ fn write_ai_context(
 }
 
 #[tauri::command]
+fn create_comment(
+    project_path: String,
+    request: CommentCreateRequest,
+) -> Result<CommentMutationResult, String> {
+    mutate_comments(
+        Path::new(&project_path),
+        &request.drawing,
+        &request.expected_revision,
+        |comments, project| {
+            if request.text.trim().is_empty() {
+                return Err("comment text must not be empty".to_owned());
+            }
+            let drawing = project
+                .drawings
+                .iter()
+                .find(|drawing| drawing.name == request.drawing)
+                .ok_or_else(|| format!("drawing {:?} was not found", request.drawing))?;
+            if !drawing
+                .entities
+                .iter()
+                .any(|entity| entity.entity.id().as_str() == request.entity_id)
+            {
+                return Err(format!("entity {:?} was not found", request.entity_id));
+            }
+            comments.push(CommentRecord {
+                schema_version: default_schema_version(),
+                id: format!("cmt_{}", Ulid::new()),
+                drawing: request.drawing.clone(),
+                anchor: Some(request.anchor.clone()),
+                entity_ids: vec![request.entity_id.clone()],
+                text: request.text.clone(),
+                status: "open".to_owned(),
+            });
+            Ok(())
+        },
+    )
+}
+
+#[tauri::command]
+fn update_comment_status(
+    project_path: String,
+    request: CommentStatusRequest,
+) -> Result<CommentMutationResult, String> {
+    mutate_comments(
+        Path::new(&project_path),
+        &request.drawing,
+        &request.expected_revision,
+        |comments, _| {
+            if !matches!(request.status.as_str(), "open" | "resolved") {
+                return Err("comment status must be open or resolved".to_owned());
+            }
+            let comment = comments
+                .iter_mut()
+                .find(|comment| comment.id == request.comment_id)
+                .ok_or_else(|| format!("comment {:?} was not found", request.comment_id))?;
+            comment.status = request.status.clone();
+            Ok(())
+        },
+    )
+}
+
+fn mutate_comments<F>(
+    project_path: &Path,
+    drawing: &str,
+    expected_revision: &str,
+    mutation: F,
+) -> Result<CommentMutationResult, String>
+where
+    F: FnOnce(&mut Vec<CommentRecord>, &cad_model::ProjectSource) -> Result<(), String>,
+{
+    static COMMENT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = COMMENT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "comment update lock is poisoned".to_owned())?;
+    let project = cad_model::load_project(project_path).map_err(|error| error.to_string())?;
+    if !project
+        .drawings
+        .iter()
+        .any(|candidate| candidate.name == drawing)
+    {
+        return Err(format!("drawing {drawing:?} was not found"));
+    }
+    let path = project_path
+        .join("comments")
+        .join(format!("{drawing}.ndjson"));
+    let original = if path.exists() {
+        fs::read(&path).map_err(|error| format!("failed to read comments: {error}"))?
+    } else {
+        Vec::new()
+    };
+    let actual_revision = blake3::hash(&original).to_hex().to_string();
+    if actual_revision != expected_revision {
+        return Err(format!(
+            "revision_conflict: comments changed (expected {expected_revision}, found {actual_revision})"
+        ));
+    }
+    let newline = if original.windows(2).any(|pair| pair == b"\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let trailing_newline = original.ends_with(b"\n");
+    let mut comments = parse_comment_records(&original)?;
+    mutation(&mut comments, &project)?;
+    let mut text = comments
+        .iter()
+        .map(|comment| serde_json::to_string(comment).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(newline);
+    if trailing_newline {
+        text.push_str(newline);
+    }
+    let current = if path.exists() {
+        fs::read(&path).map_err(|error| format!("failed to reread comments: {error}"))?
+    } else {
+        Vec::new()
+    };
+    if blake3::hash(&current).to_hex().to_string() != expected_revision {
+        return Err("revision_conflict: comments changed before publish".to_owned());
+    }
+    let permissions = fs::metadata(&path)
+        .or_else(|_| fs::metadata(project_path))
+        .map_err(|error| format!("failed to inspect comment permissions: {error}"))?
+        .permissions();
+    let parent = path.parent().ok_or("comments path has no parent")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create comments directory: {error}"))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".comments-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to stage comments: {error}"))?;
+    fs::write(staging.path(), text)
+        .map_err(|error| format!("failed to write comments: {error}"))?;
+    fs::set_permissions(staging.path(), permissions)
+        .map_err(|error| format!("failed to preserve comments permissions: {error}"))?;
+    staging
+        .persist(&path)
+        .map_err(|error| format!("failed to publish comments: {}", error.error))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read updated comments: {error}"))?;
+    Ok(CommentMutationResult {
+        drawing: drawing.to_owned(),
+        revision: blake3::hash(&bytes).to_hex().to_string(),
+        comments,
+    })
+}
+
+fn parse_comment_records(bytes: &[u8]) -> Result<Vec<CommentRecord>, String> {
+    String::from_utf8(bytes.to_vec())
+        .map_err(|error| format!("comments are not UTF-8: {error}"))?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|error| format!("invalid comment: {error}")))
+        .collect()
+}
+
+fn comment_revision(project_path: &Path, drawing: &str) -> Result<String, String> {
+    let path = project_path
+        .join("comments")
+        .join(format!("{drawing}.ndjson"));
+    let bytes = if path.exists() {
+        fs::read(&path).map_err(|error| format!("failed to read comments: {error}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+#[tauri::command]
 fn start_project_watch<R: Runtime>(
     app: tauri::AppHandle<R>,
     manager: State<'_, ProjectWatchManager>,
@@ -480,6 +690,8 @@ pub fn run() {
             import_jww,
             export_jww,
             update_layer_rules,
+            create_comment,
+            update_comment_status,
             write_ai_context,
             start_project_watch,
             stop_project_watch,
@@ -634,6 +846,8 @@ fn run_review_for_drawing(
     let sheet_svg = cad_render_svg::render_drawing_svg(&head, &drawing_name)
         .map_err(|error| format!("failed to render SVG: {error}"))?;
     let (comments, comment_diagnostics) = load_comments_for_drawing(project_path, &drawing_name);
+    let comments_revision = comment_revision(project_path, &drawing_name)
+        .unwrap_or_else(|_| blake3::hash(&[]).to_hex().to_string());
     check.diagnostics.extend(comment_diagnostics);
     let editor = cad_edit::editor_state(&head, &drawing_name)
         .map_err(|error| format!("failed to load editor state: {error}"))?;
@@ -671,6 +885,7 @@ fn run_review_for_drawing(
         check,
         diff,
         comments,
+        comments_revision,
         diff_unavailable,
         layers: layer_workspace_state_for_drawing(&head, Some(&drawing_name)),
         editor,
@@ -1687,6 +1902,57 @@ mod tests {
             diagnostic.code == "comments.read_failed"
                 && diagnostic.severity == cad_check::Severity::Warning
         }));
+    }
+
+    #[test]
+    fn comment_create_and_status_update_preserve_revision_contract() {
+        let repo = fixture_repo();
+        let path = repo.project_path.join("comments/plan_1f.ndjson");
+        let revision =
+            comment_revision(&repo.project_path, "plan_1f").expect("revision should load");
+        let created = create_comment(
+            repo.project_path.to_string_lossy().into_owned(),
+            CommentCreateRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_revision: revision,
+                entity_id: "ent_01JZ0000000000000000000000".to_owned(),
+                anchor: CommentAnchor { x: 12.0, y: 34.0 },
+                text: "new note".to_owned(),
+            },
+        )
+        .expect("comment should be created");
+        assert_eq!(
+            created.comments.last().expect("created comment").status,
+            "open"
+        );
+        assert!(
+            created
+                .comments
+                .last()
+                .expect("created comment")
+                .anchor
+                .is_some()
+        );
+
+        let updated = update_comment_status(
+            repo.project_path.to_string_lossy().into_owned(),
+            CommentStatusRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_revision: created.revision,
+                comment_id: created.comments.last().expect("created comment").id.clone(),
+                status: "resolved".to_owned(),
+            },
+        )
+        .expect("comment status should update");
+        assert_eq!(
+            updated.comments.last().expect("updated comment").status,
+            "resolved"
+        );
+        assert!(
+            fs::read_to_string(path)
+                .expect("comments should be readable")
+                .contains("resolved")
+        );
     }
 
     #[test]

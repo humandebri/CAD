@@ -59,6 +59,7 @@ import {
 } from "./artifacts";
 import { formatError } from "./app-errors";
 import { applyDrawingEdit, queryDrawingSnap } from "./desktop-editor";
+import { createDesktopComment, updateDesktopCommentStatus } from "./desktop-comments";
 import { LatestAiContextWriteQueue } from "./desktop-ai-context";
 import { importJwwFromDesktop } from "./desktop-import";
 import { loadReviewSnapshotFromDesktop } from "./desktop-loader";
@@ -179,6 +180,7 @@ function App() {
   const drawingStageRef = useRef<HTMLDivElement>(null);
   const svgSurfaceRef = useRef<HTMLDivElement>(null);
   const currentViewBoxRef = useRef<ViewBox | null>(null);
+  const lastCommentAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const projectStateRef = useRef<ProjectState | null>(null);
   const currentDrawingRef = useRef<string | null>(null);
   const snapSequenceRef = useRef(0);
@@ -345,6 +347,10 @@ function App() {
       .querySelectorAll(`.drawing-stage [data-entity-id="${selectedEntityId}"]`)
       .forEach((element) => element.classList.add("is-selected"));
   }, [activeSvg, selectedEntityId]);
+
+  useEffect(() => {
+    lastCommentAnchorRef.current = null;
+  }, [artifacts?.currentDrawing, selectedEntityId]);
 
   useEffect(() => {
     if (artifacts !== null) {
@@ -624,6 +630,10 @@ function App() {
   }
 
   function handlePointerDown(event: PointerEvent) {
+    const anchorPoint = clientPointToSvg({ x: event.clientX, y: event.clientY });
+    if (anchorPoint !== null && viewMode === "sheet") {
+      lastCommentAnchorRef.current = { x: anchorPoint.x, y: -anchorPoint.y };
+    }
     if ((editorMode === "move" || editorMode === "copy") && viewMode === "sheet") {
       const targetId = event.target instanceof Element
         ? event.target.closest("[data-entity-id]")?.getAttribute("data-entity-id")
@@ -919,6 +929,53 @@ function App() {
     setSelectedEntityId(entityId);
     if (focus) {
       focusSelectedEntity(entityId);
+    }
+  }
+
+  async function createCommentForSelection() {
+    if (!isDesktop || projectState === null || artifacts === null || selectedEntityId === "") {
+      return;
+    }
+    const text = window.prompt("Comment");
+    if (text === null || text.trim() === "") {
+      return;
+    }
+    try {
+      const result = await createDesktopComment(projectState.project_path, {
+        drawing: artifacts.currentDrawing,
+        expected_revision: artifacts.commentsRevision,
+        entity_id: selectedEntityId,
+        anchor: lastCommentAnchorRef.current ?? entityAnchor(selectedEditorEntity),
+        text,
+      });
+      setArtifacts((current) => current === null ? current : {
+        ...current,
+        comments: result.comments,
+        commentsRevision: result.revision,
+      });
+    } catch (error: unknown) {
+      setEditMessage(formatError(error, "failed to create comment"));
+    }
+  }
+
+  async function changeCommentStatus(comment: CommentRecord) {
+    if (!isDesktop || projectState === null || artifacts === null) {
+      return;
+    }
+    try {
+      const result = await updateDesktopCommentStatus(projectState.project_path, {
+        drawing: artifacts.currentDrawing,
+        expected_revision: artifacts.commentsRevision,
+        comment_id: comment.id,
+        status: comment.status === "resolved" ? "open" : "resolved",
+      });
+      setArtifacts((current) => current === null ? current : {
+        ...current,
+        comments: result.comments,
+        commentsRevision: result.revision,
+      });
+    } catch (error: unknown) {
+      setEditMessage(formatError(error, "failed to update comment status"));
     }
   }
 
@@ -1694,6 +1751,9 @@ function App() {
                 artifacts={artifacts}
                 selectedEntityId={selectedEntityId}
                 onSelectEntity={selectEntity}
+                canEditComments={isDesktop && projectState !== null}
+                onCreateComment={() => void createCommentForSelection()}
+                onToggleCommentStatus={(comment) => void changeCommentStatus(comment)}
               />
             </>
           )}
@@ -1798,6 +1858,20 @@ function App() {
       )}
     </main>
   );
+}
+
+function entityAnchor(entity: EditorEntity | null): { x: number; y: number } {
+  if (entity === null) {
+    return { x: 0, y: 0 };
+  }
+  const record = entity as Record<string, unknown>;
+  const points = Array.isArray(record.points) ? record.points : [];
+  const candidate = record.center ?? record.at ?? record.p1 ?? points[0];
+  if (Array.isArray(candidate) && candidate.length >= 2 &&
+      typeof candidate[0] === "number" && typeof candidate[1] === "number") {
+    return { x: candidate[0], y: candidate[1] };
+  }
+  return { x: 0, y: 0 };
 }
 
 function EditorToolButton(props: {
@@ -2331,8 +2405,18 @@ function ResultPanel(props: {
   artifacts: Artifacts;
   selectedEntityId: string;
   onSelectEntity: (entityId: string, focus: boolean) => void;
+  canEditComments: boolean;
+  onCreateComment: () => void;
+  onToggleCommentStatus: (comment: CommentRecord) => void;
 }) {
-  const { artifacts, selectedEntityId, onSelectEntity } = props;
+  const {
+    artifacts,
+    selectedEntityId,
+    onSelectEntity,
+    canEditComments,
+    onCreateComment,
+    onToggleCommentStatus,
+  } = props;
   return (
     <div class="result-stack">
       <section class="result-section">
@@ -2396,23 +2480,48 @@ function ResultPanel(props: {
       </section>
 
       <section class="result-section">
-        <h2>Comments</h2>
+        <h2>
+          Comments
+          {canEditComments && selectedEntityId !== "" && (
+            <button type="button" class="icon-button" onClick={onCreateComment} aria-label="Add comment">
+              <Plus size={15} aria-hidden="true" />
+            </button>
+          )}
+        </h2>
         <div class="comment-list">
           {artifacts.comments.map((comment) => (
-            <button
-              type="button"
+            <div
               class="comment-row"
               key={comment.id}
-              onClick={() => {
-                const entityId = comment.entity_ids[0] ?? "";
-                if (entityId !== "") {
-                  onSelectEntity(entityId, true);
-                }
-              }}
             >
-              <span>{comment.text}</span>
-              <small>{comment.status}</small>
-            </button>
+              <button
+                type="button"
+                class="comment-select-button"
+                onClick={() => {
+                  const entityId = comment.entity_ids[0] ?? "";
+                  if (entityId !== "") {
+                    onSelectEntity(entityId, true);
+                  }
+                }}
+              >
+                <span>{comment.text}</span>
+              </button>
+              <small>
+                {comment.status}
+                {canEditComments && (
+                  <button
+                    type="button"
+                    class="comment-status-button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onToggleCommentStatus(comment);
+                    }}
+                  >
+                    {comment.status === "resolved" ? "Reopen" : "Resolve"}
+                  </button>
+                )}
+              </small>
+            </div>
           ))}
         </div>
       </section>
@@ -2490,6 +2599,7 @@ async function loadArtifacts(): Promise<Artifacts> {
     check: parseCheckReport(checkValue),
     diff: parseDiffReport(diffValue),
     comments: parseComments(commentsText),
+    commentsRevision: "",
     layers: layerWorkspaceFromSvg(safeSheetSvg),
     drawingNames: ["plan_1f"],
     currentDrawing: "plan_1f",

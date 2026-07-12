@@ -35,6 +35,10 @@ scripts/ci-local.sh
 
 The script runs the same checks as the manual sequence below.
 
+`cadc format` normalizes numeric values in drawing and comment NDJSON to three
+decimal places while preserving unknown fields, line endings, trailing newline,
+and file permissions. TOML files are validated but not rewritten.
+
 ```bash
 cargo test --workspace
 cargo run -p cad-cli -- --help
@@ -128,6 +132,11 @@ Git's responsibility.
 Generated AI context is published as a matched JSON/Markdown generation under
 `build/ai-context/`. `build/ai-context-current.json` atomically points to the
 current pair, so readers never combine files from different selections.
+
+Desktop comments can be created for the selected entity and toggled between
+`open` and `resolved`. Comment writes use the comments file revision, preserve
+line endings and permissions, and publish atomically; stale writes are rejected
+with `revision_conflict`.
 
 Viewer zoom is based on the full-paper viewBox: `100%` means the initial paper
 view, and deep zoom is available up to `4096x`. The mouse wheel zooms around the

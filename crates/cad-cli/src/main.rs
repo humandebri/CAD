@@ -5,7 +5,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "cadc", version, about = "Git-native CAD source tooling")]
@@ -30,7 +31,7 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
-    #[command(about = "Load CAD source and prepare it for future formatting")]
+    #[command(about = "Normalize known CAD numeric values in source files")]
     Format {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
@@ -129,17 +130,8 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Format { project }) => {
-            let source = cad_model::load_project(&project).into_diagnostic()?;
-            let entity_count: usize = source
-                .drawings
-                .iter()
-                .map(|drawing| drawing.entities.len())
-                .sum();
-            println!(
-                "format scaffold ok: {} drawing(s), {} entity/entities",
-                source.drawings.len(),
-                entity_count
-            );
+            let files = format_project(&project).into_diagnostic()?;
+            println!("formatted {files} NDJSON file(s)");
         }
         Some(Command::ImportJww { input, out }) => {
             let report = cad_import_jww::import_jww_file(&input, &out).into_diagnostic()?;
@@ -271,9 +263,103 @@ fn write_text_file(path: &PathBuf, text: &str) -> Result<()> {
         .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
+fn format_project(project: &Path) -> std::io::Result<usize> {
+    let source = cad_model::load_project(project)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut files = Vec::new();
+    for drawing in &source.drawings {
+        files.push(
+            project
+                .join("drawings")
+                .join(&drawing.name)
+                .join("entities.ndjson"),
+        );
+    }
+    for drawing in &source.drawings {
+        let path = project
+            .join("comments")
+            .join(format!("{}.ndjson", drawing.name));
+        if path.exists() {
+            files.push(path);
+        }
+    }
+    for path in &files {
+        format_ndjson_file(path)?;
+    }
+    Ok(files.len())
+}
+
+fn format_ndjson_file(path: &Path) -> std::io::Result<()> {
+    let original = fs::read(path)?;
+    let mut output = String::new();
+    let text = String::from_utf8(original.clone())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    for (index, segment) in text.split_inclusive('\n').enumerate() {
+        let (line, ending) = if let Some(line) = segment.strip_suffix("\r\n") {
+            (line, "\r\n")
+        } else if let Some(line) = segment.strip_suffix('\n') {
+            (line, "\n")
+        } else {
+            (segment, "")
+        };
+        if line.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("empty NDJSON line at {}:{}", path.display(), index + 1),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid NDJSON at {}:{}: {error}",
+                    path.display(),
+                    index + 1
+                ),
+            )
+        })?;
+        output.push_str(
+            &serde_json::to_string(&normalize_numbers(value)).map_err(std::io::Error::other)?,
+        );
+        output.push_str(ending);
+    }
+    let permissions = fs::metadata(path)?.permissions();
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("source path has no parent"))?;
+    let mut staging = tempfile::Builder::new()
+        .prefix(".format-")
+        .tempfile_in(parent)?;
+    staging.write_all(output.as_bytes())?;
+    fs::set_permissions(staging.path(), permissions)?;
+    staging.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .and_then(|value| serde_json::Number::from_f64((value * 1000.0).round() / 1000.0))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Number(number)),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(normalize_numbers).collect())
+        }
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, normalize_numbers(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::paths_refer_to_same_file;
+    use super::{format_ndjson_file, normalize_numbers, paths_refer_to_same_file};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -286,5 +372,23 @@ mod tests {
             Path::new("result.jww"),
             Path::new("result.json")
         ));
+    }
+
+    #[test]
+    fn format_normalizes_numbers_and_preserves_crlf_and_trailing_newline() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp.path().join("entities.ndjson");
+        fs::write(&path, b"{\"x\":1.23456,\"unknown\":\"keep\"}\r\n")
+            .expect("fixture should write");
+        format_ndjson_file(&path).expect("format should succeed");
+        let text = fs::read_to_string(path).expect("formatted file should read");
+        assert!(text.contains("1.235"));
+        assert!(text.contains("keep"));
+        assert!(text.ends_with("\n"));
+        assert!(text.contains("\r\n"));
+        assert_eq!(
+            normalize_numbers(serde_json::json!({"x": 2.3456}))["x"],
+            2.346
+        );
     }
 }

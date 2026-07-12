@@ -28,3 +28,4 @@ tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tempfile.workspace = true
 toml_edit.workspace = true
+ulid.workspace = true

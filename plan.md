@@ -1,6 +1,6 @@
 # MVP Implementation Plan
 
-Status: implemented through Phase 8
+Status: implemented through Phase 9D; JWW compatibility validation remains pending
 
 Source: [ADR.md](ADR.md)
 
@@ -348,6 +348,8 @@ Status: implemented
 - AIや外部editorとの競合は`revision_conflict`で拒否する。
 
 ### Phase 9D: Comment Workflow
+
+Status: implemented
 
 - コメント作成とstatus変更を追加する。
 - コメントNDJSONの競合と原子的書込を定義する。

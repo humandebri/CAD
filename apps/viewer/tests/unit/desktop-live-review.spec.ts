@@ -181,6 +181,7 @@ function artifacts(id: string): Artifacts {
     check: { schema_version: "0.1", status: "ok", diagnostics: [] },
     diff: { schema_version: "0.2", status: "ok", changes: [], warnings: [], configuration_changes: [] },
     comments: [],
+    commentsRevision: "comments-revision",
     layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
     drawingNames: ["plan_1f"],
     currentDrawing: "plan_1f",

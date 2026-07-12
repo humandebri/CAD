@@ -49,6 +49,7 @@ export type DiffReport = {
 export type CommentRecord = {
   id: string;
   drawing: string;
+  anchor?: { x: number; y: number } | null;
   entity_ids: string[];
   text: string;
   status: string;
@@ -60,6 +61,7 @@ export type Artifacts = {
   check: CheckReport;
   diff: DiffReport;
   comments: CommentRecord[];
+  commentsRevision: string;
   diffUnavailable?: string;
   layers: LayerWorkspaceState;
   drawingNames: string[];
@@ -214,6 +216,7 @@ export type DesktopReviewArtifacts = {
   check: CheckReport;
   diff: DiffReport | null;
   comments: CommentRecord[];
+  comments_revision: string;
   diff_unavailable: string | null;
   layers: LayerWorkspaceState;
   editor: EditorDrawingState;

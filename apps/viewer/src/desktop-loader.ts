@@ -38,6 +38,7 @@ export async function loadReviewSnapshotFromDesktop(
       check: review.check,
       diff: review.diff ?? emptyDiffReport(review.diff_unavailable ?? "diff unavailable"),
       comments: review.comments,
+      commentsRevision: review.comments_revision,
       diffUnavailable: review.diff_unavailable ?? undefined,
       layers: review.layers,
       drawingNames: review.drawing_names,
