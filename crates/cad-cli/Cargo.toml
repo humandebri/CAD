@@ -9,12 +9,15 @@ name = "cadc"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 cad-check.workspace = true
 cad-diff.workspace = true
+cad-edit.workspace = true
 cad-export-jww.workspace = true
 cad-import-jww.workspace = true
 cad-model.workspace = true
 cad-render-svg.workspace = true
+cad-render-pdf.workspace = true
 clap.workspace = true
 miette.workspace = true
 serde_json.workspace = true

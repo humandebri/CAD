@@ -5,7 +5,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -43,6 +42,12 @@ enum Command {
 
         #[arg(long, value_name = "PROJECT_DIR")]
         out: PathBuf,
+
+        #[arg(
+            long,
+            help = "Flatten block references instead of preserving definitions"
+        )]
+        flatten: bool,
     },
     #[command(about = "Export a CAD drawing to experimental JWW version 600")]
     ExportJww {
@@ -63,6 +68,23 @@ enum Command {
 
         #[arg(long, value_name = "REPORT.json")]
         report: Option<PathBuf>,
+    },
+    #[command(about = "Export a CAD drawing to PDF")]
+    ExportPdf {
+        #[arg(value_name = "PROJECT")]
+        project: PathBuf,
+
+        #[arg(long, value_name = "NAME")]
+        drawing: String,
+
+        #[arg(long, value_name = "NAME")]
+        layout: Option<String>,
+
+        #[arg(long, value_name = "FILE.pdf")]
+        out: PathBuf,
+
+        #[arg(long)]
+        force: bool,
     },
     #[command(about = "Compare CAD source projects by stable entity IDs")]
     Diff {
@@ -91,6 +113,20 @@ enum Command {
     },
 }
 
+impl Command {
+    fn source_projects(&self) -> Vec<&Path> {
+        match self {
+            Self::Check { project, .. }
+            | Self::Format { project }
+            | Self::ExportJww { project, .. }
+            | Self::ExportPdf { project, .. }
+            | Self::Render { project, .. } => vec![project.as_path()],
+            Self::Diff { base, head, .. } => vec![base.as_path(), head.as_path()],
+            Self::ImportJww { .. } => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CheckFormat {
     Json,
@@ -114,6 +150,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(command) = cli.command.as_ref() {
+        for project in command.source_projects() {
+            recover_project(project)?;
+        }
+    }
+
     match cli.command {
         Some(Command::Check {
             project,
@@ -133,8 +175,20 @@ fn main() -> Result<()> {
             let files = format_project(&project).into_diagnostic()?;
             println!("formatted {files} NDJSON file(s)");
         }
-        Some(Command::ImportJww { input, out }) => {
-            let report = cad_import_jww::import_jww_file(&input, &out).into_diagnostic()?;
+        Some(Command::ImportJww {
+            input,
+            out,
+            flatten,
+        }) => {
+            let options = cad_import_jww::ImportOptions {
+                block_mode: if flatten {
+                    cad_import_jww::BlockMode::Flatten
+                } else {
+                    cad_import_jww::BlockMode::Preserve
+                },
+            };
+            let report = cad_import_jww::import_jww_file_with_options(&input, &out, options)
+                .into_diagnostic()?;
             println!(
                 "imported {} entity/entities from {} into {} ({} warning(s))",
                 report.supported_entities,
@@ -185,6 +239,26 @@ fn main() -> Result<()> {
                 ));
             }
         }
+        Some(Command::ExportPdf {
+            project,
+            drawing,
+            layout,
+            out,
+            force,
+        }) => {
+            cad_render_pdf::export_drawing_pdf(
+                &project,
+                &drawing,
+                layout.as_deref(),
+                &out,
+                cad_render_pdf::PdfExportOptions {
+                    overwrite: force,
+                    expected_files: Vec::new(),
+                },
+            )
+            .into_diagnostic()?;
+            println!("exported PDF to {}", out.display());
+        }
         Some(Command::Diff {
             base,
             head,
@@ -219,6 +293,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn recover_project(project: &Path) -> Result<()> {
+    cad_edit::recover_source_transactions(project).map_err(|error| {
+        miette!(
+            "failed to recover source transactions in {}: {error}",
+            project.display()
+        )
+    })
+}
+
 fn paths_refer_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
     if left == right {
         return true;
@@ -238,7 +321,7 @@ fn paths_refer_to_same_file(left: &std::path::Path, right: &std::path::Path) -> 
     }
 }
 
-fn write_json_report(path: &PathBuf, report: &cad_check::CheckReport) -> Result<()> {
+fn write_json_report(path: &Path, report: &cad_check::CheckReport) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .into_diagnostic()
@@ -247,20 +330,23 @@ fn write_json_report(path: &PathBuf, report: &cad_check::CheckReport) -> Result<
     let text = serde_json::to_string_pretty(report)
         .into_diagnostic()
         .wrap_err("failed to serialize check report")?;
-    fs::write(path, format!("{text}\n"))
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", path.display()))
+    write_atomic_text(path, &format!("{text}\n"))
 }
 
-fn write_text_file(path: &PathBuf, text: &str) -> Result<()> {
+fn write_text_file(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, text)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", path.display()))
+    write_atomic_text(path, text)
+}
+
+fn write_atomic_text(path: &Path, text: &str) -> Result<()> {
+    cad_edit::atomic_publish(path, text.as_bytes(), true)
+        .map_err(|error| miette::miette!("failed to publish {}: {error}", path.display()))
+        .wrap_err_with(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 fn format_project(project: &Path) -> std::io::Result<usize> {
@@ -323,17 +409,16 @@ fn format_ndjson_file(path: &Path) -> std::io::Result<()> {
         );
         output.push_str(ending);
     }
-    let permissions = fs::metadata(path)?.permissions();
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("source path has no parent"))?;
-    let mut staging = tempfile::Builder::new()
-        .prefix(".format-")
-        .tempfile_in(parent)?;
-    staging.write_all(output.as_bytes())?;
-    fs::set_permissions(staging.path(), permissions)?;
-    staging.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    let metadata = fs::metadata(path)?;
+    let permissions = cad_edit::permissions_snapshot(&metadata.permissions());
+    let expected_revision = blake3::hash(&original).to_hex().to_string();
+    cad_edit::atomic_replace_with_permissions(
+        path,
+        output.as_bytes(),
+        &expected_revision,
+        &permissions,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
@@ -358,7 +443,8 @@ fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_ndjson_file, normalize_numbers, paths_refer_to_same_file};
+    use super::{Cli, Command, format_ndjson_file, normalize_numbers, paths_refer_to_same_file};
+    use clap::Parser;
     use std::fs;
     use std::path::Path;
 
@@ -372,6 +458,105 @@ mod tests {
             Path::new("result.jww"),
             Path::new("result.json")
         ));
+    }
+
+    #[test]
+    fn parses_pdf_export_contract() {
+        let cli = Cli::try_parse_from([
+            "cadc",
+            "export-pdf",
+            "project",
+            "--drawing",
+            "plan",
+            "--layout",
+            "print",
+            "--out",
+            "plan.pdf",
+            "--force",
+        ])
+        .expect("PDF command should parse");
+        let Some(Command::ExportPdf {
+            project,
+            drawing,
+            layout,
+            out,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected export-pdf command");
+        };
+        assert_eq!(project, Path::new("project"));
+        assert_eq!(drawing, "plan");
+        assert_eq!(layout.as_deref(), Some("print"));
+        assert_eq!(out, Path::new("plan.pdf"));
+        assert!(force);
+    }
+
+    #[test]
+    fn every_source_reading_command_declares_its_recovery_roots() {
+        let cases = [
+            (
+                vec![
+                    "cadc", "check", "project", "--format", "json", "--out", "out.json",
+                ],
+                1,
+            ),
+            (vec!["cadc", "format", "project"], 1),
+            (
+                vec![
+                    "cadc",
+                    "export-jww",
+                    "project",
+                    "--drawing",
+                    "plan",
+                    "--out",
+                    "out.jww",
+                ],
+                1,
+            ),
+            (
+                vec![
+                    "cadc",
+                    "export-pdf",
+                    "project",
+                    "--drawing",
+                    "plan",
+                    "--out",
+                    "out.pdf",
+                ],
+                1,
+            ),
+            (
+                vec![
+                    "cadc", "render", "project", "--format", "svg", "--out", "out.svg",
+                ],
+                1,
+            ),
+            (
+                vec![
+                    "cadc", "diff", "base", "head", "--format", "json", "--out", "out.json",
+                ],
+                2,
+            ),
+        ];
+        for (arguments, expected_roots) in cases {
+            let cli = Cli::try_parse_from(arguments).expect("command should parse");
+            assert_eq!(
+                cli.command.expect("command").source_projects().len(),
+                expected_roots
+            );
+        }
+
+        let import =
+            Cli::try_parse_from(["cadc", "import-jww", "source.jww", "--out", "new-project"])
+                .expect("import should parse");
+        assert!(
+            import
+                .command
+                .expect("import command")
+                .source_projects()
+                .is_empty()
+        );
     }
 
     #[test]
