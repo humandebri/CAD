@@ -240,6 +240,15 @@ pub enum Record {
         values: [f64; 8],
         color: Option<u32>,
     },
+    Block {
+        base: Base,
+        ref_x: f64,
+        ref_y: f64,
+        scale_x: f64,
+        scale_y: f64,
+        rotation: f64,
+        def_number: u32,
+    },
 }
 
 impl Record {
@@ -251,6 +260,7 @@ impl Record {
             Self::Text { .. } => "CDataMoji",
             Self::Dimension { .. } => "CDataSunpou",
             Self::Solid { .. } => "CDataSolid",
+            Self::Block { .. } => "CDataBlock",
         }
     }
 }
@@ -1018,6 +1028,21 @@ fn write_record_body(writer: &mut Writer, record: &Record) -> CodecResult<()> {
             if base.pen_color == 10 {
                 writer.u32(color.unwrap_or_default());
             }
+        }
+        Record::Block {
+            base,
+            ref_x,
+            ref_y,
+            scale_x,
+            scale_y,
+            rotation,
+            def_number,
+        } => {
+            write_base(writer, *base);
+            for value in [*ref_x, *ref_y, *scale_x, *scale_y, *rotation] {
+                writer.f64(value);
+            }
+            writer.u32(*def_number);
         }
     }
     Ok(())

@@ -1,6 +1,6 @@
 //! Experimental CAD source to JWW boundary exporter.
 
-use cad_jww_codec::{Base, Document, Header, Layer, LayerGroup, Record};
+use cad_jww_codec::{Base, BlockDefinition, Document, Header, Layer, LayerGroup, Record};
 use cad_model::{Entity, LayerDef, ProjectSource, TextStyleDef};
 use encoding_rs::SHIFT_JIS;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -104,6 +104,12 @@ pub fn export_loaded_project(
         });
     }
     let (header, layer_slots) = build_header(project, drawing_name, &mut context);
+    let block_numbers = project
+        .blocks
+        .keys()
+        .enumerate()
+        .map(|(index, id)| (id.clone(), u32::try_from(index + 1).unwrap_or(u32::MAX)))
+        .collect::<BTreeMap<_, _>>();
     let mut records = Vec::new();
     let mut written = 0;
     for record in &drawing.entities {
@@ -112,12 +118,32 @@ pub fn export_loaded_project(
             project,
             &record.entity,
             &layer_slots,
+            &block_numbers,
             &mut records,
             &mut context,
         );
         if records.len() > record_count {
             written += 1;
         }
+    }
+    let mut block_definitions = Vec::new();
+    for (block_id, definition) in &project.blocks {
+        let mut block_records = Vec::new();
+        for record in &definition.entities {
+            convert_entity(
+                project,
+                &record.entity,
+                &layer_slots,
+                &block_numbers,
+                &mut block_records,
+                &mut context,
+            );
+        }
+        block_definitions.push(BlockDefinition {
+            number: block_numbers[block_id],
+            name: definition.config.name.clone(),
+            records: block_records,
+        });
     }
     if records.len() > 65_534 {
         context.block(
@@ -136,7 +162,7 @@ pub fn export_loaded_project(
     let bytes = cad_jww_codec::write_document(&Document {
         header,
         records,
-        blocks: Vec::new(),
+        blocks: block_definitions,
     })?;
     publish(output_path, &bytes, options.overwrite)?;
     Ok(context.report(ExportStatus::Exported, written, expanded))
@@ -172,9 +198,17 @@ impl<'a> ExportContext<'a> {
         }
     }
 
+    fn warn(&mut self, entity: Option<&Entity>, code: &str, message: impl Into<String>) {
+        self.warnings.push(ExportIssue {
+            code: code.to_owned(),
+            message: message.into(),
+            entity_id: entity.map(|entity| entity.id().as_str().to_owned()),
+        });
+    }
+
     fn report(self, status: ExportStatus, written: usize, expanded: usize) -> ExportReport {
         ExportReport {
-            schema_version: "0.1".to_owned(),
+            schema_version: "0.2".to_owned(),
             status,
             output_path: self.output_path.display().to_string(),
             written_entities: written,
@@ -195,9 +229,25 @@ fn build_header(
         .iter()
         .find(|drawing| drawing.name == drawing_name)
         .expect("drawing checked");
+    let Some(layout) = drawing.layouts.active() else {
+        context.block(
+            None,
+            "invalid_active_layout",
+            "drawing has no active layout",
+        );
+        return (Header::default(), BTreeMap::new());
+    };
+    let layout_scale = parse_layout_scale(&layout.scale, context);
+    if matches!(layout.orientation, cad_model::SheetOrientation::Landscape) {
+        context.warn(
+            None,
+            "layout_orientation_approximated",
+            "JWW version 600 does not carry an independent layout orientation flag",
+        );
+    }
     let mut header = Header {
         memo: cp932_text(&project.project.name, None, context),
-        paper_size: paper_code(&drawing.sheet.paper, context),
+        paper_size: paper_code(&layout.paper, context),
         ..Header::default()
     };
     let mut groups = project.layers.groups.iter().collect::<Vec<_>>();
@@ -225,7 +275,7 @@ fn build_header(
                     0
                 },
                 write_layer: 0,
-                scale: group.scale_denominator.max(1.0),
+                scale: layout_scale.unwrap_or_else(|| group.scale_denominator.max(1.0)),
                 protect: u32::from(group.locked),
                 layers: std::array::from_fn(|_| Layer {
                     state: 0,
@@ -285,6 +335,7 @@ fn convert_entity(
     project: &ProjectSource,
     entity: &Entity,
     layer_slots: &BTreeMap<String, (u16, u16)>,
+    block_numbers: &BTreeMap<String, u32>,
     records: &mut Vec<Record>,
     context: &mut ExportContext<'_>,
 ) {
@@ -565,11 +616,98 @@ fn convert_entity(
                 color,
             });
         }
-        Entity::BlockRef { .. } => context.block(
-            Some(entity),
-            "unsupported_block_ref",
-            "block_ref export is not implemented",
-        ),
+        Entity::BlockRef {
+            block,
+            at,
+            rotation_deg,
+            scale,
+            ..
+        } => {
+            let Some(def_number) = block_numbers.get(block).copied() else {
+                context.block(
+                    Some(entity),
+                    "unsupported_block_ref",
+                    format!("block definition {block:?} is not available"),
+                );
+                return;
+            };
+            let base_point = project
+                .blocks
+                .get(block)
+                .map(|definition| definition.config.base_point)
+                .unwrap_or([0.0, 0.0]);
+            let angle = rotation_deg.to_radians();
+            let (sin, cos) = angle.sin_cos();
+            let base_offset = [
+                scale * (base_point[0] * cos - base_point[1] * sin),
+                scale * (base_point[0] * sin + base_point[1] * cos),
+            ];
+            records.push(Record::Block {
+                base,
+                ref_x: at[0] - base_offset[0],
+                ref_y: at[1] - base_offset[1],
+                scale_x: *scale,
+                scale_y: *scale,
+                rotation: rotation_deg.to_radians(),
+                def_number,
+            });
+        }
+        Entity::Hatch {
+            loops,
+            pattern,
+            angle_deg,
+            scale,
+            fill,
+            ..
+        } => {
+            if loops.len() != 1 {
+                context.block(
+                    Some(entity),
+                    "unsupported_hatch_loop",
+                    "JWW export supports only one closed hatch loop",
+                );
+                return;
+            }
+            let loop_points = &loops[0];
+            if loop_points.len() < 3
+                || loop_points
+                    .iter()
+                    .any(|point| !point[0].is_finite() || !point[1].is_finite())
+            {
+                context.block(
+                    Some(entity),
+                    "unsupported_hatch_geometry",
+                    "hatch loop must contain at least three finite points",
+                );
+                return;
+            }
+            let Some((fill_base, color)) = fill
+                .as_deref()
+                .and_then(|fill| fill_base(project, fill, base))
+            else {
+                context.block(
+                    Some(entity),
+                    "undefined_fill",
+                    "hatch fill color is missing or invalid",
+                );
+                return;
+            };
+            context.warn(
+                Some(entity),
+                "hatch_pattern_approximated",
+                format!(
+                    "hatch pattern {pattern:?}, angle {angle_deg}, and scale {scale} are emitted as solid polygon fill"
+                ),
+            );
+            for pair in loop_points[1..].windows(2) {
+                push_solid_record(
+                    records,
+                    fill_base,
+                    [loop_points[0], pair[0], pair[1]],
+                    color,
+                );
+            }
+        }
     }
 }
 
@@ -743,6 +881,52 @@ fn paper_code(paper: &str, context: &mut ExportContext<'_>) -> u32 {
     }
 }
 
+fn parse_layout_scale(scale: &str, context: &mut ExportContext<'_>) -> Option<f64> {
+    let scale = scale.trim();
+    let value = scale
+        .strip_prefix("1/")
+        .and_then(|value| value.parse::<f64>().ok())
+        .or_else(|| {
+            scale
+                .strip_prefix("1:")
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .or_else(|| scale.parse::<f64>().ok());
+    match value {
+        Some(value) if value.is_finite() && value > 0.0 => Some(value),
+        _ => {
+            context.block(
+                None,
+                "unsupported_layout_scale",
+                format!("layout scale {scale:?} is not a positive numeric scale"),
+            );
+            None
+        }
+    }
+}
+
+fn push_solid_record(
+    records: &mut Vec<Record>,
+    base: Base,
+    points: [[f64; 2]; 3],
+    color: Option<u32>,
+) {
+    records.push(Record::Solid {
+        base,
+        values: [
+            points[0][0],
+            points[0][1],
+            points[2][0],
+            points[2][1],
+            points[1][0],
+            points[1][1],
+            points[2][0],
+            points[2][1],
+        ],
+        color,
+    });
+}
+
 fn cp932_text(value: &str, entity: Option<&Entity>, context: &mut ExportContext<'_>) -> String {
     let (encoded, _, had_errors) = SHIFT_JIS.encode(value);
     if !had_errors {
@@ -846,7 +1030,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000009","type":"block_ref","layer":"0-1","block":"door","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000009","type":"block_ref","layer":"0-1","block":"door","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
         )
         .expect("block entity");
         project.drawings[0]
@@ -930,8 +1114,8 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         for source in [
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000008","type":"solid","layer":"0-1","points":[[0.0,0.0],[100.0,0.0],[100.0,50.0],[0.0,50.0]],"fill":"jw_black"}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000007","type":"curve_solid","layer":"0-1","center":[200.0,200.0],"radius":100.0,"flatness":0.5,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0,"solid_param":20.0,"encoding_code":1,"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000008","type":"solid","layer":"0-1","points":[[0.0,0.0],[100.0,0.0],[100.0,50.0],[0.0,50.0]],"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000007","type":"curve_solid","layer":"0-1","center":[200.0,200.0],"radius":100.0,"flatness":0.5,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0,"solid_param":20.0,"encoding_code":1,"fill":"jw_black"}"#,
         ] {
             let entity: Entity = serde_json::from_str(source).expect("solid entity");
             project.drawings[0]
@@ -961,5 +1145,92 @@ mod tests {
         .expect("reimported entities");
         assert!(entities.contains("\"type\":\"solid\""));
         assert!(entities.contains("\"type\":\"curve_solid\""));
+    }
+
+    #[test]
+    fn simple_hatch_is_emitted_as_solid_polygons_with_a_warning() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).expect("example");
+        let entity: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000010","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]]],"pattern":"solid","angle_deg":30.0,"scale":2.0,"fill":"jw_black"}"#,
+        )
+        .expect("hatch entity");
+        project.drawings[0]
+            .entities
+            .push(cad_model::EntityRecord { line: 2, entity });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("hatch.jww");
+        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
+            .expect("hatch export");
+        assert_eq!(report.status, ExportStatus::Exported);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "hatch_pattern_approximated")
+        );
+
+        let decoded = cad_jww_codec::read_document(&fs::read(&output).expect("JWW bytes"))
+            .expect("JWW should decode");
+        assert!(
+            decoded
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, cad_jww_codec::DecodedEntity::Solid(_)))
+        );
+    }
+
+    #[test]
+    fn block_export_offsets_jww_reference_by_definition_base_point() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).expect("example");
+        let child: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000098","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
+        )
+        .expect("block child");
+        project.blocks.insert(
+            "door_test".to_owned(),
+            cad_model::BlockDefinition {
+                id: "door_test".to_owned(),
+                config: cad_model::BlockDefinitionConfig {
+                    schema_version: cad_model::CURRENT_SCHEMA_VERSION.to_owned(),
+                    name: "Door test".to_owned(),
+                    base_point: [10.0, 20.0],
+                },
+                entities: vec![cad_model::EntityRecord {
+                    line: 1,
+                    entity: child,
+                }],
+            },
+        );
+        let reference: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000099","type":"block_ref","layer":"0-1","block":"door_test","at":[100.0,200.0],"rotation_deg":90.0,"scale":2.0}"#,
+        )
+        .expect("block reference");
+        project.drawings[0].entities.push(cad_model::EntityRecord {
+            line: 2,
+            entity: reference,
+        });
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("base-point.jww");
+
+        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
+            .expect("export");
+        assert_eq!(report.status, ExportStatus::Exported);
+        let decoded = cad_jww_codec::read_document(
+            &fs::read(output).expect("exported JWW should be readable"),
+        )
+        .expect("exported JWW should decode");
+        let block = decoded
+            .entities
+            .iter()
+            .find_map(|entity| match entity {
+                cad_jww_codec::DecodedEntity::Block(block) => Some(block),
+                _ => None,
+            })
+            .expect("block reference should be exported");
+        assert!((block.ref_x - 140.0).abs() < 1e-9);
+        assert!((block.ref_y - 180.0).abs() < 1e-9);
     }
 }

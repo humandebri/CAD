@@ -6,11 +6,10 @@
 use cad_model::{Entity, EntityRecord, ModelError, ProjectSource, entity_bbox};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 pub const CRATE_NAME: &str = "cad-check";
-pub const CHECK_SCHEMA_VERSION: &str = "0.1";
+pub const CHECK_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 const EPSILON_MM: f64 = 0.001;
 
 #[must_use]
@@ -113,7 +112,8 @@ impl<'a> Checker<'a> {
         }
         self.check_layer_definitions();
         self.check_style_definitions();
-        self.check_sheets();
+        self.check_layouts();
+        self.check_blocks();
         self.check_entities();
     }
 
@@ -286,38 +286,68 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_sheets(&mut self) {
+    fn check_layouts(&mut self) {
         for drawing in &self.project.drawings {
-            let file = format!("drawings/{}/sheet.toml", drawing.name);
-            if !matches!(
-                drawing.sheet.paper.as_str(),
-                "A0" | "A1" | "A2" | "A3" | "A4"
-            ) {
+            let layouts_file = format!("drawings/{}/layouts.toml", drawing.name);
+            if drawing.layouts.layouts.is_empty() {
                 self.push_diagnostic(
-                    &file,
-                    "sheet.invalid_paper",
-                    Some("paper".to_owned()),
+                    &layouts_file,
+                    "layout.missing",
+                    Some("layouts".to_owned()),
+                    "at least one layout is required".to_owned(),
+                );
+            }
+            if !drawing
+                .layouts
+                .layouts
+                .contains_key(&drawing.layouts.active_layout)
+            {
+                self.push_diagnostic(
+                    &layouts_file,
+                    "layout.undefined_active",
+                    Some("active_layout".to_owned()),
                     format!(
-                        "unsupported paper {:?}; expected A0 through A4",
-                        drawing.sheet.paper
+                        "active_layout references undefined layout {:?}",
+                        drawing.layouts.active_layout
                     ),
                 );
             }
-            if parse_scale(&drawing.sheet.scale).is_none() {
-                self.push_diagnostic(
-                    &file,
-                    "sheet.invalid_scale",
-                    Some("scale".to_owned()),
-                    "scale must be a finite positive ratio such as 1:100".to_owned(),
-                );
-            }
-            if drawing.sheet.origin.iter().any(|value| !value.is_finite()) {
-                self.push_diagnostic(
-                    &file,
-                    "sheet.invalid_origin",
-                    Some("origin".to_owned()),
-                    "origin coordinates must be finite".to_owned(),
-                );
+            for (layout_id, layout) in &drawing.layouts.layouts {
+                if !matches!(layout.paper.as_str(), "A0" | "A1" | "A2" | "A3" | "A4") {
+                    self.push_diagnostic(
+                        &layouts_file,
+                        "layout.invalid_paper",
+                        Some(format!("layouts.{layout_id}.paper")),
+                        format!("unsupported paper {:?}", layout.paper),
+                    );
+                }
+                if parse_scale(&layout.scale).is_none() {
+                    self.push_diagnostic(
+                        &layouts_file,
+                        "layout.invalid_scale",
+                        Some(format!("layouts.{layout_id}.scale")),
+                        "scale must be a finite positive ratio such as 1:100".to_owned(),
+                    );
+                }
+                if layout.origin.iter().any(|value| !value.is_finite())
+                    || layout
+                        .margins
+                        .iter()
+                        .any(|value| !value.is_finite() || *value < 0.0)
+                    || layout.plot_area.is_some_and(|area| {
+                        area.iter().any(|value| !value.is_finite())
+                            || area[0] >= area[2]
+                            || area[1] >= area[3]
+                    })
+                {
+                    self.push_diagnostic(
+                        &layouts_file,
+                        "layout.invalid_range",
+                        Some(format!("layouts.{layout_id}")),
+                        "layout origin, margins, and plot_area must be finite and ordered"
+                            .to_owned(),
+                    );
+                }
             }
         }
     }
@@ -343,6 +373,37 @@ impl<'a> Checker<'a> {
                 self.check_entity_references(&file, record, &blocks);
                 self.check_entity_geometry(&file, record);
                 self.check_annotation_layer(&file, record);
+            }
+        }
+    }
+
+    fn check_blocks(&mut self) {
+        let blocks = self.defined_blocks();
+        let mut dependencies = BTreeMap::<String, Vec<String>>::new();
+        for (block_id, definition) in &self.project.blocks {
+            let file = format!("blocks/{block_id}/entities.ndjson");
+            let mut refs = Vec::new();
+            for record in &definition.entities {
+                self.check_entity_references(&file, record, &blocks);
+                self.check_entity_geometry(&file, record);
+                if let Entity::BlockRef { block, .. } = &record.entity {
+                    refs.push(block.clone());
+                }
+            }
+            dependencies.insert(block_id.clone(), refs);
+        }
+        let mut reported = BTreeSet::new();
+        for block_id in self.project.blocks.keys() {
+            let mut stack = Vec::new();
+            if let Some(cycle) = block_cycle(block_id, &dependencies, &mut stack, 0)
+                && reported.insert(block_id.clone())
+            {
+                self.push_diagnostic(
+                    &format!("blocks/{block_id}/definition.toml"),
+                    "reference.block_cycle",
+                    Some("entities".to_owned()),
+                    format!("block definition cycle detected: {}", cycle.join(" -> ")),
+                );
             }
         }
     }
@@ -417,6 +478,28 @@ impl<'a> Checker<'a> {
                         "reference.undefined_fill",
                         Some("fill"),
                         format!("solid entity references undefined fill color {fill:?}"),
+                    );
+                }
+            }
+            Entity::Hatch { fill, pattern, .. } => {
+                if pattern.trim().is_empty() {
+                    self.push_entity(
+                        file,
+                        record,
+                        "reference.empty_hatch_pattern",
+                        Some("pattern"),
+                        "hatch pattern must not be empty".to_owned(),
+                    );
+                }
+                if let Some(fill) = fill
+                    && !self.project.styles.colors.contains_key(fill)
+                {
+                    self.push_entity(
+                        file,
+                        record,
+                        "reference.undefined_fill",
+                        Some("fill"),
+                        format!("hatch entity references undefined fill color {fill:?}"),
                     );
                 }
             }
@@ -646,6 +729,74 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            Entity::Hatch {
+                loops,
+                angle_deg,
+                scale,
+                ..
+            } => {
+                self.check_finite_entity_value(file, record, "angle_deg", *angle_deg);
+                if !scale.is_finite() || *scale <= EPSILON_MM {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.invalid_hatch_scale",
+                        Some("scale"),
+                        "hatch scale must be finite and positive".to_owned(),
+                    );
+                }
+                if loops.is_empty() {
+                    self.push_entity(
+                        file,
+                        record,
+                        "geometry.empty_hatch",
+                        Some("loops"),
+                        "hatch must contain at least one boundary loop".to_owned(),
+                    );
+                }
+                for loop_points in loops {
+                    if loop_points.len() < 3 {
+                        self.push_entity(
+                            file,
+                            record,
+                            "geometry.invalid_hatch_loop",
+                            Some("loops"),
+                            "hatch boundary loop must contain at least three points".to_owned(),
+                        );
+                        continue;
+                    }
+                    if loop_points
+                        .iter()
+                        .any(|point| !point[0].is_finite() || !point[1].is_finite())
+                    {
+                        self.push_entity(
+                            file,
+                            record,
+                            "geometry.non_finite",
+                            Some("loops"),
+                            "hatch boundary points must be finite".to_owned(),
+                        );
+                    }
+                    if polygon_is_degenerate(loop_points) {
+                        self.push_entity(
+                            file,
+                            record,
+                            "geometry.degenerate_hatch",
+                            Some("loops"),
+                            "hatch boundary loop must enclose a non-zero area".to_owned(),
+                        );
+                    }
+                    if has_self_intersection(loop_points, true) {
+                        self.push_entity(
+                            file,
+                            record,
+                            "geometry.hatch_self_intersection",
+                            Some("loops"),
+                            "hatch boundary loop has intersecting segments".to_owned(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -751,20 +902,7 @@ impl<'a> Checker<'a> {
     }
 
     fn defined_blocks(&self) -> BTreeSet<String> {
-        let blocks_dir = self.project.root.join("blocks");
-        let Ok(entries) = fs::read_dir(blocks_dir) else {
-            return BTreeSet::new();
-        };
-
-        entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| match entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {
-                    Some(entry.file_name().to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
-            .collect()
+        self.project.blocks.keys().cloned().collect()
     }
 
     fn entity_file(&self, drawing_name: &str) -> String {
@@ -815,7 +953,8 @@ fn model_error_to_diagnostic(root: &Path, error: &ModelError) -> CheckDiagnostic
     match error {
         ModelError::Read { path, .. }
         | ModelError::ListDir { path, .. }
-        | ModelError::Toml { path, .. } => CheckDiagnostic {
+        | ModelError::Toml { path, .. }
+        | ModelError::UnsafeSourcePath { path, .. } => CheckDiagnostic {
             severity: Severity::Error,
             file: relative_path(root, path),
             line: None,
@@ -876,7 +1015,34 @@ fn model_error_code(error: &ModelError) -> &'static str {
         ModelError::EmptyNdjsonLine { .. } => "format.empty_ndjson_line",
         ModelError::UnsupportedSchema { .. } => "format.unsupported_schema",
         ModelError::InvalidEntityId { .. } => "format.invalid_entity_id",
+        ModelError::UnsafeSourcePath { .. } => "security.unsafe_source_path",
     }
+}
+
+fn block_cycle(
+    current: &str,
+    dependencies: &BTreeMap<String, Vec<String>>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > 32 {
+        let mut cycle = stack.clone();
+        cycle.push(current.to_owned());
+        return Some(cycle);
+    }
+    if let Some(index) = stack.iter().position(|id| id == current) {
+        let mut cycle = stack[index..].to_vec();
+        cycle.push(current.to_owned());
+        return Some(cycle);
+    }
+    stack.push(current.to_owned());
+    let result = dependencies
+        .get(current)
+        .into_iter()
+        .flat_map(|refs| refs.iter())
+        .find_map(|next| block_cycle(next, dependencies, stack, depth + 1));
+    stack.pop();
+    result
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {
@@ -1008,7 +1174,7 @@ mod tests {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            "{\"schema_version\":\"0.1\"",
+            "{\"schema_version\":\"0.2\"",
         )
         .expect("entities should be writable");
 
@@ -1023,7 +1189,7 @@ mod tests {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0],"extra":true}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0],"extra":true}"#,
         )
         .expect("entities should be writable");
 
@@ -1038,7 +1204,7 @@ mod tests {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0]}"#,
         )
         .expect("entities should be writable");
 
@@ -1111,13 +1277,13 @@ mod tests {
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":0.0,"start_deg":0.0,"end_deg":0.0}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"polyline","layer":"0-1","points":[[0.0,0.0],[0.5,0.0],[1.0,0.0]],"closed":false}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,1.0],[0.0,1.0],[1.0,0.0]],"closed":false}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0],[1.0,1.0]],"closed":true}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000005","type":"polyline","layer":"0-1","points":[],"closed":false}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000006","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":0.0,"radius_y":1.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":361.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":0.0,"start_deg":0.0,"end_deg":0.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"polyline","layer":"0-1","points":[[0.0,0.0],[0.5,0.0],[1.0,0.0]],"closed":false}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,1.0],[0.0,1.0],[1.0,0.0]],"closed":false}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0],[1.0,1.0]],"closed":true}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"polyline","layer":"0-1","points":[],"closed":false}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":0.0,"radius_y":1.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":361.0}"#,
             ]
             .join("\n"),
         )
@@ -1169,7 +1335,7 @@ mod tests {
             serde_json::to_string_pretty(&report).expect("report should serialize"),
             @r#"
 {
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "status": "error",
   "diagnostics": [
     {
@@ -1206,7 +1372,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1220,10 +1386,10 @@ mod tests {
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             line_entity("ent_01JZ0000000000000000000000", "0-1"),
@@ -1235,25 +1401,25 @@ mod tests {
 
     fn line_entity(id: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.1","id":"{id}","type":"line","layer":"{layer}","p1":[0.0,0.0],"p2":[910.0,0.0]}}"#
+            r#"{{"schema_version":"0.2","id":"{id}","type":"line","layer":"{layer}","p1":[0.0,0.0],"p2":[910.0,0.0]}}"#
         )
     }
 
     fn text_entity(id: &str, style: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.1","id":"{id}","type":"text","layer":"{layer}","style":"{style}","at":[0.0,0.0],"rotation_deg":0.0,"value":"note"}}"#
+            r#"{{"schema_version":"0.2","id":"{id}","type":"text","layer":"{layer}","style":"{style}","at":[0.0,0.0],"rotation_deg":0.0,"value":"note"}}"#
         )
     }
 
     fn dimension_entity(id: &str, style: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.1","id":"{id}","type":"dimension","layer":"{layer}","style":"{style}","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}}"#
+            r#"{{"schema_version":"0.2","id":"{id}","type":"dimension","layer":"{layer}","style":"{style}","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}}"#
         )
     }
 
     fn block_entity(id: &str, block: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.1","id":"{id}","type":"block_ref","layer":"{layer}","block":"{block}","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}}"#
+            r#"{{"schema_version":"0.2","id":"{id}","type":"block_ref","layer":"{layer}","block":"{block}","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}}"#
         )
     }
 }

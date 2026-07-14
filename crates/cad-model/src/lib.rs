@@ -7,12 +7,12 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
 pub const CRATE_NAME: &str = "cad-model";
-pub const CURRENT_SCHEMA_VERSION: &str = "0.1";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.2";
 
 #[must_use]
 pub fn crate_name() -> &'static str {
@@ -57,10 +57,147 @@ pub enum ModelError {
     },
     #[error("invalid entity id {value:?}; expected ent_<26-character ULID>")]
     InvalidEntityId { value: String },
+    #[error("unsafe canonical source path {path}: {reason}")]
+    UnsafeSourcePath { path: PathBuf, reason: String },
 }
 
 pub type ModelResult<T> = Result<T, ModelError>;
 pub type Point = [f64; 2];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSourceKind {
+    Project,
+    Rule,
+    Layout,
+    DrawingEntities,
+    Comment,
+    BlockDefinition,
+    BlockEntities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFileRevision {
+    pub relative_path: String,
+    pub revision: String,
+    pub exists: bool,
+}
+
+#[must_use]
+pub fn classify_project_source_path(relative: &Path) -> Option<ProjectSourceKind> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    if relative == Path::new("cad.project.toml") {
+        return Some(ProjectSourceKind::Project);
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    let component = |index: usize| components.get(index)?.as_os_str().to_str();
+    match (
+        component(0),
+        components.len(),
+        relative.file_name()?.to_str()?,
+    ) {
+        (Some("rules"), 2, name) if name.ends_with(".toml") => Some(ProjectSourceKind::Rule),
+        (Some("drawings"), 3, "layouts.toml") => Some(ProjectSourceKind::Layout),
+        (Some("drawings"), 3, "entities.ndjson") => Some(ProjectSourceKind::DrawingEntities),
+        (Some("comments"), 2, name) if name.ends_with(".ndjson") => {
+            Some(ProjectSourceKind::Comment)
+        }
+        (Some("blocks"), 3, "definition.toml") => Some(ProjectSourceKind::BlockDefinition),
+        (Some("blocks"), 3, "entities.ndjson") => Some(ProjectSourceKind::BlockEntities),
+        _ => None,
+    }
+}
+
+pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevision>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        output: &mut Vec<SourceFileRevision>,
+    ) -> ModelResult<()> {
+        let mut entries = fs::read_dir(directory)
+            .map_err(|source| ModelError::ListDir {
+                path: directory.to_path_buf(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| ModelError::ListDir {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).expect("visited path is below root");
+            if relative
+                .components()
+                .next()
+                .is_some_and(|part| part.as_os_str() == "build")
+            {
+                continue;
+            }
+            if relative.components().count() == 1
+                && !matches!(
+                    relative.file_name().and_then(|name| name.to_str()),
+                    Some("rules" | "drawings" | "comments" | "blocks" | "cad.project.toml")
+                )
+            {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|source| ModelError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_symlink() {
+                let parts = relative.components().collect::<Vec<_>>();
+                let may_hide_source_directory = parts.len() == 2
+                    && matches!(
+                        parts.first().and_then(|part| part.as_os_str().to_str()),
+                        Some("drawings" | "blocks")
+                    );
+                if classify_project_source_path(relative).is_some() || may_hide_source_directory {
+                    return Err(ModelError::UnsafeSourcePath {
+                        path,
+                        reason: "symlinks are not allowed below canonical source roots".to_owned(),
+                    });
+                }
+                continue;
+            }
+            if file_type.is_dir() {
+                if relative.components().count() == 1
+                    && !matches!(
+                        relative.file_name().and_then(|name| name.to_str()),
+                        Some("rules" | "drawings" | "comments" | "blocks")
+                    )
+                {
+                    continue;
+                }
+                visit(root, &path, output)?;
+            } else if file_type.is_file() && classify_project_source_path(relative).is_some() {
+                let bytes = fs::read(&path).map_err(|source| ModelError::Read {
+                    path: path.clone(),
+                    source,
+                })?;
+                output.push(SourceFileRevision {
+                    relative_path: relative.to_string_lossy().replace('\\', "/"),
+                    revision: blake3::hash(&bytes).to_hex().to_string(),
+                    exists: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    let root = root.as_ref();
+    let mut output = Vec::new();
+    visit(root, root, &mut output)?;
+    output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(output)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityId {
@@ -222,12 +359,51 @@ pub struct DimensionStyleDef {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct SheetConfig {
-    pub schema_version: String,
+pub struct LayoutConfig {
+    pub name: String,
     pub paper: String,
     pub orientation: SheetOrientation,
     pub scale: String,
     pub origin: Point,
+    #[serde(default = "default_layout_margins")]
+    pub margins: [f64; 4],
+    #[serde(default)]
+    pub plot_area: Option<[f64; 4]>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutsConfig {
+    pub schema_version: String,
+    pub active_layout: String,
+    pub layouts: BTreeMap<String, LayoutConfig>,
+}
+
+fn default_layout_margins() -> [f64; 4] {
+    [0.0; 4]
+}
+
+impl LayoutsConfig {
+    #[must_use]
+    pub fn active(&self) -> Option<&LayoutConfig> {
+        self.layouts.get(&self.active_layout)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BlockDefinitionConfig {
+    pub schema_version: String,
+    pub name: String,
+    #[serde(default)]
+    pub base_point: Point,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockDefinition {
+    pub id: String,
+    pub config: BlockDefinitionConfig,
+    pub entities: Vec<EntityRecord>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -372,6 +548,19 @@ pub enum Entity {
         rotation_deg: f64,
         scale: f64,
     },
+    Hatch {
+        schema_version: String,
+        id: EntityId,
+        layer: String,
+        #[serde(default)]
+        pen: Option<String>,
+        loops: Vec<Vec<Point>>,
+        pattern: String,
+        angle_deg: f64,
+        scale: f64,
+        #[serde(default)]
+        fill: Option<String>,
+    },
 }
 
 impl Entity {
@@ -388,7 +577,8 @@ impl Entity {
             | Self::Point { id, .. }
             | Self::Solid { id, .. }
             | Self::CurveSolid { id, .. }
-            | Self::BlockRef { id, .. } => id,
+            | Self::BlockRef { id, .. }
+            | Self::Hatch { id, .. } => id,
         }
     }
 
@@ -405,7 +595,8 @@ impl Entity {
             | Self::Point { schema_version, .. }
             | Self::Solid { schema_version, .. }
             | Self::CurveSolid { schema_version, .. }
-            | Self::BlockRef { schema_version, .. } => schema_version,
+            | Self::BlockRef { schema_version, .. }
+            | Self::Hatch { schema_version, .. } => schema_version,
         }
     }
 
@@ -422,7 +613,8 @@ impl Entity {
             | Self::Point { layer, .. }
             | Self::Solid { layer, .. }
             | Self::CurveSolid { layer, .. }
-            | Self::BlockRef { layer, .. } => layer,
+            | Self::BlockRef { layer, .. }
+            | Self::Hatch { layer, .. } => layer,
         }
     }
 
@@ -437,7 +629,8 @@ impl Entity {
             | Self::Text { pen, .. }
             | Self::Dimension { pen, .. }
             | Self::Point { pen, .. }
-            | Self::BlockRef { pen, .. } => pen.as_deref(),
+            | Self::BlockRef { pen, .. }
+            | Self::Hatch { pen, .. } => pen.as_deref(),
             Self::Solid { pen, .. } | Self::CurveSolid { pen, .. } => pen.as_deref(),
         }
     }
@@ -555,6 +748,13 @@ pub fn entity_bbox(entity: &Entity) -> Option<BBox> {
                 [at[0] + radius, at[1] + radius],
             ])
         }
+        Entity::Hatch { loops, .. } => {
+            let points = loops
+                .iter()
+                .flat_map(|loop_points| loop_points.iter().copied())
+                .collect::<Vec<_>>();
+            BBox::from_points(&points)
+        }
     }
 }
 
@@ -669,7 +869,7 @@ pub struct EntityRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawingSource {
     pub name: String,
-    pub sheet: SheetConfig,
+    pub layouts: LayoutsConfig,
     pub entities: Vec<EntityRecord>,
 }
 
@@ -679,6 +879,7 @@ pub struct ProjectSource {
     pub project: ProjectConfig,
     pub layers: LayerRules,
     pub styles: StyleRules,
+    pub blocks: BTreeMap<String, BlockDefinition>,
     pub drawings: Vec<DrawingSource>,
 }
 
@@ -688,11 +889,12 @@ pub fn load_project(root: impl AsRef<Path>) -> ModelResult<ProjectSource> {
     let layers_path = root.join("rules/layers.toml");
     let styles_path = root.join("rules/styles.toml");
 
-    let project: ProjectConfig = read_toml(&project_path)?;
+    let project: ProjectConfig = read_toml(root, &project_path)?;
     ensure_schema(&project_path, None, &project.schema_version)?;
 
-    let layers = read_toml(&layers_path)?;
-    let styles = read_toml(&styles_path)?;
+    let layers = read_toml(root, &layers_path)?;
+    let styles = read_toml(root, &styles_path)?;
+    let blocks = read_blocks(root)?;
     let drawings = read_drawings(root)?;
 
     Ok(ProjectSource {
@@ -700,6 +902,7 @@ pub fn load_project(root: impl AsRef<Path>) -> ModelResult<ProjectSource> {
         project,
         layers,
         styles,
+        blocks,
         drawings,
     })
 }
@@ -739,6 +942,10 @@ fn read_drawings(root: &Path) -> ModelResult<Vec<DrawingSource>> {
         .into_iter()
         .filter_map(|entry| match entry.file_type() {
             Ok(file_type) if file_type.is_dir() => Some(Ok(entry)),
+            Ok(file_type) if file_type.is_symlink() => Some(Err(ModelError::UnsafeSourcePath {
+                path: entry.path(),
+                reason: "drawing directories may not be symlinks".to_owned(),
+            })),
             Ok(_) => None,
             Err(source) => Some(Err(ModelError::ListDir {
                 path: drawings_dir.clone(),
@@ -749,41 +956,94 @@ fn read_drawings(root: &Path) -> ModelResult<Vec<DrawingSource>> {
             let entry = entry?;
             let drawing_dir = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            let sheet_path = drawing_dir.join("sheet.toml");
             let entities_path = drawing_dir.join("entities.ndjson");
-
-            let sheet: SheetConfig = read_toml(&sheet_path)?;
-            ensure_schema(&sheet_path, None, &sheet.schema_version)?;
-            let entities = read_entities(&entities_path)?;
+            let layouts_path = drawing_dir.join("layouts.toml");
+            let layouts: LayoutsConfig = read_toml(root, &layouts_path)?;
+            ensure_schema(&layouts_path, None, &layouts.schema_version)?;
+            let entities = read_entities(root, &entities_path)?;
 
             Ok(DrawingSource {
                 name,
-                sheet,
+                layouts,
                 entities,
             })
         })
         .collect()
 }
 
-fn read_toml<T>(path: &Path) -> ModelResult<T>
+fn read_blocks(root: &Path) -> ModelResult<BTreeMap<String, BlockDefinition>> {
+    let blocks_dir = root.join("blocks");
+    if !blocks_dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut entries = fs::read_dir(&blocks_dir)
+        .map_err(|source| ModelError::ListDir {
+            path: blocks_dir.clone(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ModelError::ListDir {
+            path: blocks_dir.clone(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {
+                let path = entry.path();
+                let has_definition = path.join("definition.toml").exists();
+                let has_entities = path.join("entities.ndjson").exists();
+                if !has_definition && !has_entities {
+                    None
+                } else {
+                    Some(Ok(entry))
+                }
+            }
+            Ok(file_type) if file_type.is_symlink() => Some(Err(ModelError::UnsafeSourcePath {
+                path: entry.path(),
+                reason: "block directories may not be symlinks".to_owned(),
+            })),
+            Ok(_) => None,
+            Err(source) => Some(Err(ModelError::ListDir {
+                path: blocks_dir.clone(),
+                source,
+            })),
+        })
+        .map(|entry| {
+            let entry = entry?;
+            let block_dir = entry.path();
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let definition_path = block_dir.join("definition.toml");
+            let entities_path = block_dir.join("entities.ndjson");
+            let config: BlockDefinitionConfig = read_toml(root, &definition_path)?;
+            ensure_schema(&definition_path, None, &config.schema_version)?;
+            let entities = read_entities(root, &entities_path)?;
+            Ok((
+                id.clone(),
+                BlockDefinition {
+                    id,
+                    config,
+                    entities,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn read_toml<T>(root: &Path, path: &Path) -> ModelResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let text = fs::read_to_string(path).map_err(|source| ModelError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let text = read_canonical_source(root, path)?;
     toml::from_str(&text).map_err(|source| ModelError::Toml {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn read_entities(path: &Path) -> ModelResult<Vec<EntityRecord>> {
-    let text = fs::read_to_string(path).map_err(|source| ModelError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn read_entities(root: &Path, path: &Path) -> ModelResult<Vec<EntityRecord>> {
+    let text = read_canonical_source(root, path)?;
 
     text.lines()
         .enumerate()
@@ -811,6 +1071,56 @@ fn read_entities(path: &Path) -> ModelResult<Vec<EntityRecord>> {
         .collect()
 }
 
+fn read_canonical_source(root: &Path, path: &Path) -> ModelResult<String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ModelError::UnsafeSourcePath {
+            path: path.to_path_buf(),
+            reason: "path is outside the project root".to_owned(),
+        })?;
+    if classify_project_source_path(relative).is_none() {
+        return Err(ModelError::UnsafeSourcePath {
+            path: path.to_path_buf(),
+            reason: "path is not a canonical project source".to_owned(),
+        });
+    }
+
+    let canonical_root = fs::canonicalize(root).map_err(|source| ModelError::Read {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|source| ModelError::Read {
+            path: current.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ModelError::UnsafeSourcePath {
+                path: current,
+                reason: "symlinks are not allowed in canonical source paths".to_owned(),
+            });
+        }
+    }
+    let canonical_parent =
+        fs::canonicalize(path.parent().unwrap_or(root)).map_err(|source| ModelError::Read {
+            path: path.parent().unwrap_or(root).to_path_buf(),
+            source,
+        })?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(ModelError::UnsafeSourcePath {
+            path: path.to_path_buf(),
+            reason: "resolved parent escapes the project root".to_owned(),
+        });
+    }
+
+    fs::read_to_string(path).map_err(|source| ModelError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 fn ensure_schema(path: &Path, line: Option<usize>, found: &str) -> ModelResult<()> {
     if found == CURRENT_SCHEMA_VERSION {
         return Ok(());
@@ -826,6 +1136,137 @@ fn ensure_schema(path: &Path, line: Option<usize>, found: &str) -> ModelResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_only_canonical_project_sources() {
+        assert_eq!(
+            classify_project_source_path(Path::new("cad.project.toml")),
+            Some(ProjectSourceKind::Project)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("drawings/plan/layouts.toml")),
+            Some(ProjectSourceKind::Layout)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("blocks/door/entities.ndjson")),
+            Some(ProjectSourceKind::BlockEntities)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("drawings/plan/sheet.toml")),
+            None
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("build/.cad-history/index.json")),
+            None
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("drawings/plan/entities.ndjson.swp")),
+            None
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("drawings/../../entities.ndjson")),
+            None
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("./cad.project.toml")),
+            None
+        );
+    }
+
+    #[test]
+    fn source_manifest_excludes_generated_and_obsolete_files() {
+        let temp = minimal_project();
+        write(
+            temp.path().join("drawings/plan_1f/sheet.toml"),
+            "obsolete = true\n",
+        )
+        .expect("obsolete fixture");
+        create_dir_all(temp.path().join("build/.cad-history")).expect("history directory");
+        write(temp.path().join("build/.cad-history/index.json"), "{}").expect("history fixture");
+
+        let manifest = source_manifest(temp.path()).expect("manifest should load");
+        let paths = manifest
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"cad.project.toml".to_owned()));
+        assert!(paths.contains(&"drawings/plan_1f/layouts.toml".to_owned()));
+        assert!(!paths.iter().any(|path| path.ends_with("sheet.toml")));
+        assert!(!paths.iter().any(|path| path.starts_with("build/")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_canonical_source_files() {
+        use std::os::unix::fs::symlink;
+
+        for relative in [
+            "cad.project.toml",
+            "rules/layers.toml",
+            "rules/styles.toml",
+            "drawings/plan_1f/layouts.toml",
+            "drawings/plan_1f/entities.ndjson",
+        ] {
+            let temp = minimal_project();
+            let source = temp.path().join(relative);
+            let outside = temp.path().join("outside-source");
+            std::fs::rename(&source, &outside).expect("source should move outside canonical path");
+            symlink(&outside, &source).expect("source symlink should be created");
+
+            let error = load_project(temp.path()).expect_err("source symlink must fail closed");
+            assert!(matches!(error, ModelError::UnsafeSourcePath { .. }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_drawing_and_block_directories() {
+        use std::os::unix::fs::symlink;
+
+        let drawing_project = minimal_project();
+        let drawing = drawing_project.path().join("drawings/plan_1f");
+        let outside_drawing = drawing_project.path().join("outside-drawing");
+        std::fs::rename(&drawing, &outside_drawing).expect("drawing should move");
+        symlink(&outside_drawing, &drawing).expect("drawing symlink should be created");
+        assert!(matches!(
+            load_project(drawing_project.path()),
+            Err(ModelError::UnsafeSourcePath { .. })
+        ));
+
+        let block_project = minimal_project();
+        let outside_block = block_project.path().join("outside-block");
+        create_dir_all(&outside_block).expect("outside block directory");
+        write(
+            outside_block.join("definition.toml"),
+            "schema_version = \"0.2\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
+        )
+        .expect("block definition");
+        write(outside_block.join("entities.ndjson"), "").expect("block entities");
+        create_dir_all(block_project.path().join("blocks")).expect("blocks directory");
+        symlink(&outside_block, block_project.path().join("blocks/fixture"))
+            .expect("block symlink should be created");
+        assert!(matches!(
+            load_project(block_project.path()),
+            Err(ModelError::UnsafeSourcePath { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_manifest_rejects_symlinked_canonical_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temp = minimal_project();
+        let source = temp.path().join("drawings/plan_1f/layouts.toml");
+        let outside = temp.path().join("outside-layouts.toml");
+        std::fs::rename(&source, &outside).expect("layout should move");
+        symlink(&outside, &source).expect("layout symlink should be created");
+
+        assert!(matches!(
+            source_manifest(temp.path()),
+            Err(ModelError::UnsafeSourcePath { .. })
+        ));
+    }
     use std::fs::{create_dir_all, write};
 
     #[test]
@@ -851,16 +1292,39 @@ mod tests {
     }
 
     #[test]
+    fn layouts_toml_is_required_for_each_drawing() {
+        let temp = minimal_project();
+        std::fs::remove_file(temp.path().join("drawings/plan_1f/layouts.toml"))
+            .expect("layouts file");
+
+        let error = load_project(temp.path()).expect_err("missing layouts must fail");
+
+        assert!(matches!(error, ModelError::Read { .. }));
+    }
+
+    #[test]
+    fn obsolete_sheet_file_is_not_loaded_as_a_second_layout_source() {
+        let temp = minimal_project();
+        write(
+            temp.path().join("drawings/plan_1f/sheet.toml"),
+            "this is not valid TOML",
+        )
+        .expect("obsolete sheet file should be writable");
+
+        load_project(temp.path()).expect("schema 0.2 should use layouts.toml only");
+    }
+
+    #[test]
     fn parses_all_mvp_entity_types() {
         let source = [
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1.0,0.0]}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0]],"closed":false}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":1.0,"start_deg":0.0,"end_deg":90.0}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":1.0}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":2.0,"radius_y":1.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}"#,
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000007","type":"block_ref","layer":"0-1","block":"door_910","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1.0,0.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0]],"closed":false}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":1.0,"start_deg":0.0,"end_deg":90.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":1.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":2.0,"radius_y":1.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000007","type":"block_ref","layer":"0-1","block":"door_910","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
         ];
 
         for line in source {
@@ -874,7 +1338,7 @@ mod tests {
         let temp = minimal_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            "{\"schema_version\":\"0.1\"",
+            "{\"schema_version\":\"0.2\"",
         )
         .expect("fixture should be writable");
 
@@ -887,7 +1351,7 @@ mod tests {
     fn rejects_invalid_toml() {
         let temp = minimal_project();
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
+            temp.path().join("drawings/plan_1f/layouts.toml"),
             "schema_version = ",
         )
         .expect("fixture should be writable");
@@ -936,7 +1400,7 @@ mod tests {
         let temp = minimal_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"spline","layer":"0-1"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"spline","layer":"0-1"}"#,
         )
         .expect("fixture should be writable");
 
@@ -975,7 +1439,7 @@ mod tests {
     #[test]
     fn computes_entity_bbox() {
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[-1.0,2.0],"p2":[3.0,-4.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[-1.0,2.0],"p2":[3.0,-4.0]}"#,
         )
         .expect("line should parse");
 
@@ -1003,15 +1467,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_text_mirror_fields_for_existing_schema() {
+    fn defaults_text_mirror_fields_when_omitted() {
         let text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
         )
-        .expect("legacy text should parse");
+        .expect("text should parse");
         let dimension: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"value":null}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"value":null}"#,
         )
-        .expect("legacy dimension should parse");
+        .expect("dimension should parse");
 
         assert!(matches!(
             text,
@@ -1047,7 +1511,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1061,13 +1525,13 @@ mod tests {
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
         )
         .expect("entities NDJSON should be writable");
 

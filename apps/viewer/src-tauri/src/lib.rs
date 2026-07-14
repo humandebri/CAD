@@ -106,7 +106,7 @@ pub struct CommentAnchor {
 }
 
 fn default_schema_version() -> String {
-    "0.1".to_owned()
+    cad_model::CURRENT_SCHEMA_VERSION.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +131,8 @@ pub struct CommentMutationResult {
     pub drawing: String,
     pub revision: String,
     pub comments: Vec<CommentRecord>,
+    pub history_id: Option<String>,
+    pub changed_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +149,29 @@ pub struct ReviewArtifacts {
     diff_unavailable: Option<String>,
     layers: LayerWorkspaceState,
     editor: cad_edit::EditorDrawingState,
+    blocks: Vec<BlockWorkspaceState>,
+    layouts: Vec<LayoutWorkspaceState>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockWorkspaceState {
+    id: String,
+    name: String,
+    entity_count: usize,
+    revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LayoutWorkspaceState {
+    id: String,
+    paper: String,
+    orientation: cad_model::SheetOrientation,
+    scale: String,
+    origin: cad_model::Point,
+    margins: [f64; 4],
+    plot_area: Option<[f64; 4]>,
+    active: bool,
+    revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -181,12 +206,39 @@ pub struct LayerWorkspaceLayer {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerRulesPatch {
+    #[serde(default)]
+    drawing: Option<String>,
     expected_revision: String,
     #[serde(default)]
     layers: Vec<LayerPatch>,
     #[serde(default)]
     groups: Vec<LayerGroupPatch>,
     active_layer: Option<String>,
+}
+
+fn permissions_snapshot(permissions: &fs::Permissions) -> cad_edit::PermissionsSnapshot {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        cad_edit::PermissionsSnapshot {
+            readonly: permissions.readonly(),
+            unix_mode: Some(permissions.mode()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        cad_edit::PermissionsSnapshot {
+            readonly: permissions.readonly(),
+            unix_mode: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerMutationResult {
+    state: LayerWorkspaceState,
+    history_id: Option<String>,
+    changed_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,6 +323,7 @@ fn apply_drawing_edit(
     project_path: String,
     request: cad_edit::DrawingEditRequest,
 ) -> Result<cad_edit::DrawingEditResult, String> {
+    recover_project_sources(Path::new(&project_path))?;
     let _guard = edit_manager
         .update
         .lock()
@@ -282,6 +335,73 @@ fn apply_drawing_edit(
         .lock()
         .map_err(|_| "snap cache lock is poisoned".to_owned())? = None;
     Ok(result)
+}
+
+#[tauri::command]
+fn undo_drawing_edit(
+    edit_manager: State<'_, DrawingEditManager>,
+    snap_manager: State<'_, SnapCacheManager>,
+    project_path: String,
+    request: cad_edit::DrawingHistoryRequest,
+) -> Result<cad_edit::DrawingEditResult, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    let _guard = edit_manager
+        .update
+        .lock()
+        .map_err(|_| "drawing edit lock is poisoned".to_owned())?;
+    let result = cad_edit::undo_drawing_edit(Path::new(&project_path), &request)
+        .map_err(|error| error.to_string())?;
+    *snap_manager
+        .cache
+        .lock()
+        .map_err(|_| "snap cache lock is poisoned".to_owned())? = None;
+    Ok(result)
+}
+
+#[tauri::command]
+fn redo_drawing_edit(
+    edit_manager: State<'_, DrawingEditManager>,
+    snap_manager: State<'_, SnapCacheManager>,
+    project_path: String,
+    request: cad_edit::DrawingHistoryRequest,
+) -> Result<cad_edit::DrawingEditResult, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    let _guard = edit_manager
+        .update
+        .lock()
+        .map_err(|_| "drawing edit lock is poisoned".to_owned())?;
+    let result = cad_edit::redo_drawing_edit(Path::new(&project_path), &request)
+        .map_err(|error| error.to_string())?;
+    *snap_manager
+        .cache
+        .lock()
+        .map_err(|_| "snap cache lock is poisoned".to_owned())? = None;
+    Ok(result)
+}
+
+#[tauri::command]
+fn list_drawing_history(
+    project_path: String,
+    drawing: String,
+) -> Result<cad_edit::DrawingHistoryState, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    cad_edit::list_drawing_history(Path::new(&project_path), &drawing)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_drawing_history(
+    edit_manager: State<'_, DrawingEditManager>,
+    project_path: String,
+    drawing: String,
+) -> Result<(), String> {
+    recover_project_sources(Path::new(&project_path))?;
+    let _guard = edit_manager
+        .update
+        .lock()
+        .map_err(|_| "drawing edit lock is poisoned".to_owned())?;
+    cad_edit::clear_drawing_history(Path::new(&project_path), &drawing)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -366,17 +486,29 @@ fn validated_drawing_revision(
     drawing: &str,
     expected_revision: &str,
 ) -> Result<String, String> {
-    let path = project_path
-        .join("drawings")
-        .join(drawing)
-        .join("entities.ndjson");
-    let bytes = fs::read(&path).map_err(|error| {
-        format!(
-            "failed to read drawing revision {}: {error}",
-            path.display()
-        )
-    })?;
-    let actual_revision = blake3::hash(&bytes).to_hex().to_string();
+    recover_project_sources(project_path)?;
+    let mut drawing_components = Path::new(drawing).components();
+    if !matches!(
+        drawing_components.next(),
+        Some(std::path::Component::Normal(_))
+    ) || drawing_components.next().is_some()
+    {
+        return Err(format!("invalid drawing name {drawing:?}"));
+    }
+    let relative_path = Path::new("drawings").join(drawing).join("entities.ndjson");
+    if cad_model::classify_project_source_path(&relative_path)
+        != Some(cad_model::ProjectSourceKind::DrawingEntities)
+    {
+        return Err(format!("invalid drawing name {drawing:?}"));
+    }
+    let manifest = cad_model::source_manifest(project_path)
+        .map_err(|error| format!("failed to read canonical source manifest: {error}"))?;
+    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+    let actual_revision = manifest
+        .into_iter()
+        .find(|file| file.relative_path == relative_path)
+        .map(|file| file.revision)
+        .ok_or_else(|| format!("drawing source {relative_path:?} was not found"))?;
     if actual_revision != expected_revision {
         return Err(format!(
             "revision_conflict: drawing changed before snap query (expected {expected_revision}, found {actual_revision})"
@@ -387,8 +519,12 @@ fn validated_drawing_revision(
 
 #[tauri::command]
 fn import_jww(jww_path: String, out_dir: String) -> Result<ProjectState, String> {
-    let report = cad_import_jww::import_jww_file(&jww_path, &out_dir)
-        .map_err(|error| format!("failed to import JWW: {error}"))?;
+    let report = cad_import_jww::import_jww_file_with_options(
+        &jww_path,
+        &out_dir,
+        cad_import_jww::ImportOptions::default(),
+    )
+    .map_err(|error| format!("failed to import JWW: {error}"))?;
     let mut state = open_project_state(Path::new(&out_dir))?;
     state.import_warning_count = Some(report.warnings.len());
     Ok(state)
@@ -399,7 +535,7 @@ fn update_layer_rules(
     manager: State<'_, LayerRulesUpdateManager>,
     project_path: String,
     patch: LayerRulesPatch,
-) -> Result<LayerWorkspaceState, String> {
+) -> Result<LayerMutationResult, String> {
     let _guard = manager
         .update
         .lock()
@@ -415,6 +551,7 @@ fn export_jww(
     allow_lossy: bool,
     overwrite: bool,
 ) -> Result<cad_export_jww::ExportReport, String> {
+    recover_project_sources(Path::new(&project_path))?;
     cad_export_jww::export_jww_file(
         project_path,
         &drawing,
@@ -425,6 +562,36 @@ fn export_jww(
         },
     )
     .map_err(|error| format!("failed to export JWW: {error}"))
+}
+
+#[tauri::command]
+fn export_drawing_pdf(
+    project_path: String,
+    drawing: String,
+    layout: Option<String>,
+    output_path: String,
+    overwrite: bool,
+    expected_files: Vec<cad_edit::HistoryFileRevision>,
+) -> Result<(), String> {
+    recover_project_sources(Path::new(&project_path))?;
+    cad_render_pdf::export_drawing_pdf(
+        &project_path,
+        &drawing,
+        layout.as_deref(),
+        &output_path,
+        cad_render_pdf::PdfExportOptions {
+            overwrite,
+            expected_files: expected_files
+                .into_iter()
+                .map(|file| cad_render_pdf::PdfFileRevision {
+                    relative_path: file.relative_path,
+                    revision: file.revision,
+                    exists: file.exists,
+                })
+                .collect(),
+        },
+    )
+    .map_err(|error| format!("failed to export PDF: {error}"))
 }
 
 #[tauri::command]
@@ -449,6 +616,7 @@ fn create_comment(
         Path::new(&project_path),
         &request.drawing,
         &request.expected_revision,
+        "comment.create",
         |comments, project| {
             if request.text.trim().is_empty() {
                 return Err("comment text must not be empty".to_owned());
@@ -488,6 +656,7 @@ fn update_comment_status(
         Path::new(&project_path),
         &request.drawing,
         &request.expected_revision,
+        "comment.status",
         |comments, _| {
             if !matches!(request.status.as_str(), "open" | "resolved") {
                 return Err("comment status must be open or resolved".to_owned());
@@ -506,6 +675,31 @@ fn mutate_comments<F>(
     project_path: &Path,
     drawing: &str,
     expected_revision: &str,
+    operation: &str,
+    mutation: F,
+) -> Result<CommentMutationResult, String>
+where
+    F: FnOnce(&mut Vec<CommentRecord>, &cad_model::ProjectSource) -> Result<(), String>,
+{
+    recover_project_sources(project_path)?;
+    cad_edit::with_history_lock(|| {
+        mutate_comments_locked(
+            project_path,
+            drawing,
+            expected_revision,
+            operation,
+            mutation,
+        )
+        .map_err(cad_edit::EditError::HistoryUnavailable)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn mutate_comments_locked<F>(
+    project_path: &Path,
+    drawing: &str,
+    expected_revision: &str,
+    operation: &str,
     mutation: F,
 ) -> Result<CommentMutationResult, String>
 where
@@ -524,14 +718,13 @@ where
     {
         return Err(format!("drawing {drawing:?} was not found"));
     }
-    let path = project_path
-        .join("comments")
-        .join(format!("{drawing}.ndjson"));
-    let original = if path.exists() {
-        fs::read(&path).map_err(|error| format!("failed to read comments: {error}"))?
-    } else {
-        Vec::new()
-    };
+    let relative_path = format!("comments/{drawing}.ndjson");
+    let path = project_path.join(&relative_path);
+    let original_input = cad_edit::read_history_file(project_path, &relative_path)
+        .map_err(|error| format!("failed to read comments: {error}"))?;
+    let original_exists = original_input.exists;
+    let original_permissions = original_input.permissions;
+    let original = original_input.bytes;
     let actual_revision = blake3::hash(&original).to_hex().to_string();
     if actual_revision != expected_revision {
         return Err(format!(
@@ -554,38 +747,97 @@ where
     if trailing_newline {
         text.push_str(newline);
     }
-    let current = if path.exists() {
-        fs::read(&path).map_err(|error| format!("failed to reread comments: {error}"))?
-    } else {
-        Vec::new()
-    };
+    let current = cad_edit::read_history_file(project_path, &relative_path)
+        .map_err(|error| format!("failed to reread comments: {error}"))?
+        .bytes;
     if blake3::hash(&current).to_hex().to_string() != expected_revision {
         return Err("revision_conflict: comments changed before publish".to_owned());
     }
-    let permissions = fs::metadata(&path)
-        .or_else(|_| fs::metadata(project_path))
-        .map_err(|error| format!("failed to inspect comment permissions: {error}"))?
-        .permissions();
+    let before_input = cad_edit::HistoryFileInput {
+        relative_path: relative_path.clone(),
+        exists: original_exists,
+        bytes: original.clone(),
+        permissions: original_permissions.clone(),
+    };
+    let mut history_stage = cad_edit::stage_history_transaction(
+        project_path,
+        drawing,
+        "drawing",
+        operation,
+        &[],
+        &[before_input],
+    )
+    .map_err(|error| error.to_string())?;
+    let updated_bytes = text.as_bytes().to_vec();
+    let after_permissions_snapshot = original_permissions.clone();
+    history_stage
+        .prepare_after(&[cad_edit::HistoryFileInput {
+            relative_path: relative_path.clone(),
+            exists: true,
+            bytes: updated_bytes.clone(),
+            permissions: after_permissions_snapshot.clone(),
+        }])
+        .map_err(|error| error.to_string())?;
+    history_stage
+        .prepare_commit_journal()
+        .map_err(|error| error.to_string())?;
     let parent = path.parent().ok_or("comments path has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create comments directory: {error}"))?;
-    let staging = tempfile::Builder::new()
-        .prefix(".comments-")
-        .tempfile_in(parent)
-        .map_err(|error| format!("failed to stage comments: {error}"))?;
-    fs::write(staging.path(), text)
-        .map_err(|error| format!("failed to write comments: {error}"))?;
-    fs::set_permissions(staging.path(), permissions)
-        .map_err(|error| format!("failed to preserve comments permissions: {error}"))?;
-    staging
-        .persist(&path)
-        .map_err(|error| format!("failed to publish comments: {}", error.error))?;
+    let publish_result = if original_exists {
+        let permissions = original_permissions
+            .as_ref()
+            .ok_or("comments permissions are unavailable")?;
+        cad_edit::atomic_replace_with_permissions(
+            &path,
+            &updated_bytes,
+            expected_revision,
+            permissions,
+        )
+    } else {
+        cad_edit::atomic_create(&path, &updated_bytes, after_permissions_snapshot.as_ref())
+    };
+    if let Err(error) = publish_result {
+        history_stage.abort();
+        return Err(error.to_string());
+    }
     let bytes =
         fs::read(&path).map_err(|error| format!("failed to read updated comments: {error}"))?;
+    let history_id = history_stage.history_id().to_owned();
+    if let Err(error) = cad_edit::commit_history_stage(&mut history_stage) {
+        let rollback = if original_exists {
+            if let Some(permissions) = original_permissions.as_ref() {
+                let expected = blake3::hash(&updated_bytes).to_hex().to_string();
+                cad_edit::atomic_replace_with_permissions(&path, &original, &expected, permissions)
+            } else {
+                Err(cad_edit::EditError::HistoryUnavailable(
+                    "comments permissions are unavailable".to_owned(),
+                ))
+            }
+        } else {
+            cad_edit::atomic_delete(
+                project_path,
+                &relative_path,
+                blake3::hash(&updated_bytes).to_hex().as_ref(),
+            )
+        };
+        match rollback {
+            Ok(()) => {
+                history_stage.abort();
+                return Err(error.to_string());
+            }
+            Err(rollback_error) => {
+                history_stage.preserve_for_recovery();
+                return Err(rollback_error.to_string());
+            }
+        }
+    }
     Ok(CommentMutationResult {
         drawing: drawing.to_owned(),
         revision: blake3::hash(&bytes).to_hex().to_string(),
         comments,
+        history_id: Some(history_id),
+        changed_files: vec![relative_path],
     })
 }
 
@@ -599,14 +851,10 @@ fn parse_comment_records(bytes: &[u8]) -> Result<Vec<CommentRecord>, String> {
 }
 
 fn comment_revision(project_path: &Path, drawing: &str) -> Result<String, String> {
-    let path = project_path
-        .join("comments")
-        .join(format!("{drawing}.ndjson"));
-    let bytes = if path.exists() {
-        fs::read(&path).map_err(|error| format!("failed to read comments: {error}"))?
-    } else {
-        Vec::new()
-    };
+    let relative_path = format!("comments/{drawing}.ndjson");
+    let bytes = cad_edit::read_history_file(project_path, &relative_path)
+        .map_err(|error| format!("failed to read comments: {error}"))?
+        .bytes;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -672,23 +920,34 @@ fn save_last_project<R: Runtime>(
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create app config dir: {error}"))?;
-    fs::write(path, project_path).map_err(|error| format!("failed to save last project: {error}"))
+    cad_edit::atomic_publish(&path, project_path.as_bytes(), true)
+        .map_err(|error| format!("failed to save last project: {error}"))
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(ProjectWatchManager::default())
         .manage(LayerRulesUpdateManager::default())
         .manage(DrawingEditManager::default())
-        .manage(SnapCacheManager::default())
+        .manage(SnapCacheManager::default());
+    #[cfg(feature = "desktop-e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio_webdriver::init())
+        .plugin(tauri_plugin_wdio::init());
+    builder
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_project,
             run_review,
             apply_drawing_edit,
+            undo_drawing_edit,
+            redo_drawing_edit,
+            list_drawing_history,
+            clear_drawing_history,
             query_snap,
             import_jww,
             export_jww,
+            export_drawing_pdf,
             update_layer_rules,
             create_comment,
             update_comment_status,
@@ -772,29 +1031,17 @@ fn project_watch_event(
 
 fn source_relative_path(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    if !is_project_source_path(relative) {
-        return None;
-    }
+    cad_model::classify_project_source_path(relative)?;
     Some(relative.to_string_lossy().into_owned())
 }
 
-fn is_project_source_path(relative: &Path) -> bool {
-    if relative == Path::new("cad.project.toml") {
-        return true;
-    }
-    let Some(first) = relative.components().next() else {
-        return false;
-    };
-    let extension = relative.extension().and_then(OsStr::to_str);
-    match first.as_os_str().to_str() {
-        Some("rules") => extension == Some("toml"),
-        Some("drawings") => matches!(extension, Some("toml" | "ndjson")),
-        Some("comments") => extension == Some("ndjson"),
-        _ => false,
-    }
+fn recover_project_sources(project_path: &Path) -> Result<(), String> {
+    cad_edit::with_history_lock(|| cad_edit::recover_source_transactions(project_path))
+        .map_err(|error| format!("failed to recover source transaction: {error}"))
 }
 
 fn open_project_state(project_path: &Path) -> Result<ProjectState, String> {
+    recover_project_sources(project_path)?;
     let source = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project: {error}"))?;
     Ok(ProjectState {
@@ -814,6 +1061,7 @@ fn run_review_for_drawing(
     project_path: &Path,
     requested_drawing: Option<&str>,
 ) -> Result<ReviewArtifacts, String> {
+    recover_project_sources(project_path)?;
     let head = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project: {error}"))?;
     let drawing_name = requested_drawing
@@ -872,6 +1120,45 @@ fn run_review_for_drawing(
         Err(message) => (None, None, Some(message)),
     };
 
+    let blocks = head
+        .blocks
+        .values()
+        .map(|block| {
+            Ok(BlockWorkspaceState {
+                id: block.id.clone(),
+                name: block.config.name.clone(),
+                entity_count: block.entities.len(),
+                revision: cad_edit::block_definition_revision(&head.root, &block.id)
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let layouts_revision =
+        cad_edit::layout_revision(&head.root, &drawing_name).map_err(|error| error.to_string())?;
+    let layouts = head
+        .drawings
+        .iter()
+        .find(|drawing| drawing.name == drawing_name)
+        .map(|drawing| {
+            drawing
+                .layouts
+                .layouts
+                .iter()
+                .map(|(id, layout)| LayoutWorkspaceState {
+                    id: id.clone(),
+                    paper: layout.paper.clone(),
+                    orientation: layout.orientation.clone(),
+                    scale: layout.scale.clone(),
+                    origin: layout.origin,
+                    margins: layout.margins,
+                    plot_area: layout.plot_area,
+                    active: id == &drawing.layouts.active_layout,
+                    revision: layouts_revision.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ReviewArtifacts {
         project_name: head.project.name.clone(),
         drawing_names: head
@@ -889,6 +1176,8 @@ fn run_review_for_drawing(
         diff_unavailable,
         layers: layer_workspace_state_for_drawing(&head, Some(&drawing_name)),
         editor,
+        blocks,
+        layouts,
     })
 }
 
@@ -965,7 +1254,19 @@ fn layer_workspace_state_for_drawing(
 fn update_layer_rules_for_path(
     project_path: &Path,
     patch: &LayerRulesPatch,
-) -> Result<LayerWorkspaceState, String> {
+) -> Result<LayerMutationResult, String> {
+    recover_project_sources(project_path)?;
+    cad_edit::with_history_lock(|| {
+        update_layer_rules_for_path_locked(project_path, patch)
+            .map_err(cad_edit::EditError::HistoryUnavailable)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn update_layer_rules_for_path_locked(
+    project_path: &Path,
+    patch: &LayerRulesPatch,
+) -> Result<LayerMutationResult, String> {
     static UPDATE_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     let _guard = UPDATE_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -1003,6 +1304,7 @@ fn update_layer_rules_for_path(
     {
         return Err(format!("active layer {active_layer:?} does not exist"));
     }
+    let original_bytes = original.clone();
     let text = String::from_utf8(original)
         .map_err(|error| format!("layers.toml is not UTF-8: {error}"))?;
     let mut document = text
@@ -1033,33 +1335,91 @@ fn update_layer_rules_for_path(
     if let Some(active_layer) = &patch.active_layer {
         document["active_layer"] = toml_edit::value(active_layer.clone());
     }
-    let staging = tempfile::Builder::new()
-        .prefix(".layers-")
-        .tempfile_in(path.parent().ok_or("layers.toml has no parent")?)
-        .map_err(|error| format!("failed to stage layers.toml: {error}"))?;
-    fs::write(staging.path(), document.to_string())
-        .map_err(|error| format!("failed to write staged layers.toml: {error}"))?;
-    fs::set_permissions(staging.path(), permissions)
-        .map_err(|error| format!("failed to preserve layers.toml permissions: {error}"))?;
-    let current = fs::read(&path)
-        .map_err(|error| format!("failed to re-read layers.toml before publish: {error}"))?;
-    let current_revision = blake3::hash(&current).to_hex().to_string();
-    if patch.expected_revision != current_revision {
-        return Err(format!(
-            "layers.toml changed outside the editor (expected revision {}, found {}); reload before saving",
-            patch.expected_revision, current_revision
-        ));
+    let relative_path = "rules/layers.toml".to_owned();
+    let before_permissions = permissions_snapshot(&permissions);
+    let mut history_stage = cad_edit::stage_history_transaction(
+        project_path,
+        patch.drawing.as_deref().unwrap_or("project"),
+        "project",
+        "layer.update",
+        &[],
+        &[cad_edit::HistoryFileInput {
+            relative_path: relative_path.clone(),
+            exists: true,
+            bytes: original_bytes.clone(),
+            permissions: Some(before_permissions.clone()),
+        }],
+    )
+    .map_err(|error| error.to_string())?;
+    let updated_bytes = document.to_string().into_bytes();
+    history_stage
+        .prepare_after(&[cad_edit::HistoryFileInput {
+            relative_path: relative_path.clone(),
+            exists: true,
+            bytes: updated_bytes.clone(),
+            permissions: Some(before_permissions.clone()),
+        }])
+        .map_err(|error| error.to_string())?;
+    history_stage
+        .prepare_commit_journal()
+        .map_err(|error| error.to_string())?;
+    cad_edit::atomic_replace_with_permissions(
+        &path,
+        &updated_bytes,
+        &patch.expected_revision,
+        &before_permissions,
+    )
+    .map_err(|error| error.to_string())?;
+    let updated = match cad_model::load_project(project_path) {
+        Ok(updated) => updated,
+        Err(error) => {
+            let expected = blake3::hash(&updated_bytes).to_hex().to_string();
+            match cad_edit::atomic_replace_with_permissions(
+                &path,
+                &original_bytes,
+                &expected,
+                &before_permissions,
+            ) {
+                Ok(()) => {
+                    history_stage.abort();
+                    return Err(format!("failed to reload updated layers: {error}"));
+                }
+                Err(rollback_error) => {
+                    history_stage.preserve_for_recovery();
+                    return Err(rollback_error.to_string());
+                }
+            }
+        }
+    };
+    let history_id = history_stage.history_id().to_owned();
+    if let Err(error) = cad_edit::commit_history_stage(&mut history_stage) {
+        let expected = blake3::hash(&updated_bytes).to_hex().to_string();
+        match cad_edit::atomic_replace_with_permissions(
+            &path,
+            &original_bytes,
+            &expected,
+            &before_permissions,
+        ) {
+            Ok(()) => {
+                history_stage.abort();
+                return Err(error.to_string());
+            }
+            Err(rollback_error) => {
+                history_stage.preserve_for_recovery();
+                return Err(rollback_error.to_string());
+            }
+        }
     }
-    fs::rename(staging.path(), &path)
-        .map_err(|error| format!("failed to publish layers.toml: {error}"))?;
-    let updated = cad_model::load_project(project_path)
-        .map_err(|error| format!("failed to reload updated layers: {error}"))?;
-    Ok(layer_workspace_state(&updated))
+    Ok(LayerMutationResult {
+        state: layer_workspace_state(&updated),
+        history_id: Some(history_id),
+        changed_files: vec![relative_path],
+    })
 }
 
 fn layer_rules_revision(project_path: &Path) -> Result<String, String> {
-    fs::read(project_path.join("rules/layers.toml"))
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    cad_edit::read_history_file(project_path, "rules/layers.toml")
+        .map(|source| blake3::hash(&source.bytes).to_hex().to_string())
         .map_err(|error| format!("failed to read layers.toml revision: {error}"))
 }
 
@@ -1068,13 +1428,21 @@ fn write_ai_context_for_path(
     view_mode: &str,
     selected_entity_id: &str,
 ) -> AiContextState {
+    if let Err(error) = recover_project_sources(project_path) {
+        return ai_context_state(AiContextStatus::Error, None, None, Some(error));
+    }
     if selected_entity_id.trim().is_empty() {
-        let build_dir = project_path.join("build");
+        let build_dir = match safe_generated_dir(project_path, Path::new("build")) {
+            Ok(path) => path,
+            Err(error) => {
+                return ai_context_state(AiContextStatus::Error, None, None, Some(error));
+            }
+        };
         if let Err(error) = fs::create_dir_all(&build_dir).and_then(|()| {
             publish_ai_context_manifest(
                 &build_dir,
                 &serde_json::json!({
-                    "schema_version": "0.1",
+                    "schema_version": "0.2",
                     "status": "no_entity_selected",
                     "generation": null,
                     "json_path": null,
@@ -1102,8 +1470,19 @@ fn write_ai_context_for_path(
 
     match build_ai_context(project_path, view_mode, selected_entity_id) {
         Ok((context, markdown)) => {
-            let build_dir = project_path.join("build");
-            let generations_dir = build_dir.join("ai-context");
+            let build_dir = match safe_generated_dir(project_path, Path::new("build")) {
+                Ok(path) => path,
+                Err(error) => {
+                    return ai_context_state(AiContextStatus::Error, None, None, Some(error));
+                }
+            };
+            let generations_dir =
+                match safe_generated_dir(project_path, Path::new("build/ai-context")) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return ai_context_state(AiContextStatus::Error, None, None, Some(error));
+                    }
+                };
             if let Err(error) = fs::create_dir_all(&generations_dir) {
                 return ai_context_state(
                     AiContextStatus::Error,
@@ -1171,7 +1550,7 @@ fn write_ai_context_for_path(
             let json_path = generation_dir.join("context.json");
             let markdown_path = generation_dir.join("context.md");
             let manifest = serde_json::json!({
-                "schema_version": "0.1",
+                "schema_version": "0.2",
                 "generation": generation,
                 "json_path": path_string(&json_path),
                 "markdown_path": path_string(&markdown_path),
@@ -1195,23 +1574,64 @@ fn write_ai_context_for_path(
     }
 }
 
+fn safe_generated_dir(project_path: &Path, relative: &Path) -> Result<PathBuf, String> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!("unsafe generated path {:?}", relative));
+    }
+    let root = fs::canonicalize(project_path)
+        .map_err(|error| format!("failed to canonicalize project root: {error}"))?;
+    let target = root.join(relative);
+    let mut current = root.clone();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "generated path contains a symlink: {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "generated path component is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect generated path {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    if let Some(parent) = target.parent()
+        && parent.exists()
+    {
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|error| format!("failed to canonicalize generated parent: {error}"))?;
+        if !canonical_parent.starts_with(&root) {
+            return Err("generated path escapes the project root".to_owned());
+        }
+    }
+    Ok(target)
+}
+
 fn publish_ai_context_manifest(
     build_dir: &Path,
     manifest: &serde_json::Value,
 ) -> Result<(), String> {
     let manifest_path = build_dir.join("ai-context-current.json");
-    let staging = tempfile::Builder::new()
-        .prefix(".ai-context-current-")
-        .tempfile_in(build_dir)
-        .map_err(|error| format!("failed to stage AI context manifest: {error}"))?;
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| format!("failed to serialize AI context manifest: {error}"))?;
-    fs::write(staging.path(), bytes)
-        .map_err(|error| format!("failed to write AI context manifest: {error}"))?;
-    staging
-        .persist(&manifest_path)
-        .map_err(|error| format!("failed to publish AI context manifest: {}", error.error))?;
-    Ok(())
+    cad_edit::atomic_publish(&manifest_path, &bytes, true)
+        .map_err(|error| format!("failed to publish AI context manifest: {error}"))
 }
 
 fn ai_context_generation(json: &str, markdown: &str) -> String {
@@ -1227,16 +1647,18 @@ fn build_ai_context(
     view_mode: &str,
     selected_entity_id: &str,
 ) -> Result<(AiContext, String), String> {
+    let initial_manifest = cad_model::source_manifest(project_path)
+        .map_err(|error| format!("failed to load canonical source manifest: {error}"))?;
     let project = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project: {error}"))?;
     let Some((drawing_name, record)) = find_entity_record(&project, selected_entity_id) else {
         return Err(format!("entity {selected_entity_id} was not found"));
     };
-    let source_path = project_path
-        .join("drawings")
-        .join(&drawing_name)
-        .join("entities.ndjson");
-    let raw = read_source_line(&source_path, record.line)?;
+    let source_relative_path = format!("drawings/{drawing_name}/entities.ndjson");
+    let source_path = project_path.join(&source_relative_path);
+    let source = cad_edit::read_history_file(project_path, &source_relative_path)
+        .map_err(|error| format!("failed to read selected entity source: {error}"))?;
+    let raw = read_source_line(&source.bytes, record.line)?;
     let check = cad_check::check_project(project_path);
     let (comments, comment_diagnostics) = load_comments_for_drawing(project_path, &drawing_name);
     let comments = comments
@@ -1257,9 +1679,16 @@ fn build_ai_context(
         .filter(|diagnostic| diagnostic.entity_id.as_deref() == Some(selected_entity_id))
         .collect::<Vec<_>>();
     check_diagnostics.extend(comment_diagnostics);
+    let final_manifest = cad_model::source_manifest(project_path)
+        .map_err(|error| format!("failed to reload canonical source manifest: {error}"))?;
+    if initial_manifest != final_manifest {
+        return Err(
+            "revision_conflict: project source changed during AI context generation".to_owned(),
+        );
+    }
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let context = AiContext {
-        schema_version: "0.1".to_owned(),
+        schema_version: "0.2".to_owned(),
         project_path: path_string(project_path),
         project_name: project.project.name.clone(),
         drawing: drawing_name.clone(),
@@ -1295,9 +1724,9 @@ fn find_entity_record<'a>(
     })
 }
 
-fn read_source_line(path: &Path, line_number: usize) -> Result<String, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read selected entity source: {error}"))?;
+fn read_source_line(bytes: &[u8], line_number: usize) -> Result<String, String> {
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|error| format!("selected entity source is not UTF-8: {error}"))?;
     text.lines()
         .nth(line_number.saturating_sub(1))
         .map(str::to_owned)
@@ -1381,12 +1810,8 @@ fn load_comments_for_drawing(
     drawing: &str,
 ) -> (Vec<CommentRecord>, Vec<cad_check::CheckDiagnostic>) {
     let relative_path = format!("comments/{drawing}.ndjson");
-    let path = project_path.join(&relative_path);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new());
-        }
+    let source = match cad_edit::read_history_file(project_path, &relative_path) {
+        Ok(source) => source,
         Err(error) => {
             return (
                 Vec::new(),
@@ -1395,6 +1820,23 @@ fn load_comments_for_drawing(
                     None,
                     "comments.read_failed",
                     format!("failed to read comments: {error}"),
+                )],
+            );
+        }
+    };
+    if !source.exists {
+        return (Vec::new(), Vec::new());
+    }
+    let text = match String::from_utf8(source.bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![comment_diagnostic(
+                    &relative_path,
+                    None,
+                    "comments.read_failed",
+                    format!("comments are not UTF-8: {error}"),
                 )],
             );
         }
@@ -1634,7 +2076,7 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
             ],
         );
 
@@ -1653,8 +2095,8 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"new"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"new"}"#,
             ],
         );
 
@@ -1679,7 +2121,7 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
             ],
         );
 
@@ -1697,13 +2139,13 @@ mod tests {
         let other = temp.path().join("drawings/other");
         fs::create_dir_all(&other).expect("other drawing should be created");
         fs::copy(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            other.join("sheet.toml"),
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            other.join("layouts.toml"),
         )
-        .expect("sheet should be copied");
+        .expect("layouts should be copied");
         fs::write(
             other.join("entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
         )
         .expect("other entities should be written");
 
@@ -1772,7 +2214,7 @@ mod tests {
         let json = fs::read_to_string(json_path).expect("AI context JSON should be readable");
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("AI context JSON should parse");
-        assert_eq!(value["schema_version"], "0.1");
+        assert_eq!(value["schema_version"], cad_model::CURRENT_SCHEMA_VERSION);
         assert_eq!(
             value["selected_entity_id"],
             "ent_01JZ0000000000000000000000"
@@ -1814,7 +2256,7 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
             ],
         );
         let second = write_ai_context_for_path(
@@ -1838,13 +2280,13 @@ mod tests {
         let other = temp.path().join("drawings/other");
         fs::create_dir_all(&other).expect("other drawing should be created");
         fs::copy(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            other.join("sheet.toml"),
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            other.join("layouts.toml"),
         )
-        .expect("sheet should be copied");
+        .expect("layouts should be copied");
         fs::write(
             other.join("entities.ndjson"),
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[10.0,0.0]}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[10.0,0.0]}"#,
         )
         .expect("other entities should be written");
         fs::write(
@@ -1953,6 +2395,85 @@ mod tests {
                 .expect("comments should be readable")
                 .contains("resolved")
         );
+        assert!(updated.history_id.is_some());
+        assert_eq!(updated.changed_files, vec!["comments/plan_1f.ndjson"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn comment_mutation_rejects_symlinked_file_and_directory() {
+        use std::os::unix::fs::symlink;
+
+        let file_repo = fixture_repo();
+        let comment_path = file_repo.project_path.join("comments/plan_1f.ndjson");
+        let external_file = tempfile::NamedTempFile::new().expect("external comment");
+        fs::write(external_file.path(), b"external comment\n").expect("external bytes");
+        fs::remove_file(&comment_path).expect("remove comment source");
+        symlink(external_file.path(), &comment_path).expect("comment symlink");
+        let error = mutate_comments(
+            &file_repo.project_path,
+            "plan_1f",
+            blake3::hash(b"external comment\n").to_hex().as_ref(),
+            "comment.test",
+            |_comments, _project| Ok(()),
+        )
+        .expect_err("symlinked comment file must fail closed");
+        assert!(error.contains("source path contains a symlink"));
+        assert_eq!(
+            fs::read(external_file.path()).expect("external bytes"),
+            b"external comment\n"
+        );
+
+        let directory_repo = fixture_repo();
+        let comments_dir = directory_repo.project_path.join("comments");
+        fs::remove_dir_all(&comments_dir).expect("remove comments directory");
+        let outside = tempfile::tempdir().expect("outside comments");
+        symlink(outside.path(), &comments_dir).expect("comments directory symlink");
+        let error = mutate_comments(
+            &directory_repo.project_path,
+            "plan_1f",
+            blake3::hash(b"").to_hex().as_ref(),
+            "comment.test",
+            |_comments, _project| Ok(()),
+        )
+        .expect_err("symlinked comments directory must fail closed");
+        assert!(error.contains("source path contains a symlink"));
+        assert!(!outside.path().join("plan_1f.ndjson").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_comment_source_uses_file_permissions_not_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        write_project(&project, false);
+        mutate_comments(
+            &project,
+            "plan_1f",
+            blake3::hash(b"").to_hex().as_ref(),
+            "comment.test",
+            |comments, _project| {
+                comments.push(CommentRecord {
+                    schema_version: default_schema_version(),
+                    id: "cmt_test".to_owned(),
+                    drawing: "plan_1f".to_owned(),
+                    anchor: None,
+                    entity_ids: Vec::new(),
+                    text: "test".to_owned(),
+                    status: "open".to_owned(),
+                });
+                Ok(())
+            },
+        )
+        .expect("comment create");
+
+        let mode = fs::metadata(project.join("comments/plan_1f.ndjson"))
+            .expect("comment metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0);
     }
 
     #[test]
@@ -1972,6 +2493,22 @@ mod tests {
         assert!(manifest["generation"].is_null());
         assert!(manifest["json_path"].is_null());
         assert!(manifest["markdown_path"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_context_rejects_symlinked_build_directory() {
+        use std::os::unix::fs::symlink;
+
+        let repo = fixture_repo();
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        symlink(outside.path(), repo.project_path.join("build"))
+            .expect("build symlink should be created");
+
+        let state = write_ai_context_for_path(&repo.project_path, "sheet", "");
+
+        assert_eq!(state.status, AiContextStatus::Error);
+        assert!(!outside.path().join("ai-context-current.json").exists());
     }
 
     #[test]
@@ -1999,6 +2536,102 @@ mod tests {
             validated_drawing_revision(&repo.project_path, "plan_1f", &revision)
                 .expect_err("stale revision should fail")
                 .contains("revision_conflict")
+        );
+    }
+
+    #[test]
+    fn drawing_revision_validation_rejects_path_traversal() {
+        let repo = fixture_repo();
+        let error = validated_drawing_revision(
+            &repo.project_path,
+            "../..",
+            blake3::hash(b"").to_hex().as_ref(),
+        )
+        .expect_err("drawing traversal must fail before reading a path");
+
+        assert!(error.contains("invalid drawing name"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drawing_revision_validation_rejects_a_symlinked_source() {
+        use std::os::unix::fs::symlink;
+
+        let repo = fixture_repo();
+        let entities = repo.project_path.join("drawings/plan_1f/entities.ndjson");
+        let original = fs::read(&entities).expect("entities");
+        let revision = blake3::hash(&original).to_hex().to_string();
+        let external = tempfile::NamedTempFile::new().expect("external source");
+        fs::write(external.path(), &original).expect("external bytes");
+        fs::remove_file(&entities).expect("remove canonical source");
+        symlink(external.path(), &entities).expect("source symlink");
+
+        let error = validated_drawing_revision(&repo.project_path, "plan_1f", &revision)
+            .expect_err("source symlink must fail closed");
+
+        assert!(error.contains("unsafe canonical source path"));
+        assert_eq!(fs::read(external.path()).expect("external bytes"), original);
+    }
+
+    #[test]
+    fn desktop_source_readers_fail_closed_on_an_incomplete_transaction() {
+        let review_repo = fixture_repo();
+        write_incomplete_transaction(&review_repo.project_path);
+        assert!(
+            run_review_for_path(&review_repo.project_path)
+                .expect_err("review must run recovery first")
+                .contains("failed to recover source transaction")
+        );
+
+        let snap_repo = fixture_repo();
+        let entities = snap_repo
+            .project_path
+            .join("drawings/plan_1f/entities.ndjson");
+        let revision = blake3::hash(&fs::read(entities).expect("entities"))
+            .to_hex()
+            .to_string();
+        write_incomplete_transaction(&snap_repo.project_path);
+        assert!(
+            build_snap_index_for_revision(&snap_repo.project_path, "plan_1f", &revision)
+                .err()
+                .expect("snap must run recovery first")
+                .contains("failed to recover source transaction")
+        );
+
+        let pdf_repo = fixture_repo();
+        let output = pdf_repo
+            .project_path
+            .parent()
+            .expect("fixture parent")
+            .join("blocked.pdf");
+        write_incomplete_transaction(&pdf_repo.project_path);
+        assert!(
+            export_drawing_pdf(
+                path_string(&pdf_repo.project_path),
+                "plan_1f".to_owned(),
+                None,
+                path_string(&output),
+                false,
+                Vec::new(),
+            )
+            .expect_err("PDF must run recovery first")
+            .contains("failed to recover source transaction")
+        );
+        assert!(!output.exists());
+
+        let ai_repo = fixture_repo();
+        write_incomplete_transaction(&ai_repo.project_path);
+        let state = write_ai_context_for_path(
+            &ai_repo.project_path,
+            "sheet",
+            "ent_01JZ0000000000000000000000",
+        );
+        assert_eq!(state.status, AiContextStatus::Error);
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("failed to recover source transaction"))
         );
     }
 
@@ -2125,7 +2758,7 @@ mod tests {
         let event = loop {
             attempt += 1;
             let line = format!(
-                r#"{{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[{}.0,0.0]}}"#,
+                r#"{{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[{}.0,0.0]}}"#,
                 1200 + attempt
             );
             write_entities(temp.path(), &[&line]);
@@ -2192,27 +2825,13 @@ mod tests {
     }
 
     #[test]
-    fn project_source_path_filter_matches_only_consumed_files() {
-        assert!(is_project_source_path(Path::new("cad.project.toml")));
-        assert!(is_project_source_path(Path::new("rules/styles.toml")));
-        assert!(is_project_source_path(Path::new(
-            "drawings/plan_1f/entities.ndjson"
-        )));
-        assert!(is_project_source_path(Path::new("comments/plan_1f.ndjson")));
-        assert!(!is_project_source_path(Path::new("build/ai-context.json")));
-        assert!(!is_project_source_path(Path::new(".git/index")));
-        assert!(!is_project_source_path(Path::new(
-            "drawings/plan_1f/entities.ndjson.swp"
-        )));
-    }
-
-    #[test]
     fn layer_rules_update_is_persisted_and_reloaded() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         write_project(temp.path(), false);
         let state = update_layer_rules_for_path(
             temp.path(),
             &LayerRulesPatch {
+                drawing: Some("plan".to_owned()),
                 expected_revision: layer_rules_revision(temp.path()).expect("revision should load"),
                 layers: vec![LayerPatch {
                     id: "0-1".to_owned(),
@@ -2225,9 +2844,11 @@ mod tests {
             },
         )
         .expect("layer update should succeed");
-        assert_eq!(state.active_layer.as_deref(), Some("0-1"));
-        assert!(!state.layers[0].visible);
-        assert!(state.layers[0].locked);
+        assert_eq!(state.state.active_layer.as_deref(), Some("0-1"));
+        assert!(!state.state.layers[0].visible);
+        assert!(state.state.layers[0].locked);
+        assert!(state.history_id.is_some());
+        assert_eq!(state.changed_files, vec!["rules/layers.toml"]);
         let text = fs::read_to_string(temp.path().join("rules/layers.toml"))
             .expect("layers TOML should be readable");
         assert!(text.contains("active_layer = \"0-1\""));
@@ -2249,6 +2870,7 @@ mod tests {
         let error = update_layer_rules_for_path(
             temp.path(),
             &LayerRulesPatch {
+                drawing: Some("plan".to_owned()),
                 expected_revision: stale_revision,
                 layers: Vec::new(),
                 groups: Vec::new(),
@@ -2280,6 +2902,7 @@ mod tests {
                 update_layer_rules_for_path(
                     root.as_ref(),
                     &LayerRulesPatch {
+                        drawing: Some("plan".to_owned()),
                         expected_revision: revision,
                         layers: vec![LayerPatch {
                             id: "0-1".to_owned(),
@@ -2330,6 +2953,255 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pdf_export_command_writes_layout_aware_output_with_source_revisions() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path().join("project");
+        let output = temp.path().join("plan.pdf");
+        write_project(&project, false);
+        let expected_files = [
+            "drawings/plan_1f/entities.ndjson",
+            "drawings/plan_1f/layouts.toml",
+        ]
+        .into_iter()
+        .map(|relative_path| {
+            let bytes = fs::read(project.join(relative_path)).expect("source file");
+            cad_edit::HistoryFileRevision {
+                relative_path: relative_path.to_owned(),
+                revision: blake3::hash(&bytes).to_hex().to_string(),
+                exists: true,
+            }
+        })
+        .collect();
+        export_drawing_pdf(
+            path_string(&project),
+            "plan_1f".to_owned(),
+            Some("default".to_owned()),
+            path_string(&output),
+            false,
+            expected_files,
+        )
+        .expect("PDF export should succeed");
+        assert!(
+            fs::read(&output)
+                .expect("PDF should be readable")
+                .starts_with(b"%PDF-1.4")
+        );
+    }
+
+    #[test]
+    fn desktop_file_smoke_covers_edit_comment_layer_history_and_pdf_conflicts() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path().join("project");
+        write_project(&project, false);
+
+        let opened = open_project_state(&project).expect("project should open");
+        assert_eq!(opened.project_name, "desktop-fixture");
+        let initial_review =
+            run_review_for_drawing(&project, Some("plan_1f")).expect("initial review should run");
+        let entity_path = project.join("drawings/plan_1f/entities.ndjson");
+        let initial_entities = fs::read(&entity_path).expect("initial entities");
+        let initial_revision = blake3::hash(&initial_entities).to_hex().to_string();
+
+        let edit = cad_edit::apply_edit(
+            &project,
+            &cad_edit::DrawingEditRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_revision: initial_revision,
+                operation: cad_edit::EditOperation::Translate {
+                    entity_id: "ent_01JZ0000000000000000000000".to_owned(),
+                    delta: [25.0, 10.0],
+                    duplicate: false,
+                },
+            },
+        )
+        .expect("drawing edit should publish");
+        assert_eq!(
+            edit.entity_id.as_deref(),
+            Some("ent_01JZ0000000000000000000000")
+        );
+        let edited_entities = fs::read(&entity_path).expect("edited entities");
+        assert_ne!(edited_entities, initial_entities);
+
+        let after_edit_history =
+            cad_edit::list_drawing_history(&project, "plan_1f").expect("history should list");
+        let undone = cad_edit::undo_drawing_edit(
+            &project,
+            &cad_edit::DrawingHistoryRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_files: after_edit_history.current_files.clone(),
+            },
+        )
+        .expect("undo should restore the edit");
+        assert_eq!(
+            undone.revision,
+            blake3::hash(&initial_entities).to_hex().to_string()
+        );
+        assert_eq!(
+            fs::read(&entity_path).expect("undone entities"),
+            initial_entities
+        );
+
+        let after_undo_history =
+            cad_edit::list_drawing_history(&project, "plan_1f").expect("history after undo");
+        cad_edit::redo_drawing_edit(
+            &project,
+            &cad_edit::DrawingHistoryRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_files: after_undo_history.current_files.clone(),
+            },
+        )
+        .expect("redo should restore the edit");
+        assert_eq!(
+            fs::read(&entity_path).expect("redone entities"),
+            edited_entities
+        );
+
+        let comments_path = project.join("comments/plan_1f.ndjson");
+        let comment_bytes = fs::read(&comments_path).unwrap_or_default();
+        let comment_revision = blake3::hash(&comment_bytes).to_hex().to_string();
+        let comment = mutate_comments(
+            &project,
+            "plan_1f",
+            &comment_revision,
+            "comment.create",
+            |comments, _project| {
+                comments.push(CommentRecord {
+                    schema_version: default_schema_version(),
+                    id: "cmt_01JZ0000000000000000000001".to_owned(),
+                    drawing: "plan_1f".to_owned(),
+                    anchor: Some(CommentAnchor { x: 25.0, y: -10.0 }),
+                    entity_ids: vec!["ent_01JZ0000000000000000000000".to_owned()],
+                    text: "desktop smoke".to_owned(),
+                    status: "open".to_owned(),
+                });
+                Ok(())
+            },
+        )
+        .expect("comment mutation should publish");
+        assert_eq!(comment.comments.len(), 1);
+        let layer_revision = layer_rules_revision(&project).expect("layer revision");
+        let layers = update_layer_rules_for_path(
+            &project,
+            &LayerRulesPatch {
+                drawing: Some("plan_1f".to_owned()),
+                expected_revision: layer_revision,
+                layers: vec![LayerPatch {
+                    id: "0-1".to_owned(),
+                    visible: Some(false),
+                    locked: None,
+                    printable: None,
+                }],
+                groups: Vec::new(),
+                active_layer: None,
+            },
+        )
+        .expect("layer mutation should publish");
+        assert!(!layers.state.layers[0].visible);
+
+        let reviewed =
+            run_review_for_drawing(&project, Some("plan_1f")).expect("review should refresh");
+        assert_eq!(reviewed.comments.len(), 1);
+        assert!(!reviewed.layers.layers[0].visible);
+        assert_eq!(reviewed.project_name, initial_review.project_name);
+
+        let history = cad_edit::list_drawing_history(&project, "plan_1f")
+            .expect("history should include comment and layer");
+        let layer_before_undo = fs::read(project.join("rules/layers.toml")).expect("layers");
+        cad_edit::undo_drawing_edit(
+            &project,
+            &cad_edit::DrawingHistoryRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_files: history.current_files.clone(),
+            },
+        )
+        .expect("undo should restore the latest layer mutation");
+        assert_ne!(
+            fs::read(project.join("rules/layers.toml")).expect("restored layers"),
+            layer_before_undo
+        );
+        let history_after_layer_undo =
+            cad_edit::list_drawing_history(&project, "plan_1f").expect("history after layer undo");
+        cad_edit::redo_drawing_edit(
+            &project,
+            &cad_edit::DrawingHistoryRequest {
+                drawing: "plan_1f".to_owned(),
+                expected_files: history_after_layer_undo.current_files,
+            },
+        )
+        .expect("redo should restore the layer mutation");
+        assert_eq!(
+            fs::read(project.join("rules/layers.toml")).expect("redone layers"),
+            layer_before_undo
+        );
+
+        let expected_files = [
+            "drawings/plan_1f/entities.ndjson",
+            "drawings/plan_1f/layouts.toml",
+        ]
+        .into_iter()
+        .map(|relative_path| {
+            let bytes = fs::read(project.join(relative_path)).expect("PDF source");
+            cad_render_pdf::PdfFileRevision {
+                relative_path: relative_path.to_owned(),
+                revision: blake3::hash(&bytes).to_hex().to_string(),
+                exists: true,
+            }
+        })
+        .collect();
+        let output = temp.path().join("desktop-smoke.pdf");
+        cad_render_pdf::export_drawing_pdf(
+            &project,
+            "plan_1f",
+            Some("default"),
+            &output,
+            cad_render_pdf::PdfExportOptions {
+                overwrite: false,
+                expected_files,
+            },
+        )
+        .expect("PDF should publish");
+        let existing_pdf = fs::read(&output).expect("PDF bytes");
+        let error = cad_render_pdf::export_drawing_pdf(
+            &project,
+            "plan_1f",
+            Some("default"),
+            &output,
+            cad_render_pdf::PdfExportOptions {
+                overwrite: false,
+                expected_files: Vec::new(),
+            },
+        )
+        .expect_err("overwrite conflict should be reported");
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read(&output).expect("existing PDF"), existing_pdf);
+
+        let stale_comment_revision =
+            blake3::hash(&fs::read(&comments_path).expect("current comments"))
+                .to_hex()
+                .to_string();
+        let external_comments = fs::read_to_string(&comments_path)
+            .expect("current comments should be UTF-8")
+            .replace("desktop smoke", "external edit");
+        fs::write(&comments_path, external_comments.as_bytes()).expect("external edit");
+        let stale_error = mutate_comments(
+            &project,
+            "plan_1f",
+            &stale_comment_revision,
+            "comment.status",
+            |_comments, _project| Ok(()),
+        )
+        .expect_err("stale external edit should be rejected");
+        assert!(
+            stale_error.to_string().contains("revision_conflict"),
+            "unexpected stale error: {stale_error}"
+        );
+        assert_eq!(
+            fs::read(&comments_path).expect("external bytes must survive conflict"),
+            external_comments.as_bytes()
+        );
+    }
+
     struct FixtureRepo {
         _temp: tempfile::TempDir,
         project_path: PathBuf,
@@ -2353,6 +3225,11 @@ mod tests {
         }
     }
 
+    fn write_incomplete_transaction(project_path: &Path) {
+        fs::create_dir_all(project_path.join("build/.cad-transactions/incomplete"))
+            .expect("incomplete transaction directory");
+    }
+
     fn write_project(project_path: &Path, include_comment: bool) {
         fs::create_dir_all(project_path.join("rules")).expect("rules dir should be created");
         fs::create_dir_all(project_path.join("drawings/plan_1f"))
@@ -2360,7 +3237,7 @@ mod tests {
         fs::create_dir_all(project_path.join("comments")).expect("comments dir should be created");
         fs::write(
             project_path.join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"desktop-fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"desktop-fixture\"\n",
         )
         .expect("project TOML should be written");
         fs::write(
@@ -2374,14 +3251,14 @@ mod tests {
         )
         .expect("styles TOML should be written");
         fs::write(
-            project_path.join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            project_path.join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be written");
+        .expect("layouts TOML should be written");
         write_entities(
             project_path,
             &[
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
             ],
         );
         if include_comment {

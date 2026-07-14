@@ -9,7 +9,9 @@ use cad_model::{
 };
 use svg::Document;
 use svg::node::element::path::Data;
-use svg::node::element::{Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Text};
+use svg::node::element::{
+    Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Rectangle, Text,
+};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "cad-render-svg";
@@ -25,6 +27,8 @@ pub enum RenderError {
     NoDrawings,
     #[error("drawing {name:?} was not found")]
     MissingDrawing { name: String },
+    #[error("drawing has no active layout")]
+    MissingActiveLayout,
     #[error("unsupported paper {paper:?}")]
     UnsupportedPaper { paper: String },
     #[error("unsupported scale {scale:?}")]
@@ -68,6 +72,40 @@ pub fn render_drawing_svg(project: &ProjectSource, drawing_name: &str) -> Render
     let viewport = Viewport::from_drawing(project, drawing)?;
 
     let mut root = Group::new().set("id", drawing.name.clone());
+    if let Some(layout) = drawing.layouts.active() {
+        let (paper_width, paper_height) = paper_size_mm(&layout.paper)?;
+        let (paper_width, paper_height) = match layout.orientation {
+            cad_model::SheetOrientation::Portrait => (paper_width, paper_height),
+            cad_model::SheetOrientation::Landscape => (paper_height, paper_width),
+        };
+        let scale = parse_scale(&layout.scale)?;
+        root = root.add(
+            Rectangle::new()
+                .set("data-layout", layout.name.clone())
+                .set("data-paper-frame", true)
+                .set("x", layout.origin[0])
+                .set("y", svg_y(layout.origin[1] + paper_height * scale))
+                .set("width", paper_width * scale)
+                .set("height", paper_height * scale)
+                .set("fill", "none")
+                .set("stroke", "#888")
+                .set("stroke-dasharray", "8 4"),
+        );
+        if let Some([x1, y1, x2, y2]) = layout.plot_area {
+            root = root.add(
+                Rectangle::new()
+                    .set("data-layout", layout.name.clone())
+                    .set("data-plot-area", true)
+                    .set("x", x1)
+                    .set("y", svg_y(y2))
+                    .set("width", (x2 - x1) * scale)
+                    .set("height", (y2 - y1) * scale)
+                    .set("fill", "none")
+                    .set("stroke", "#3b82f6")
+                    .set("stroke-dasharray", "4 3"),
+            );
+        }
+    }
     for record in &drawing.entities {
         root = root.add(render_entity(project, record)?);
     }
@@ -86,6 +124,14 @@ pub fn render_drawing_svg(project: &ProjectSource, drawing_name: &str) -> Render
 }
 
 fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult<Group> {
+    render_entity_with_depth(project, record, 0)
+}
+
+fn render_entity_with_depth(
+    project: &ProjectSource,
+    record: &EntityRecord,
+    depth: usize,
+) -> RenderResult<Group> {
     let entity_id = record.entity.id().as_str().to_owned();
     let layer = resolve_layer(project, &record.entity)?;
     let layer_group = layer
@@ -101,7 +147,6 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
         })?;
 
     let mut group = Group::new()
-        .set("data-entity-id", entity_id)
         .set("data-layer", record.entity.layer())
         .set("data-layer-visible", visible)
         .set("data-layer-locked", locked)
@@ -115,6 +160,11 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
                 cad_model::format_decimal_mm(bbox.max[1])
             ),
         );
+    group = if depth == 0 {
+        group.set("data-entity-id", entity_id)
+    } else {
+        group.set("data-block-child-id", entity_id)
+    };
     if !stroke.dash.is_empty() {
         group = group.set("stroke-dasharray", stroke.dash_attr());
     }
@@ -410,38 +460,97 @@ fn render_entity(project: &ProjectSource, record: &EntityRecord) -> RenderResult
             scale,
             ..
         } => {
-            let size = 100.0 * scale;
-            group = group
-                .add(
-                    Line::new()
-                        .set("x1", at[0] - size)
-                        .set("y1", svg_y(at[1]))
-                        .set("x2", at[0] + size)
-                        .set("y2", svg_y(at[1]))
-                        .set("transform", rotate_attr(*rotation_deg, *at))
+            if !project.blocks.contains_key(block) {
+                let size = 100.0 * scale;
+                group = group
+                    .add(
+                        Line::new()
+                            .set("x1", at[0] - size)
+                            .set("y1", svg_y(at[1]))
+                            .set("x2", at[0] + size)
+                            .set("y2", svg_y(at[1]))
+                            .set("transform", rotate_attr(*rotation_deg, *at))
+                            .set("stroke", stroke.color.clone())
+                            .set("stroke-width", stroke.width_attr()),
+                    )
+                    .add(
+                        Line::new()
+                            .set("x1", at[0])
+                            .set("y1", svg_y(at[1] - size))
+                            .set("x2", at[0])
+                            .set("y2", svg_y(at[1] + size))
+                            .set("transform", rotate_attr(*rotation_deg, *at))
+                            .set("stroke", stroke.color.clone())
+                            .set("stroke-width", stroke.width_attr()),
+                    )
+                    .add(
+                        Text::new("")
+                            .set("x", at[0])
+                            .set("y", svg_y(at[1] + (size * 1.5)))
+                            .set("font-size", 250.0 * scale)
+                            .set("text-anchor", "middle")
+                            .set("transform", rotate_attr(*rotation_deg, *at))
+                            .set("fill", stroke.color)
+                            .add(svg::node::Text::new(block.clone())),
+                    );
+            } else {
+                let definition = project.blocks.get(block).expect("block checked");
+                let base_point = definition.config.base_point;
+                let mut block_group = Group::new()
+                    .set("data-block-id", block.clone())
+                    .set("data-block-reference-id", record.entity.id().as_str())
+                    .set(
+                        "transform",
+                        format!(
+                            "translate({} {}) rotate({}) scale({}) translate({} {})",
+                            at[0],
+                            svg_y(at[1]),
+                            normalize_zero(-rotation_deg),
+                            scale,
+                            normalize_zero(-base_point[0]),
+                            normalize_zero(base_point[1]),
+                        ),
+                    );
+                if depth < 32 {
+                    for child in &definition.entities {
+                        block_group =
+                            block_group.add(render_entity_with_depth(project, child, depth + 1)?);
+                    }
+                } else {
+                    block_group = block_group.add(block_marker(block, 1.0, &stroke));
+                }
+                group = group.add(block_group);
+            }
+        }
+        Entity::Hatch { loops, fill, .. } => {
+            let fill_color = fill
+                .as_deref()
+                .map(|fill| resolve_fill(project, &record.entity, fill))
+                .transpose()?
+                .unwrap_or_else(|| "none".to_owned());
+            let mut data = Data::new();
+            let mut has_loop = false;
+            for loop_points in loops {
+                let Some(first) = loop_points.first() else {
+                    continue;
+                };
+                has_loop = true;
+                data = data.move_to((first[0], svg_y(first[1])));
+                for point in loop_points.iter().skip(1) {
+                    data = data.line_to((point[0], svg_y(point[1])));
+                }
+                data = data.close();
+            }
+            if has_loop {
+                group = group.add(
+                    Path::new()
+                        .set("d", data)
+                        .set("fill", fill_color)
+                        .set("fill-rule", "evenodd")
                         .set("stroke", stroke.color.clone())
                         .set("stroke-width", stroke.width_attr()),
-                )
-                .add(
-                    Line::new()
-                        .set("x1", at[0])
-                        .set("y1", svg_y(at[1] - size))
-                        .set("x2", at[0])
-                        .set("y2", svg_y(at[1] + size))
-                        .set("transform", rotate_attr(*rotation_deg, *at))
-                        .set("stroke", stroke.color.clone())
-                        .set("stroke-width", stroke.width_attr()),
-                )
-                .add(
-                    Text::new("")
-                        .set("x", at[0])
-                        .set("y", svg_y(at[1] + (size * 1.5)))
-                        .set("font-size", 250.0 * scale)
-                        .set("text-anchor", "middle")
-                        .set("transform", rotate_attr(*rotation_deg, *at))
-                        .set("fill", stroke.color)
-                        .add(svg::node::Text::new(block.clone())),
                 );
+            }
         }
     }
 
@@ -457,6 +566,38 @@ fn stroked_line(start: Point, end: Point, stroke: &Stroke) -> Line {
         .set("fill", "none")
         .set("stroke", stroke.color.clone())
         .set("stroke-width", stroke.width_attr())
+}
+
+fn block_marker(block: &str, scale: f64, stroke: &Stroke) -> Group {
+    let size = 100.0 * scale;
+    Group::new()
+        .add(
+            Line::new()
+                .set("x1", -size)
+                .set("y1", 0.0)
+                .set("x2", size)
+                .set("y2", 0.0)
+                .set("stroke", stroke.color.clone())
+                .set("stroke-width", stroke.width_attr()),
+        )
+        .add(
+            Line::new()
+                .set("x1", 0.0)
+                .set("y1", -size)
+                .set("x2", 0.0)
+                .set("y2", size)
+                .set("stroke", stroke.color.clone())
+                .set("stroke-width", stroke.width_attr()),
+        )
+        .add(
+            Text::new("")
+                .set("x", 0.0)
+                .set("y", size * 1.5)
+                .set("font-size", 250.0 * scale)
+                .set("text-anchor", "middle")
+                .set("fill", stroke.color.clone())
+                .add(svg::node::Text::new(block.to_owned())),
+        )
 }
 
 fn dimension_arrow(tip: Point, toward: Point, size: f64, color: &str) -> Path {
@@ -877,17 +1018,21 @@ struct Viewport {
 
 impl Viewport {
     fn from_drawing(project: &ProjectSource, drawing: &DrawingSource) -> RenderResult<Self> {
-        let (paper_width_mm, paper_height_mm) = paper_size_mm(&drawing.sheet.paper)?;
-        let (paper_width_mm, paper_height_mm) = match drawing.sheet.orientation {
+        let layout = drawing
+            .layouts
+            .active()
+            .ok_or(RenderError::MissingActiveLayout)?;
+        let (paper_width_mm, paper_height_mm) = paper_size_mm(&layout.paper)?;
+        let (paper_width_mm, paper_height_mm) = match layout.orientation {
             cad_model::SheetOrientation::Portrait => (paper_width_mm, paper_height_mm),
             cad_model::SheetOrientation::Landscape => (paper_height_mm, paper_width_mm),
         };
-        let scale = parse_scale(&drawing.sheet.scale)?;
+        let scale = parse_scale(&layout.scale)?;
         let fallback = BBox {
-            min: drawing.sheet.origin,
+            min: layout.origin,
             max: [
-                drawing.sheet.origin[0] + (paper_width_mm * scale),
-                drawing.sheet.origin[1] + (paper_height_mm * scale),
+                layout.origin[0] + (paper_width_mm * scale),
+                layout.origin[1] + (paper_height_mm * scale),
             ],
         };
         let content_bbox = drawing_content_bbox(project, drawing)?;
@@ -924,6 +1069,14 @@ fn drawing_content_bbox(
 }
 
 fn render_entity_bbox(project: &ProjectSource, entity: &Entity) -> Option<BBox> {
+    render_entity_bbox_with_depth(project, entity, 0)
+}
+
+fn render_entity_bbox_with_depth(
+    project: &ProjectSource,
+    entity: &Entity,
+    depth: usize,
+) -> Option<BBox> {
     match entity {
         Entity::Text {
             style,
@@ -974,6 +1127,46 @@ fn render_entity_bbox(project: &ProjectSource, entity: &Entity) -> Option<BBox> 
                 "middle",
             )?;
             Some(union_bbox(line_bbox, text_bbox))
+        }
+        Entity::BlockRef {
+            block,
+            at,
+            rotation_deg,
+            scale,
+            ..
+        } => {
+            if depth >= 32 {
+                return entity_bbox(entity);
+            }
+            let Some(definition) = project.blocks.get(block) else {
+                return entity_bbox(entity);
+            };
+            let mut bounds = None;
+            for child in &definition.entities {
+                let child_bbox = render_entity_bbox_with_depth(project, &child.entity, depth + 1)?;
+                let corners = [
+                    [child_bbox.min[0], child_bbox.min[1]],
+                    [child_bbox.min[0], child_bbox.max[1]],
+                    [child_bbox.max[0], child_bbox.min[1]],
+                    [child_bbox.max[0], child_bbox.max[1]],
+                ];
+                let transformed = corners.map(|point| {
+                    let local = [
+                        point[0] - definition.config.base_point[0],
+                        point[1] - definition.config.base_point[1],
+                    ];
+                    rotate_point(
+                        [at[0] + local[0] * scale, at[1] + local[1] * scale],
+                        *at,
+                        *rotation_deg,
+                    )
+                });
+                if let Some(child_bbox) = BBox::from_points(&transformed) {
+                    bounds =
+                        Some(bounds.map_or(child_bbox, |current| union_bbox(current, child_bbox)));
+                }
+            }
+            bounds.or_else(|| entity_bbox(entity))
         }
         _ => entity_bbox(entity),
     }
@@ -1056,7 +1249,9 @@ fn paper_size_mm(paper: &str) -> RenderResult<(f64, f64)> {
 }
 
 fn parse_scale(scale: &str) -> RenderResult<f64> {
-    let Some((numerator, denominator)) = scale.split_once('/') else {
+    let scale = scale.trim();
+    let Some((numerator, denominator)) = scale.split_once('/').or_else(|| scale.split_once(':'))
+    else {
         return Err(RenderError::UnsupportedScale {
             scale: scale.to_owned(),
         });
@@ -1145,6 +1340,7 @@ mod tests {
         insta::assert_snapshot!(svg, @r##"
 <svg data-drawing="plan_1f" data-paper-height-mm="297" data-paper-width-mm="420" height="100%" preserveAspectRatio="xMinYMin meet" viewBox="-2625 -31825 46750 34450" width="100%" xmlns="http://www.w3.org/2000/svg">
 <g id="plan_1f">
+<rect data-layout="default" data-paper-frame="true" fill="none" height="29700" stroke="#888" stroke-dasharray="8 4" width="42000" x="0" y="-29700"/>
 <g data-bbox="0,0,910,0" data-entity-id="ent_01JZ0000000000000000000000" data-layer="0-1" data-layer-locked="false" data-layer-visible="true">
 <line fill="none" stroke="#000000" stroke-width="0.25mm" x1="0" x2="910" y1="0" y2="0"/>
 </g>
@@ -1187,8 +1383,8 @@ door_910
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[10.0,20.0],"radius_x":4.0,"radius_y":2.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":360.0}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[10.0,20.0],"radius_x":4.0,"radius_y":2.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":360.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
             ]
             .join("\n"),
         )
@@ -1229,8 +1425,8 @@ door_910
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
             ]
             .join("\n"),
         )
@@ -1244,6 +1440,56 @@ door_910
         assert!(svg.contains("data-bbox="));
     }
 
+    #[test]
+    fn block_rendering_uses_base_point_and_keeps_children_non_interactive() {
+        let temp = fixture_project();
+        write(
+            temp.path().join("blocks/door_910/definition.toml"),
+            "schema_version = \"0.2\"\nname = \"Door\"\nbase_point = [10.0, 20.0]\n",
+        )
+        .expect("block definition");
+        write(
+            temp.path().join("blocks/door_910/entities.ndjson"),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000099","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
+        )
+        .expect("block entities");
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"block_ref","layer":"0-1","block":"door_910","at":[100.0,200.0],"rotation_deg":0.0,"scale":2.0}"#,
+        )
+        .expect("block reference");
+        let project = cad_model::load_project(temp.path()).expect("fixture should load");
+
+        let svg = render_project_svg(&project).expect("block should render");
+
+        assert!(
+            svg.contains("transform=\"translate(100 -200) rotate(0) scale(2) translate(-10 20)\"")
+        );
+        assert!(svg.contains("data-bbox=\"100,200,120,200\""));
+        assert!(svg.contains("data-block-child-id=\"ent_01JZ0000000000000000000099\""));
+        assert!(!svg.contains("data-entity-id=\"ent_01JZ0000000000000000000099\""));
+    }
+
+    #[test]
+    fn hatch_loops_share_one_evenodd_path() {
+        let temp = fixture_project();
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            r##"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000008","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[10.0,0.0],[10.0,10.0],[0.0,10.0]],[[2.0,2.0],[2.0,8.0],[8.0,8.0],[8.0,2.0]]],"pattern":"solid","angle_deg":0.0,"scale":1.0,"fill":"jw_black"}"##,
+        )
+        .expect("hatch entity");
+        let project = cad_model::load_project(temp.path()).expect("fixture should load");
+
+        let svg = render_project_svg(&project).expect("hatch should render");
+
+        assert_eq!(svg.matches("fill-rule=\"evenodd\"").count(), 1);
+        let path = svg
+            .split("fill-rule=\"evenodd\"")
+            .next()
+            .expect("hatch path");
+        assert!(path.matches('M').count() >= 2);
+    }
+
     fn fixture_project() -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         create_dir_all(temp.path().join("rules")).expect("rules dir should be created");
@@ -1253,7 +1499,7 @@ door_910
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1267,18 +1513,18 @@ door_910
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":500.0,"start_deg":0.0,"end_deg":90.0}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"note"}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[910.0,0.0],"offset":120.0,"value":null}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"block_ref","layer":"0-1","block":"door_910","at":[455.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":500.0,"start_deg":0.0,"end_deg":90.0}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"note"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[910.0,0.0],"offset":120.0,"value":null}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"block_ref","layer":"0-1","block":"door_910","at":[455.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
             ]
             .join("\n"),
         )

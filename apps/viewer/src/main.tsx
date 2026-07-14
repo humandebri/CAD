@@ -25,6 +25,7 @@ import {
   MousePointer2,
   PenLine,
   Plus,
+  Redo2,
   RefreshCw,
   RotateCcw,
   Ruler,
@@ -49,6 +50,7 @@ import {
   type LiveReviewState,
   type ExportReport,
   type EditOperation,
+  type DrawingHistoryState,
   type EditorEntity,
   type LayerRulesPatch,
   type LayerWorkspaceState,
@@ -58,21 +60,33 @@ import {
   emptyLayerWorkspace,
 } from "./artifacts";
 import { formatError } from "./app-errors";
-import { applyDrawingEdit, queryDrawingSnap } from "./desktop-editor";
+import { commandForKeyboardEvent, commandLabel, type CadCommand } from "./command-registry";
+import { closestEntityId } from "./svg-selection";
+import {
+  applyDrawingEdit,
+  expectedRevisionForOperation,
+  listDrawingHistory,
+  queryDrawingSnap,
+  redoDrawingEdit,
+  shouldRefreshDesktopReview,
+  undoDrawingEdit,
+} from "./desktop-editor";
 import { createDesktopComment, updateDesktopCommentStatus } from "./desktop-comments";
 import { LatestAiContextWriteQueue } from "./desktop-ai-context";
 import { importJwwFromDesktop } from "./desktop-import";
 import { loadReviewSnapshotFromDesktop } from "./desktop-loader";
 import {
+  exportDrawingPdfFromDesktop,
   exportJwwFromDesktop,
   LatestLayerRulesQueue,
+  PdfExportGuard,
 } from "./desktop-layers";
 import {
   DrawingLoadGuard,
+  LatestProjectPersistenceQueue,
   LatestReviewQueue,
-  isRelevantProjectSourcePath,
   mergeProjectStateFromReview,
-  sheetSvgContainsEntity,
+  ProjectOpenGuard,
   shouldPreserveView,
   startProjectWatchWithCatchUp,
   stopProjectWatch,
@@ -84,6 +98,10 @@ import {
   swapPreviousView,
 } from "./view-history";
 import "./styles.css";
+
+if (import.meta.env.VITE_CAD_DESKTOP_E2E === "1") {
+  void import("@wdio/tauri-plugin");
+}
 import {
   type BBox,
   type Point,
@@ -119,7 +137,17 @@ type EditorMode =
   | "arc"
   | "text"
   | "dimension"
-  | "point";
+  | "rotate"
+  | "mirror"
+  | "offset"
+  | "trim"
+  | "extend"
+  | "point"
+  | "insert_block"
+  | "edit_block"
+  | "hatch"
+  | "layout"
+  | "print_preview";
 
 type DragInteraction = {
   pointerId: number;
@@ -157,6 +185,7 @@ function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportReport, setExportReport] = useState<ExportReport | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState(false);
   const [liveReviewState, setLiveReviewState] = useState<LiveReviewState>({
     status: "starting",
   });
@@ -166,8 +195,14 @@ function App() {
   });
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [selectedEntityId, setSelectedEntityId] = useState("");
+  const [selectedEntityIds, setSelectedEntityIds] = useState<Set<string>>(new Set());
   const [editorMode, setEditorMode] = useState<EditorMode>("select");
+  const [cadCommand, setCadCommand] = useState<CadCommand>("select");
   const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
+  const [pendingOperation, setPendingOperation] = useState<EditOperation | null>(null);
+  const [historyState, setHistoryState] = useState<DrawingHistoryState | null>(null);
+  const [historyMessage, setHistoryMessage] = useState("");
+  const [isHistoryBusy, setIsHistoryBusy] = useState(false);
   const [snapCandidate, setSnapCandidate] = useState<SnapCandidate | null>(null);
   const [editMessage, setEditMessage] = useState("");
   const [isEditSaving, setIsEditSaving] = useState(false);
@@ -184,6 +219,7 @@ function App() {
   const projectStateRef = useRef<ProjectState | null>(null);
   const currentDrawingRef = useRef<string | null>(null);
   const snapSequenceRef = useRef(0);
+  const historySequenceRef = useRef(0);
   const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchActiveRef = useRef(false);
   const watchErrorRef = useRef<string | null>(null);
@@ -197,6 +233,9 @@ function App() {
   const previousLayerVisibilityRef = useRef<LayerWorkspaceState | null>(null);
   const layerRulesQueue = useMemo(() => new LatestLayerRulesQueue(), []);
   const drawingLoadGuard = useMemo(() => new DrawingLoadGuard(), []);
+  const projectOpenGuard = useMemo(() => new ProjectOpenGuard(), []);
+  const lastProjectPersistence = useMemo(() => new LatestProjectPersistenceQueue(), []);
+  const pdfExportGuard = useMemo(() => new PdfExportGuard(), []);
   const reviewQueue = useMemo(
     () =>
       new LatestReviewQueue((projectPath) =>
@@ -210,6 +249,62 @@ function App() {
     [],
   );
   const isDesktop = isTauriRuntime();
+
+  useEffect(() => {
+    pdfExportGuard.invalidate();
+  }, [
+    projectState?.project_path,
+    artifacts?.currentDrawing,
+    artifacts?.editor.revision,
+    artifacts?.commentsRevision,
+    artifacts?.layers.revision,
+    pdfExportGuard,
+  ]);
+
+  useEffect(() => {
+    const sequence = ++historySequenceRef.current;
+    if (!isDesktop || projectState === null || artifacts === null) {
+      setHistoryState(null);
+      setHistoryMessage("");
+      return;
+    }
+    setHistoryMessage("");
+    void listDrawingHistory(
+      projectState.project_path,
+      artifacts.currentDrawing,
+    )
+      .then((state) => {
+        if (sequence === historySequenceRef.current) {
+          setHistoryState(state);
+        }
+      })
+      .catch((error: unknown) => {
+        if (sequence === historySequenceRef.current) {
+          setHistoryState(null);
+          setHistoryMessage(formatError(error, "failed to load edit history"));
+        }
+      });
+  }, [
+    isDesktop,
+    projectState?.project_path,
+    artifacts?.currentDrawing,
+    artifacts?.editor.revision,
+    artifacts?.commentsRevision,
+    artifacts?.layers.revision,
+  ]);
+
+  useEffect(() => {
+    setSelectedEntityIds((current) => {
+      if (selectedEntityId === "") return new Set();
+      return current.has(selectedEntityId) ? current : new Set([selectedEntityId]);
+    });
+  }, [selectedEntityId]);
+
+  useEffect(() => {
+    if (selectedEntityId !== "" && !selectedEntityIds.has(selectedEntityId)) {
+      setSelectedEntityId(selectedEntityIds.values().next().value ?? "");
+    }
+  }, [selectedEntityId, selectedEntityIds]);
 
   useEffect(() => {
     if (!isDesktop) {
@@ -241,15 +336,18 @@ function App() {
 
   useEffect(() => {
     if (isDesktop) {
+      const startupSequence = projectOpenGuard.begin();
       loadLastDesktopProject()
         .then((projectPath) => {
+          if (!projectOpenGuard.accepts(startupSequence)) return;
           if (projectPath === null) {
             setLoadState("idle");
             return;
           }
-          return openDesktopProject(projectPath);
+          return openDesktopProject(projectPath, true, startupSequence);
         })
         .catch((error: unknown) => {
+          if (!projectOpenGuard.accepts(startupSequence)) return;
           setErrorMessage(formatError(error, "unknown desktop load error"));
           setLoadState("error");
         });
@@ -304,21 +402,57 @@ function App() {
 
   useEffect(() => {
     function cancelActiveOperation(event: KeyboardEvent) {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
+        return;
+      }
+      const command = commandForKeyboardEvent(event);
+      if (command !== null) {
+        event.preventDefault();
+        setCadCommand(command);
+        if (command === "delete") {
+          void deleteSelectedEntities();
+          return;
+        }
+        if (command === "undo" || command === "redo") {
+          void runHistoryAction(command === "undo");
+          return;
+        }
+        if (["line", "polyline", "circle", "arc", "text", "dimension", "point", "move", "copy", "rotate", "mirror", "offset", "trim", "extend", "insert_block", "hatch"].includes(command)) {
+          setEditorMode(command as EditorMode);
+          setViewMode("sheet");
+          setDraftPoints([]);
+          setPendingOperation(null);
+          return;
+        }
+        if (command === "layout" || command === "print_preview") {
+          setEditorMode(command);
+          setViewMode("sheet");
+          setEditMessage(command === "layout" ? "Active layout is shown in the paper frame" : "Print preview uses the active layout");
+          return;
+        }
+      }
       if (event.key === "Escape") {
         setIsZoomAreaActive(false);
         setSelectionRect(null);
         dragInteraction.current = null;
         setEditorMode("select");
+        setCadCommand("select");
         setDraftPoints([]);
+        setPendingOperation(null);
         setSnapCandidate(null);
       }
+      if (event.key === "Enter" && pendingOperation !== null) {
+        event.preventDefault();
+        void commitDrawingEdit(pendingOperation);
+      }
       if (event.key === "Enter" && editorMode === "polyline") {
+        event.preventDefault();
         completePolyline();
       }
     }
     window.addEventListener("keydown", cancelActiveOperation);
     return () => window.removeEventListener("keydown", cancelActiveOperation);
-  }, [editorMode, draftPoints, artifacts]);
+  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState]);
 
   useEffect(() => () => clearPendingWheelHistory(), []);
 
@@ -343,10 +477,12 @@ function App() {
     if (selectedEntityId === "") {
       return;
     }
-    document
-      .querySelectorAll(`.drawing-stage [data-entity-id="${selectedEntityId}"]`)
-      .forEach((element) => element.classList.add("is-selected"));
-  }, [activeSvg, selectedEntityId]);
+    selectedEntityIds.forEach((entityId) => {
+      document
+        .querySelectorAll(`.drawing-stage [data-entity-id="${entityId}"]`)
+        .forEach((element) => element.classList.add("is-selected"));
+    });
+  }, [activeSvg, selectedEntityIds]);
 
   useEffect(() => {
     lastCommentAnchorRef.current = null;
@@ -635,9 +771,7 @@ function App() {
       lastCommentAnchorRef.current = { x: anchorPoint.x, y: -anchorPoint.y };
     }
     if ((editorMode === "move" || editorMode === "copy") && viewMode === "sheet") {
-      const targetId = event.target instanceof Element
-        ? event.target.closest("[data-entity-id]")?.getAttribute("data-entity-id")
-        : null;
+      const targetId = closestEntityId(event.target);
       const point = clientPointToSvg({ x: event.clientX, y: event.clientY });
       if (targetId === selectedEntityId && point !== null && drawingStageRef.current !== null) {
         const cadPoint: [number, number] = [point.x, -point.y];
@@ -810,12 +944,11 @@ function App() {
       const rawEnd = clientPointToSvg(interaction.endClient);
       const end = snapCandidate?.point ?? (rawEnd === null ? undefined : [rawEnd.x, -rawEnd.y] as [number, number]);
       if (interaction.moved && start !== undefined && end !== undefined && selectedEntityId !== "") {
-        void commitDrawingEdit({
-          kind: "translate",
-          entity_id: selectedEntityId,
-          delta: [end[0] - start[0], end[1] - start[1]],
-          duplicate: editorMode === "copy",
-        });
+        const entityIds = selectedEntityIds.size > 0 ? Array.from(selectedEntityIds) : [selectedEntityId];
+        const delta: [number, number] = [end[0] - start[0], end[1] - start[1]];
+        void commitDrawingEdit(entityIds.length > 1
+          ? { kind: "translate_many", entity_ids: entityIds, delta, duplicate: editorMode === "copy" }
+          : { kind: "translate", entity_id: selectedEntityId, delta, duplicate: editorMode === "copy" });
       } else {
         setDraftPoints([]);
       }
@@ -855,6 +988,7 @@ function App() {
     }
     if (interaction.mode === "edit-move") {
       setDraftPoints([]);
+      setPendingOperation(null);
       setSnapCandidate(null);
     }
     dragInteraction.current = null;
@@ -922,24 +1056,35 @@ function App() {
     suppressClickUntil.current = performance.now() + 250;
   }
 
-  function selectEntity(entityId: string, focus: boolean) {
+  function selectEntity(entityId: string, focus: boolean, append = false) {
     if (entityId === "") {
       return;
     }
     setSelectedEntityId(entityId);
+    setSelectedEntityIds((current) => {
+      if (!append) return new Set([entityId]);
+      const next = new Set(current);
+      if (next.has(entityId)) {
+        next.delete(entityId);
+      } else {
+        next.add(entityId);
+      }
+      return next;
+    });
     if (focus) {
       focusSelectedEntity(entityId);
     }
   }
 
   async function createCommentForSelection() {
-    if (!isDesktop || projectState === null || artifacts === null || selectedEntityId === "") {
+    if (isEditSaving || isHistoryBusy || !isDesktop || projectState === null || artifacts === null || selectedEntityId === "") {
       return;
     }
     const text = window.prompt("Comment");
     if (text === null || text.trim() === "") {
       return;
     }
+    setIsEditSaving(true);
     try {
       const result = await createDesktopComment(projectState.project_path, {
         drawing: artifacts.currentDrawing,
@@ -953,15 +1098,19 @@ function App() {
         comments: result.comments,
         commentsRevision: result.revision,
       });
+      enqueueDesktopReview(projectState.project_path);
     } catch (error: unknown) {
       setEditMessage(formatError(error, "failed to create comment"));
+    } finally {
+      setIsEditSaving(false);
     }
   }
 
   async function changeCommentStatus(comment: CommentRecord) {
-    if (!isDesktop || projectState === null || artifacts === null) {
+    if (isEditSaving || isHistoryBusy || !isDesktop || projectState === null || artifacts === null) {
       return;
     }
+    setIsEditSaving(true);
     try {
       const result = await updateDesktopCommentStatus(projectState.project_path, {
         drawing: artifacts.currentDrawing,
@@ -974,8 +1123,11 @@ function App() {
         comments: result.comments,
         commentsRevision: result.revision,
       });
+      enqueueDesktopReview(projectState.project_path);
     } catch (error: unknown) {
       setEditMessage(formatError(error, "failed to update comment status"));
+    } finally {
+      setIsEditSaving(false);
     }
   }
 
@@ -995,10 +1147,18 @@ function App() {
   }
 
   async function loadLastDesktopProject(): Promise<string | null> {
+    if (import.meta.env.VITE_CAD_DESKTOP_E2E === "1") {
+      return import.meta.env.VITE_CAD_E2E_PROJECT_PATH ?? null;
+    }
     return invoke<string | null>("load_last_project");
   }
 
-  async function openDesktopProject(projectPath: string, clearSelection = true) {
+  async function openDesktopProject(
+    projectPath: string,
+    clearSelection = true,
+    requestedSequence?: number,
+  ) {
+    const openSequence = requestedSequence ?? projectOpenGuard.begin();
     setLoadState("loading");
     setLiveReviewState({ status: "starting" });
     watchActiveRef.current = false;
@@ -1011,14 +1171,28 @@ function App() {
     drawingLoadGuard.reset(null);
     if (clearSelection) {
       setSelectedEntityId("");
+      setSelectedEntityIds(new Set());
     }
+    setEditorMode("select");
+    setCadCommand("select");
+    setDraftPoints([]);
+    setPendingOperation(null);
+    setHistoryState(null);
+    setHistoryMessage("");
     const state = await invoke<ProjectState>("open_project", { projectPath });
-    await loadDesktopProjectState(state);
+    if (!projectOpenGuard.accepts(openSequence)) return;
+    await loadDesktopProjectState(state, openSequence);
   }
 
-  async function loadDesktopProjectState(state: ProjectState) {
-    await invoke("save_last_project", { projectPath: state.project_path });
+  async function loadDesktopProjectState(state: ProjectState, openSequence: number) {
+    await lastProjectPersistence.enqueue(
+      openSequence,
+      (sequence) => projectOpenGuard.accepts(sequence),
+      () => invoke("save_last_project", { projectPath: state.project_path }),
+    );
+    if (!projectOpenGuard.accepts(openSequence)) return;
     const loaded = await loadReviewSnapshotFromDesktop(state.project_path, sanitizeSvg);
+    if (!projectOpenGuard.accepts(openSequence)) return;
     currentDrawingRef.current = loaded.artifacts.currentDrawing;
     drawingLoadGuard.reset(loaded.artifacts.currentDrawing);
     const reviewedState = mergeProjectStateFromReview(state, loaded);
@@ -1033,12 +1207,14 @@ function App() {
         throw new Error("project watch listener is not ready");
       }
       await listenerReady;
+      if (!projectOpenGuard.accepts(openSequence)) return;
       await startProjectWatchWithCatchUp(state.project_path, (projectPath) => {
         watchActiveRef.current = true;
         watchErrorRef.current = null;
         enqueueDesktopReview(projectPath);
       });
     } catch (error: unknown) {
+      if (!projectOpenGuard.accepts(openSequence)) return;
       const message = formatError(error, "failed to watch project");
       watchActiveRef.current = false;
       watchErrorRef.current = message;
@@ -1098,9 +1274,11 @@ function App() {
     layerRulesQueue.reset();
     previousLayerVisibilityRef.current = null;
     setSelectedEntityId("");
+    const openSequence = projectOpenGuard.begin();
     try {
       const state = await importJwwFromDesktop(selectedFile, selectedParent);
-      await loadDesktopProjectState(state);
+      if (!projectOpenGuard.accepts(openSequence)) return;
+      await loadDesktopProjectState(state, openSequence);
     } catch (error: unknown) {
       setErrorMessage(formatError(error, "unknown JWW import error"));
       setLoadState("error");
@@ -1137,7 +1315,7 @@ function App() {
     patch: LayerRulesPatch,
     rememberVisibility = false,
   ) {
-    if (artifacts === null) {
+    if (artifacts === null || isEditSaving || isHistoryBusy) {
       return;
     }
     if (rememberVisibility) {
@@ -1163,9 +1341,11 @@ function App() {
     if (!isDesktop || projectState === null) {
       return;
     }
+    setIsEditSaving(true);
     try {
       const result = await layerRulesQueue.enqueue(projectState.project_path, {
         ...patch,
+        drawing: artifacts.currentDrawing,
         expectedRevision: artifacts.layers.revision,
       });
       if (!result.isLatest) {
@@ -1183,6 +1363,8 @@ function App() {
     } catch (error: unknown) {
       setImportMessage(formatError(error, "failed to update layer rules"));
       enqueueDesktopReview(projectState.project_path);
+    } finally {
+      setIsEditSaving(false);
     }
   }
 
@@ -1256,6 +1438,74 @@ function App() {
     }
   }
 
+  async function performPdfExport() {
+    if (!isDesktop || projectState === null || artifacts === null || historyState === null || pdfBusy) return;
+    const sequence = pdfExportGuard.begin();
+    const activeLayout = artifacts.layouts?.find((layout) => layout.active);
+    const outputPath = import.meta.env.VITE_CAD_DESKTOP_E2E === "1"
+      ? import.meta.env.VITE_CAD_E2E_PDF_PATH
+      : await save({
+          title: "Export PDF",
+          defaultPath: `${projectState.project_name}-${artifacts.currentDrawing}.pdf`,
+          filters: [{ name: "PDF", extensions: ["pdf"] }],
+        });
+    if (typeof outputPath !== "string") return;
+    if (!pdfExportGuard.accepts(sequence)) return;
+    setPdfBusy(true);
+    try {
+      await exportDrawingPdfFromDesktop({
+        projectPath: projectState.project_path,
+        drawing: artifacts.currentDrawing,
+        layout: activeLayout?.id ?? null,
+        outputPath,
+        overwrite: false,
+        expectedFiles: historyState?.current_files ?? [],
+      });
+      if (pdfExportGuard.accepts(sequence)) {
+        setEditMessage("PDF exported from the active layout");
+      }
+    } catch (error: unknown) {
+      const message = formatError(error, "PDF export failed");
+      if (!pdfExportGuard.accepts(sequence)) return;
+      if (message.includes("output already exists")) {
+        const overwrite = await confirm("Replace the existing PDF file?", {
+          title: "Export PDF",
+          kind: "warning",
+        });
+        if (overwrite && pdfExportGuard.accepts(sequence)) {
+          try {
+            await exportDrawingPdfFromDesktop({
+              projectPath: projectState.project_path,
+              drawing: artifacts.currentDrawing,
+              layout: activeLayout?.id ?? null,
+              outputPath,
+              overwrite: true,
+              expectedFiles: historyState?.current_files ?? [],
+            });
+            if (pdfExportGuard.accepts(sequence)) {
+              setEditMessage("PDF exported from the active layout");
+            }
+          } catch (retryError: unknown) {
+            if (pdfExportGuard.accepts(sequence)) {
+              const retryMessage = formatError(retryError, "PDF export failed");
+              setEditMessage(retryMessage);
+              if (shouldRefreshDesktopReview(retryMessage)) {
+                enqueueDesktopReview(projectState.project_path);
+              }
+            }
+          }
+        }
+      } else {
+        setEditMessage(message);
+        if (shouldRefreshDesktopReview(message)) {
+          enqueueDesktopReview(projectState.project_path);
+        }
+      }
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
   function rerunReview() {
     if (isDesktop && projectState !== null) {
       enqueueDesktopReview(projectState.project_path);
@@ -1280,15 +1530,13 @@ function App() {
       });
       return;
     }
-    if (!event.paths.some(isRelevantProjectSourcePath)) {
-      return;
-    }
     watchActiveRef.current = true;
     watchErrorRef.current = null;
     enqueueDesktopReview(currentProject.project_path);
   }
 
   function enqueueDesktopReview(projectPath: string) {
+    historySequenceRef.current += 1;
     setLiveReviewState({ status: "refreshing" });
     reviewQueue.enqueue(
       projectPath,
@@ -1305,10 +1553,18 @@ function App() {
         setProjectState(reviewedState);
         currentDrawingRef.current = loaded.artifacts.currentDrawing;
         setArtifacts(loaded.artifacts);
+        setEditorMode("select");
+        setCadCommand("select");
+        setDraftPoints([]);
+        setPendingOperation(null);
+        setSnapCandidate(null);
+        dragInteraction.current = null;
+        const availableEntityIds = new Set(loaded.artifacts.editor.entities.map((entity) => entity.id));
+        setSelectedEntityIds((entityIds) => new Set(
+          Array.from(entityIds).filter((entityId) => availableEntityIds.has(entityId)),
+        ));
         setSelectedEntityId((entityId) =>
-          entityId === "" || sheetSvgContainsEntity(loaded.artifacts.sheetSvg, entityId)
-            ? entityId
-            : "",
+          entityId === "" || availableEntityIds.has(entityId) ? entityId : "",
         );
         setLoadState("ready");
         if (watchActiveRef.current) {
@@ -1338,9 +1594,14 @@ function App() {
     }
     setLoadState("loading");
     setSelectedEntityId("");
+    setSelectedEntityIds(new Set());
     setEditorMode("select");
+    setCadCommand("select");
     setDraftPoints([]);
+    setPendingOperation(null);
     setSnapCandidate(null);
+    setHistoryState(null);
+    setHistoryMessage("");
     reviewQueue.reset();
     const token = drawingLoadGuard.begin(drawing);
     currentDrawingRef.current = drawing;
@@ -1372,7 +1633,9 @@ function App() {
 
   function selectEditorMode(mode: EditorMode) {
     setEditorMode(mode);
+    setCadCommand(mode);
     setDraftPoints([]);
+    setPendingOperation(null);
     setSnapCandidate(null);
     if (mode !== "select") {
       setViewMode("sheet");
@@ -1401,20 +1664,42 @@ function App() {
     setIsEditSaving(true);
     setEditMessage("Saving edit...");
     try {
+      const expectedRevision = expectedRevisionForOperation(
+        operation,
+        artifacts.editor.revision,
+        artifacts.blocks,
+        artifacts.layouts,
+      );
+      if (expectedRevision === null) {
+        throw new Error(`revision is unavailable for ${operation.kind}`);
+      }
       const result = await applyDrawingEdit(projectState.project_path, {
         drawing: artifacts.currentDrawing,
-        expected_revision: artifacts.editor.revision,
+        expected_revision: expectedRevision,
         operation,
       });
-      setArtifacts((current) =>
-        current === null
-          ? current
-          : { ...current, editor: { ...current.editor, revision: result.revision } },
-      );
-      setSelectedEntityId(result.entity_id ?? "");
+      if (operation.kind !== "update_block_definition" && operation.kind !== "update_layout") {
+        setArtifacts((current) =>
+          current === null
+            ? current
+            : { ...current, editor: { ...current.editor, revision: result.revision } },
+        );
+      }
+      if (result.operation === "delete") {
+        setSelectedEntityIds(new Set());
+        setSelectedEntityId("");
+      } else {
+        const resultIds = result.entity_ids.length > 0
+          ? result.entity_ids
+          : (result.entity_id === null || result.entity_id === undefined ? [] : [result.entity_id]);
+        setSelectedEntityIds(new Set(resultIds));
+        setSelectedEntityId(resultIds[0] ?? "");
+      }
       setDraftPoints([]);
+      setPendingOperation(null);
       setSnapCandidate(null);
       setEditorMode("select");
+      setCadCommand("select");
       setEditMessage(`${result.operation} saved`);
       enqueueDesktopReview(projectState.project_path);
     } catch (error: unknown) {
@@ -1425,6 +1710,79 @@ function App() {
       }
     } finally {
       setIsEditSaving(false);
+    }
+  }
+
+  async function deleteSelectedEntities() {
+    if (!isDesktop || projectState === null || artifacts === null) {
+      return;
+    }
+    const entityIds = selectedEntityIds.size > 0
+      ? Array.from(selectedEntityIds)
+      : (selectedEntityId === "" ? [] : [selectedEntityId]);
+    if (entityIds.length === 0) {
+      setEditMessage("Select one or more entities first");
+      return;
+    }
+    if (!await confirm(`Delete ${entityIds.length} selected entit${entityIds.length === 1 ? "y" : "ies"}?`, { title: "Delete entities", kind: "warning" })) {
+      setCadCommand("select");
+      return;
+    }
+    await commitDrawingEdit(entityIds.length > 1
+      ? { kind: "delete_many", entity_ids: entityIds }
+      : { kind: "delete", entity_id: entityIds[0] });
+  }
+
+  async function runHistoryAction(undo: boolean) {
+    if (isHistoryBusy || isEditSaving || !isDesktop || projectState === null || artifacts === null) {
+      return;
+    }
+    const available = undo ? historyState?.undo.length : historyState?.redo.length;
+    if (!available) {
+      setHistoryMessage(undo ? "Nothing to undo" : "Nothing to redo");
+      setCadCommand("select");
+      return;
+    }
+    setIsHistoryBusy(true);
+    setHistoryMessage(undo ? "Undoing edit..." : "Redoing edit...");
+    const requestSequence = historySequenceRef.current;
+    const requestDrawing = artifacts.currentDrawing;
+    try {
+      const request = {
+        drawing: requestDrawing,
+        expected_files: historyState?.current_files ?? [],
+      };
+      const result = undo
+        ? await undoDrawingEdit(projectState.project_path, request)
+        : await redoDrawingEdit(projectState.project_path, request);
+      if (
+        requestSequence !== historySequenceRef.current
+        || currentDrawingRef.current !== requestDrawing
+      ) {
+        return;
+      }
+      setArtifacts((current) =>
+        current === null
+          ? current
+          : { ...current, editor: { ...current.editor, revision: result.revision } },
+      );
+      setSelectedEntityIds(new Set(result.entity_ids));
+      setSelectedEntityId(result.entity_ids[0] ?? "");
+      setEditorMode("select");
+      setCadCommand("select");
+      setDraftPoints([]);
+      setPendingOperation(null);
+      setSnapCandidate(null);
+      setHistoryMessage(`${undo ? "Undo" : "Redo"} applied`);
+      enqueueDesktopReview(projectState.project_path);
+    } catch (error: unknown) {
+      const message = formatError(error, undo ? "undo failed" : "redo failed");
+      setHistoryMessage(message);
+      if (message.includes("revision_conflict") || message.includes("history")) {
+        enqueueDesktopReview(projectState.project_path);
+      }
+    } finally {
+      setIsHistoryBusy(false);
     }
   }
 
@@ -1498,12 +1856,67 @@ function App() {
         setDraftPoints([point]);
         return true;
       }
-      void commitDrawingEdit({
-        kind: "translate",
-        entity_id: selectedEntityId,
-        delta: [point[0] - draftPoints[0][0], point[1] - draftPoints[0][1]],
-        duplicate: editorMode === "copy",
-      });
+      const entityIds = selectedEntityIds.size > 0 ? Array.from(selectedEntityIds) : [selectedEntityId];
+      const delta: [number, number] = [point[0] - draftPoints[0][0], point[1] - draftPoints[0][1]];
+      void commitDrawingEdit(entityIds.length > 1
+        ? { kind: "translate_many", entity_ids: entityIds, delta, duplicate: editorMode === "copy" }
+        : { kind: "translate", entity_id: selectedEntityId, delta, duplicate: editorMode === "copy" });
+      return true;
+    }
+    if (["rotate", "mirror", "offset", "trim", "extend"].includes(editorMode)) {
+      const entityIds = Array.from(selectedEntityIds);
+      if (entityIds.length === 0) {
+        setEditMessage("Select one or more entities first");
+        return true;
+      }
+      if (editorMode === "rotate") {
+        if (draftPoints.length === 0) {
+          setDraftPoints([point]);
+          return true;
+        }
+        const rawAngle = window.prompt("Rotation angle (degrees)", "90");
+        const angle = rawAngle === null ? NaN : Number(rawAngle);
+        if (Number.isFinite(angle)) {
+          setPendingOperation({ kind: "rotate", entity_ids: entityIds, center: draftPoints[0], angle_deg: angle });
+          setEditMessage("Rotate preview ready; press Enter to apply");
+        } else {
+          setEditMessage("Enter a finite rotation angle");
+        }
+        return true;
+      }
+      if (editorMode === "mirror") {
+        const points = [...draftPoints, point];
+        setDraftPoints(points);
+        if (points.length < 2) return true;
+        setPendingOperation({ kind: "mirror", entity_ids: entityIds, axis_start: points[0], axis_end: points[1] });
+        setEditMessage("Mirror preview ready; press Enter to apply");
+        return true;
+      }
+      if (editorMode === "offset") {
+        const rawDistance = window.prompt("Offset distance", "10");
+        const distance = rawDistance === null ? NaN : Number(rawDistance);
+        if (Number.isFinite(distance)) {
+          setPendingOperation({ kind: "offset", entity_ids: entityIds, distance });
+          setEditMessage("Offset preview ready; press Enter to apply");
+        } else {
+          setEditMessage("Enter a finite offset distance");
+        }
+        return true;
+      }
+      if (entityIds.length < 2) {
+        setEditMessage(`Select a target and ${editorMode === "trim" ? "cutter" : "boundary"} entity`);
+        return true;
+      }
+      const targetEntityId = selectedEntityId || entityIds[0];
+      const otherEntityId = entityIds.find((id) => id !== targetEntityId);
+      if (otherEntityId === undefined) {
+        setEditMessage("Select two different entities");
+        return true;
+      }
+      setPendingOperation(editorMode === "trim"
+        ? { kind: "trim", target_entity_id: targetEntityId, cutter_entity_id: otherEntityId, pick_point: point }
+        : { kind: "extend", target_entity_id: targetEntityId, boundary_entity_id: otherEntityId, pick_point: point });
+      setEditMessage(`${editorMode === "trim" ? "Trim" : "Extend"} preview ready; press Enter to apply`);
       return true;
     }
     const layer = activeLayerEditable();
@@ -1531,6 +1944,43 @@ function App() {
           });
         }
       }
+      return true;
+    }
+    if (editorMode === "insert_block") {
+      const block = artifacts.blocks?.[0];
+      if (block === undefined) {
+        setEditMessage("No block definition is available");
+        return true;
+      }
+      void commitDrawingEdit({
+        kind: "insert_block",
+        block: block.id,
+        layer,
+        at: point,
+        rotation_deg: 0,
+        scale: 1,
+      });
+      return true;
+    }
+    if (editorMode === "hatch") {
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      if (points.length < 3) {
+        return true;
+      }
+      void commitDrawingEdit({
+        kind: "create",
+        entity: {
+          type: "hatch",
+          layer,
+          pen: null,
+          loops: [points],
+          pattern: "solid",
+          angle_deg: 0,
+          scale: 1,
+          fill: null,
+        },
+      });
       return true;
     }
     const points = [...draftPoints, point];
@@ -1572,10 +2022,9 @@ function App() {
       event.preventDefault();
       return;
     }
-    const entityElement = event.target.closest("[data-entity-id]");
-    const entityId = entityElement?.getAttribute("data-entity-id");
+    const entityId = closestEntityId(event.target);
     if (entityId !== null && entityId !== undefined && entityId !== "") {
-      selectEntity(entityId, true);
+      selectEntity(entityId, true, event.shiftKey);
     }
   }
 
@@ -1624,7 +2073,7 @@ function App() {
           <span class="diff-source">HEAD vs working tree</span>
         </div>
         {isDesktop && artifacts !== null && (
-          <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving}>
+        <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving || isHistoryBusy || pdfBusy}>
             <select
               class="drawing-select"
               aria-label="Current drawing"
@@ -1635,7 +2084,43 @@ function App() {
                 <option value={drawing} key={drawing}>{drawing}</option>
               ))}
             </select>
+            {(artifacts.layouts?.length ?? 0) > 0 && (
+              <select
+                class="drawing-select"
+                aria-label="Active layout"
+                value={artifacts.layouts?.find((layout) => layout.active)?.id ?? artifacts.layouts?.[0]?.id ?? ""}
+                onChange={(event) => void commitDrawingEdit({
+                  kind: "update_layout",
+                  layout: "active_layout",
+                  properties: event.currentTarget.value,
+                })}
+              >
+                {artifacts.layouts?.map((layout) => (
+                  <option value={layout.id} key={layout.id}>{layout.id}</option>
+                ))}
+              </select>
+            )}
             <EditorToolButton mode="select" active={editorMode} label="Select" icon={<MousePointer2 size={16} />} onSelect={selectEditorMode} />
+            <button
+              type="button"
+              class="icon-button"
+              aria-label="Undo"
+              title="Undo"
+              disabled={historyState === null || historyState.context_blocked != null || historyState.undo.length === 0 || isHistoryBusy || isEditSaving}
+              onClick={() => void runHistoryAction(true)}
+            >
+              <Undo2 size={16} />
+            </button>
+            <button
+              type="button"
+              class="icon-button"
+              aria-label="Redo"
+              title="Redo"
+              disabled={historyState === null || historyState.context_blocked != null || historyState.redo.length === 0 || isHistoryBusy || isEditSaving}
+              onClick={() => void runHistoryAction(false)}
+            >
+              <Redo2 size={16} />
+            </button>
             <EditorToolButton mode="move" active={editorMode} label="Move" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="copy" active={editorMode} label="Copy" icon={<Plus size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="line" active={editorMode} label="Line" icon={<Minus size={16} />} onSelect={selectEditorMode} />
@@ -1645,6 +2130,73 @@ function App() {
             <EditorToolButton mode="text" active={editorMode} label="Text" icon={<TypeIcon size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="dimension" active={editorMode} label="Dimension" icon={<Ruler size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="point" active={editorMode} label="Point" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="rotate" active={editorMode} label="Rotate" icon={<RotateCcw size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="mirror" active={editorMode} label="Mirror" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="offset" active={editorMode} label="Offset" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="trim" active={editorMode} label="Trim" icon={<Minus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="extend" active={editorMode} label="Extend" icon={<Maximize2 size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="insert_block" active={editorMode} label="Insert Block" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <button
+              type="button"
+              class="icon-button"
+              aria-label="Edit Block"
+              title="Edit Block"
+              disabled={selectedEditorEntity?.type !== "block_ref"}
+              onClick={() => {
+                const block = selectedEditorEntity?.block;
+                if (typeof block !== "string") return;
+                const name = window.prompt("Block name", artifacts.blocks?.find((candidate) => candidate.id === block)?.name ?? "");
+                if (name === null || name.trim() === "") return;
+                setCadCommand("edit_block");
+                void commitDrawingEdit({ kind: "update_block_definition", block, properties: { name } });
+              }}
+            >
+              Edit Block
+            </button>
+            <EditorToolButton mode="hatch" active={editorMode} label="Hatch" icon={<Layers3 size={16} />} onSelect={selectEditorMode} />
+            <button
+              type="button"
+              class={cadCommand === "layout" ? "icon-button is-active" : "icon-button"}
+              aria-label="Layout"
+              title="Layout"
+              onClick={() => {
+                setCadCommand("layout");
+                setEditorMode("layout");
+                setEditMessage("Active layout is shown in the paper frame");
+              }}
+            >
+              Layout
+            </button>
+            <button
+              type="button"
+              class={cadCommand === "print_preview" ? "icon-button is-active" : "icon-button"}
+              aria-label="Print Preview"
+              title="Print Preview"
+              onClick={() => {
+                setCadCommand("print_preview");
+                setEditorMode("print_preview");
+                setViewMode("sheet");
+                setEditMessage("Print preview uses the active layout");
+              }}
+            >
+              Preview
+            </button>
+            <button
+              type="button"
+              class="icon-button"
+              aria-label="Export PDF"
+              title="Export PDF"
+              disabled={!isDesktop || pdfBusy}
+              onClick={() => void performPdfExport()}
+            >
+              {pdfBusy ? "Exporting…" : "PDF"}
+            </button>
+            <button type="button" class="icon-button" aria-label="Delete" title="Delete" onClick={() => void deleteSelectedEntities()}>
+              Delete
+            </button>
+            <span class="command-status" aria-live="polite">
+              Command: {commandLabel(cadCommand)}{selectedEntityIds.size > 0 ? ` · ${selectedEntityIds.size} selected` : ""}{historyState?.context_blocked ? ` · ${historyState.context_blocked}` : ""}{historyMessage !== "" ? ` · ${historyMessage}` : ""}
+            </span>
           </fieldset>
         )}
         <div class="mode-tabs" aria-label="SVG mode">
@@ -1740,9 +2292,35 @@ function App() {
           />
           {artifacts !== null && (
             <>
+              {(artifacts.blocks?.length ?? 0) > 0 && (
+                <section class="workspace-section" aria-label="Block definitions">
+                  <h3>Blocks</h3>
+                  {artifacts.blocks?.map((block) => (
+                    <p class="detail-line" key={block.id}>
+                      <strong>{block.name}</strong>
+                      <span>{block.entity_count} entities</span>
+                    </p>
+                  ))}
+                </section>
+              )}
+              {(artifacts.layouts?.length ?? 0) > 0 && (
+                <section class="workspace-section" aria-label="Layouts">
+                  <h3>Layouts</h3>
+                  {artifacts.layouts?.map((layout) => (
+                    <p class="detail-line" key={layout.id}>
+                      <strong>{layout.id}{layout.active ? " (active)" : ""}</strong>
+                      <span>
+                        {layout.paper} {layout.orientation} {layout.scale} ·
+                        margins {layout.margins.join(", ")} ·
+                        plot {layout.plot_area?.join(", ") ?? "full"}
+                      </span>
+                    </p>
+                  ))}
+                </section>
+              )}
               <LayerWorkspace
                 state={artifacts.layers}
-                canPersist={!isDesktop || projectState !== null}
+                canPersist={!isDesktop || (projectState !== null && !isEditSaving && !isHistoryBusy)}
                 canRestore={previousLayerVisibilityRef.current !== null}
                 onChange={updateLayerWorkspace}
                 onRestore={restoreLayerVisibility}
@@ -1751,7 +2329,7 @@ function App() {
                 artifacts={artifacts}
                 selectedEntityId={selectedEntityId}
                 onSelectEntity={selectEntity}
-                canEditComments={isDesktop && projectState !== null}
+                canEditComments={isDesktop && projectState !== null && !isEditSaving && !isHistoryBusy}
                 onCreateComment={() => void createCommentForSelection()}
                 onToggleCommentStatus={(comment) => void changeCommentStatus(comment)}
               />
@@ -1786,7 +2364,15 @@ function App() {
                   completePolyline();
                 }
               }}
-              onContextMenu={(event) => event.preventDefault()}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setCadCommand("select");
+                setEditorMode("select");
+                setDraftPoints([]);
+                setPendingOperation(null);
+                setSnapCandidate(null);
+                setSelectionRect(null);
+              }}
             >
               <div
                 ref={svgSurfaceRef}
@@ -1835,10 +2421,18 @@ function App() {
                   pens={artifacts.editor.pens}
                   message={editMessage}
                   onReplace={(entity) => void commitDrawingEdit({ kind: "replace", entity_id: entity.id, entity })}
-                  onTranslate={(delta, duplicate) => void commitDrawingEdit({ kind: "translate", entity_id: selectedEditorEntity.id, delta, duplicate })}
+                  onTranslate={(delta, duplicate) => {
+                    const entityIds = selectedEntityIds.size > 0 ? Array.from(selectedEntityIds) : [selectedEditorEntity.id];
+                    void commitDrawingEdit(entityIds.length > 1
+                      ? { kind: "translate_many", entity_ids: entityIds, delta, duplicate }
+                      : { kind: "translate", entity_id: selectedEditorEntity.id, delta, duplicate });
+                  }}
                   onDelete={() => void confirm("Delete the selected entity?", { title: "Delete entity", kind: "warning" }).then((accepted) => {
                     if (accepted) {
-                      return commitDrawingEdit({ kind: "delete", entity_id: selectedEditorEntity.id });
+                      const entityIds = selectedEntityIds.size > 0 ? Array.from(selectedEntityIds) : [selectedEditorEntity.id];
+                      return commitDrawingEdit(entityIds.length > 1
+                        ? { kind: "delete_many", entity_ids: entityIds }
+                        : { kind: "delete", entity_id: selectedEditorEntity.id });
                     }
                   })}
                 />
@@ -2611,6 +3205,8 @@ async function loadArtifacts(): Promise<Artifacts> {
       dimension_styles: [],
       pens: [],
     },
+    blocks: [],
+    layouts: [],
   };
 }
 

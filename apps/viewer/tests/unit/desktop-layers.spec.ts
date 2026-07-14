@@ -1,7 +1,9 @@
 import { expect, test } from "@playwright/test";
 import {
+  exportDrawingPdfFromDesktop,
   exportJwwFromDesktop,
   LatestLayerRulesQueue,
+  PdfExportGuard,
   updateLayerRulesFromDesktop,
   withLayerVisibility,
 } from "../../src/desktop-layers";
@@ -16,6 +18,16 @@ const layers: LayerWorkspaceState = {
     { id: "b", name: "B", order: 1, visible: true, locked: false, printable: true, used_entity_count: 0 },
   ],
 };
+
+test("PDF export guard rejects results after a context invalidation", () => {
+  const guard = new PdfExportGuard();
+  const first = guard.begin();
+  expect(guard.accepts(first)).toBe(true);
+  guard.invalidate();
+  expect(guard.accepts(first)).toBe(false);
+  const latest = guard.begin();
+  expect(guard.accepts(latest)).toBe(true);
+});
 
 test.describe("desktop layer transport", () => {
   test("uses the Tauri layer command contract", async () => {
@@ -114,6 +126,29 @@ test.describe("desktop layer transport", () => {
       allowLossy: false,
       overwrite: true,
     }]]);
+  });
+
+  test("uses the layout-aware PDF export command contract", async () => {
+    const calls: unknown[][] = [];
+    const invoke = async <T>(command: string, args: Record<string, unknown>) => {
+      calls.push([command, args]);
+      return undefined as T;
+    };
+    await exportDrawingPdfFromDesktop({
+      projectPath: "/project",
+      drawing: "plan",
+      layout: "default",
+      outputPath: "/tmp/plan.pdf",
+      overwrite: false,
+    }, invoke);
+    expect(calls).toEqual([["export_drawing_pdf", {
+      projectPath: "/project",
+      drawing: "plan",
+        layout: "default",
+        outputPath: "/tmp/plan.pdf",
+        overwrite: false,
+        expectedFiles: [],
+      }]]);
   });
 });
 

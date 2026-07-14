@@ -67,6 +67,27 @@ export type Artifacts = {
   drawingNames: string[];
   currentDrawing: string;
   editor: EditorDrawingState;
+  blocks?: BlockWorkspaceState[];
+  layouts?: LayoutWorkspaceState[];
+};
+
+export type BlockWorkspaceState = {
+  id: string;
+  name: string;
+  entity_count: number;
+  revision: string;
+};
+
+export type LayoutWorkspaceState = {
+  id: string;
+  paper: string;
+  orientation: "portrait" | "landscape";
+  scale: string;
+  origin: [number, number];
+  margins: [number, number, number, number];
+  plot_area?: [number, number, number, number] | null;
+  active: boolean;
+  revision: string;
 };
 
 export type EditorEntity = Record<string, unknown> & {
@@ -87,10 +108,38 @@ export type EditorDrawingState = {
 };
 
 export type EditOperation =
+  | { kind: "batch"; operations: EditOperation[] }
   | { kind: "create"; entity: Record<string, unknown> }
   | { kind: "replace"; entity_id: string; entity: EditorEntity }
   | { kind: "translate"; entity_id: string; delta: [number, number]; duplicate: boolean }
-  | { kind: "delete"; entity_id: string };
+  | { kind: "delete"; entity_id: string }
+  | { kind: "translate_many"; entity_ids: string[]; delta: [number, number]; duplicate: boolean }
+  | { kind: "delete_many"; entity_ids: string[] }
+  | { kind: "rotate"; entity_ids: string[]; center: [number, number]; angle_deg: number }
+  | { kind: "mirror"; entity_ids: string[]; axis_start: [number, number]; axis_end: [number, number] }
+  | { kind: "offset"; entity_ids: string[]; distance: number }
+  | { kind: "trim"; target_entity_id: string; cutter_entity_id: string; pick_point: [number, number] }
+  | { kind: "extend"; target_entity_id: string; boundary_entity_id: string; pick_point: [number, number] }
+  | {
+      kind: "insert_block";
+      block: string;
+      layer: string;
+      at: [number, number];
+      rotation_deg: number;
+      scale: number;
+      entity_id?: string;
+    }
+  | {
+      kind: "update_hatch";
+      entity_id: string;
+      loops: [number, number][][];
+      pattern: string;
+      angle_deg: number;
+      scale: number;
+      fill?: string | null;
+    }
+  | { kind: "update_layout"; layout: string; properties: Record<string, unknown> | string }
+  | { kind: "update_block_definition"; block: string; properties: Record<string, unknown> };
 
 export type DrawingEditRequest = {
   drawing: string;
@@ -102,7 +151,58 @@ export type DrawingEditResult = {
   drawing: string;
   revision: string;
   entity_id?: string | null;
+  entity_ids: string[];
   operation: string;
+  history_id: string | null;
+};
+
+export type DrawingHistoryRequest = {
+  drawing: string;
+  expected_files?: HistoryFileRevision[];
+  /** Phase 3A compatibility for older desktop binaries. */
+  expected_revision?: string;
+};
+
+export type HistoryFileRevision = {
+  relative_path: string;
+  revision: string;
+  exists: boolean;
+};
+
+export type HistoryFileSnapshot = {
+  relative_path: string;
+  exists: boolean;
+  before_revision: string;
+  after_revision: string;
+  before_snapshot?: string | null;
+  after_snapshot?: string | null;
+  before_permissions?: { readonly: boolean; unix_mode?: number | null } | null;
+  after_permissions?: { readonly: boolean; unix_mode?: number | null } | null;
+};
+
+export type DrawingHistoryEntry = {
+  history_id: string;
+  drawing: string;
+  operation: string;
+  timestamp: string;
+  before_revision: string;
+  after_revision: string;
+  entity_ids: string[];
+  scope: "drawing" | "project" | string;
+  changed_files: string[];
+  affected_files: string[];
+  files: HistoryFileSnapshot[];
+  before_manifest_revision: string;
+  after_manifest_revision: string;
+};
+
+export type DrawingHistoryState = {
+  drawing: string;
+  undo: DrawingHistoryEntry[];
+  redo: DrawingHistoryEntry[];
+  limit: number;
+  current_files: HistoryFileRevision[];
+  context_blocked?: string | null;
 };
 
 export type SnapKind = "endpoint" | "midpoint" | "intersection";
@@ -148,10 +248,17 @@ export type LayerPatch = {
 };
 
 export type LayerRulesPatch = {
+  drawing?: string;
   expectedRevision: string;
   layers?: LayerPatch[];
   groups?: Array<{ id: string; visible?: boolean; locked?: boolean }>;
   activeLayer?: string;
+};
+
+export type LayerMutationResult = {
+  state: LayerWorkspaceState;
+  history_id: string | null;
+  changed_files: string[];
 };
 
 export type ExportIssue = {
@@ -168,6 +275,15 @@ export type ExportReport = {
   expanded_entities: number;
   warnings: ExportIssue[];
   blockers: ExportIssue[];
+};
+
+export type PdfExportRequest = {
+  projectPath: string;
+  drawing: string;
+  layout?: string | null;
+  outputPath: string;
+  overwrite: boolean;
+  expectedFiles?: HistoryFileRevision[];
 };
 
 export type ProjectState = {
@@ -220,6 +336,8 @@ export type DesktopReviewArtifacts = {
   diff_unavailable: string | null;
   layers: LayerWorkspaceState;
   editor: EditorDrawingState;
+  blocks?: BlockWorkspaceState[];
+  layouts?: LayoutWorkspaceState[];
 };
 
 export const emptyLayerWorkspace: LayerWorkspaceState = {

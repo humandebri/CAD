@@ -5,6 +5,8 @@ export type CommentMutationResult = {
   drawing: string;
   revision: string;
   comments: CommentRecord[];
+  history_id: string | null;
+  changed_files: string[];
 };
 
 type InvokeComments = <T>(command: string, args: Record<string, unknown>) => Promise<T>;

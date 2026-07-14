@@ -46,6 +46,9 @@ pub enum ChangeReason {
     StyleChanged,
     TextChanged,
     LineWidthChanged,
+    BlockChanged,
+    HatchChanged,
+    LayoutChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,35 +222,6 @@ fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<Conf
         &serde_json::to_value(&head.styles).expect("style rules are serializable"),
         &mut changes,
     );
-    let base_sheets = base
-        .drawings
-        .iter()
-        .map(|drawing| (&drawing.name, &drawing.sheet))
-        .collect::<BTreeMap<_, _>>();
-    let head_sheets = head
-        .drawings
-        .iter()
-        .map(|drawing| (&drawing.name, &drawing.sheet))
-        .collect::<BTreeMap<_, _>>();
-    for name in base_sheets
-        .keys()
-        .chain(head_sheets.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-    {
-        let before = base_sheets
-            .get(name)
-            .map(|sheet| serde_json::to_value(sheet).expect("sheet is serializable"));
-        let after = head_sheets
-            .get(name)
-            .map(|sheet| serde_json::to_value(sheet).expect("sheet is serializable"));
-        collect_optional_json_changes(
-            &format!("drawings.{name}.sheet"),
-            before.as_ref(),
-            after.as_ref(),
-            &mut changes,
-        );
-    }
     let base_blocks = block_file_signatures(&base.root);
     let head_blocks = block_file_signatures(&head.root);
     for path in base_blocks
@@ -268,7 +242,44 @@ fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<Conf
             &mut changes,
         );
     }
+    let base_layouts = layout_file_signatures(base);
+    let head_layouts = layout_file_signatures(head);
+    for path in base_layouts
+        .keys()
+        .chain(head_layouts.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let before = base_layouts
+            .get(path)
+            .map(|value| serde_json::Value::String(value.clone()));
+        let after = head_layouts
+            .get(path)
+            .map(|value| serde_json::Value::String(value.clone()));
+        collect_optional_json_changes(
+            &format!("layouts.{path}"),
+            before.as_ref(),
+            after.as_ref(),
+            &mut changes,
+        );
+    }
     changes
+}
+
+fn layout_file_signatures(project: &ProjectSource) -> BTreeMap<String, String> {
+    project
+        .drawings
+        .iter()
+        .map(|drawing| {
+            (
+                format!("{}/layouts.toml", drawing.name),
+                blake3::hash(
+                    &serde_json::to_vec(&drawing.layouts).expect("layouts are serializable"),
+                )
+                .to_hex()
+                .to_string(),
+            )
+        })
+        .collect()
 }
 
 fn block_file_signatures(root: &FsPath) -> BTreeMap<String, String> {
@@ -473,6 +484,19 @@ fn change_reasons(
     if entity_geometry_signature(base) != entity_geometry_signature(head) {
         reasons.insert(ChangeReason::GeometryChanged);
     }
+    match (base, head) {
+        (Entity::BlockRef { block: before, .. }, Entity::BlockRef { block: after, .. })
+            if before != after =>
+        {
+            reasons.insert(ChangeReason::BlockChanged);
+        }
+        (Entity::Hatch { .. }, Entity::Hatch { .. })
+            if entity_geometry_signature(base) != entity_geometry_signature(head) =>
+        {
+            reasons.insert(ChangeReason::HatchChanged);
+        }
+        _ => {}
+    }
     if base.layer() != head.layer() {
         reasons.insert(ChangeReason::LayerChanged);
     }
@@ -595,6 +619,14 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             scale,
             ..
         } => format!("block_ref:{block}:{at:?}:{rotation_deg}:{scale}"),
+        Entity::Hatch {
+            loops,
+            pattern,
+            angle_deg,
+            scale,
+            fill,
+            ..
+        } => format!("hatch:{loops:?}:{pattern}:{angle_deg}:{scale}:{fill:?}"),
     }
 }
 
@@ -660,17 +692,20 @@ fn is_outside_paper(project: &ProjectSource, drawing_name: &str, entity: &Entity
     let Some(bbox) = entity_bbox(entity) else {
         return false;
     };
-    let Some((paper_width, paper_height)) = paper_model_size(&drawing.sheet) else {
+    let Some(layout) = drawing.layouts.active() else {
         return false;
     };
-    bbox.min[0] < drawing.sheet.origin[0]
-        || bbox.min[1] < drawing.sheet.origin[1]
-        || bbox.max[0] > drawing.sheet.origin[0] + paper_width
-        || bbox.max[1] > drawing.sheet.origin[1] + paper_height
+    let Some((paper_width, paper_height)) = paper_model_size(layout) else {
+        return false;
+    };
+    bbox.min[0] < layout.origin[0]
+        || bbox.min[1] < layout.origin[1]
+        || bbox.max[0] > layout.origin[0] + paper_width
+        || bbox.max[1] > layout.origin[1] + paper_height
 }
 
-fn paper_model_size(sheet: &cad_model::SheetConfig) -> Option<(f64, f64)> {
-    let (paper_width, paper_height) = match sheet.paper.as_str() {
+fn paper_model_size(layout: &cad_model::LayoutConfig) -> Option<(f64, f64)> {
+    let (paper_width, paper_height) = match layout.paper.as_str() {
         "A0" => (841.0, 1189.0),
         "A1" => (594.0, 841.0),
         "A2" => (420.0, 594.0),
@@ -678,11 +713,11 @@ fn paper_model_size(sheet: &cad_model::SheetConfig) -> Option<(f64, f64)> {
         "A4" => (210.0, 297.0),
         _ => return None,
     };
-    let (paper_width, paper_height) = match sheet.orientation {
+    let (paper_width, paper_height) = match layout.orientation {
         cad_model::SheetOrientation::Portrait => (paper_width, paper_height),
         cad_model::SheetOrientation::Landscape => (paper_height, paper_width),
     };
-    parse_scale(&sheet.scale).map(|scale| (paper_width * scale, paper_height * scale))
+    parse_scale(&layout.scale).map(|scale| (paper_width * scale, paper_height * scale))
 }
 
 fn parse_scale(scale: &str) -> Option<f64> {
@@ -1145,6 +1180,29 @@ fn render_overlay_entity(
                         .add(svg::node::Text::new(block.clone())),
                 );
         }
+        Entity::Hatch { loops, fill, .. } => {
+            let mut data = Data::new();
+            let mut has_loop = false;
+            for loop_points in loops {
+                let Some(first) = loop_points.first() else {
+                    continue;
+                };
+                has_loop = true;
+                data = data.move_to((first[0], svg_y(first[1])));
+                for point in loop_points.iter().skip(1) {
+                    data = data.line_to((point[0], svg_y(point[1])));
+                }
+                data = data.close();
+            }
+            if has_loop {
+                group = group.add(
+                    Path::new()
+                        .set("d", data)
+                        .set("fill", if fill.is_some() { color } else { "none" })
+                        .set("fill-rule", "evenodd"),
+                );
+            }
+        }
     }
     group
 }
@@ -1371,6 +1429,26 @@ mod tests {
     }
 
     #[test]
+    fn outside_paper_warning_uses_active_layout_not_stale_metadata() {
+        let base = fixture_project(BaseFixture::Base);
+        let head = fixture_project(BaseFixture::Head);
+        write(
+            head.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A0\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+        )
+        .expect("active layout should be writable");
+        let base = cad_model::load_project(base.path()).expect("base should load");
+        let head = cad_model::load_project(head.path()).expect("head should load");
+
+        let report = diff_projects(&base, &head);
+
+        assert!(!report.warnings.iter().any(|warning| {
+            warning.kind == WarningKind::OutsidePaper
+                && warning.entity_ids == vec!["ent_01JZ0000000000000000000003".to_owned()]
+        }));
+    }
+
+    #[test]
     fn json_report_snapshot_is_stable() {
         let base = fixture_project(BaseFixture::Base);
         let head = fixture_project(BaseFixture::Head);
@@ -1527,7 +1605,7 @@ mod tests {
     #[test]
     fn ellipse_signature_and_svg_path_include_all_geometry() {
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[1.0,2.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[1.0,2.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
         )
         .expect("ellipse should parse");
 
@@ -1541,11 +1619,11 @@ mod tests {
     #[test]
     fn mirrored_text_and_dimension_metadata_affect_diff_geometry() {
         let text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
         )
         .expect("text should parse");
         let dimension: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
         )
         .expect("dimension should parse");
         let style = TextStyleDef {
@@ -1599,7 +1677,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         let line_width = match kind {
@@ -1619,21 +1697,21 @@ mod tests {
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
         let entities = match kind {
             BaseFixture::Base => vec![
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[400.0,200.0],"rotation_deg":0.0,"value":"removed"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[400.0,200.0],"rotation_deg":0.0,"value":"removed"}"#,
             ],
             BaseFixture::Head => vec![
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000003","type":"line","layer":"0-1","p1":[50000.0,0.0],"p2":[51000.0,0.0]}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000004","type":"text","layer":"0-1","style":"note","at":[150.0,220.0],"rotation_deg":0.0,"value":"overlap"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"line","layer":"0-1","p1":[50000.0,0.0],"p2":[51000.0,0.0]}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"text","layer":"0-1","style":"note","at":[150.0,220.0],"rotation_deg":0.0,"value":"overlap"}"#,
             ],
         };
         write(
@@ -1653,7 +1731,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"text-change-fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"text-change-fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1667,17 +1745,17 @@ mod tests {
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
 
         let entity = match kind {
             TextFixture::Base => {
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"before"}"#
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"before"}"#
             }
             TextFixture::Head => {
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note_big","at":[100.0,200.0],"rotation_deg":0.0,"value":"after"}"#
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note_big","at":[100.0,200.0],"rotation_deg":0.0,"value":"after"}"#
             }
         };
         write(temp.path().join("drawings/plan_1f/entities.ndjson"), entity)
@@ -1694,7 +1772,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.1\"\nname = \"styled-bbox-fixture\"\n",
+            "schema_version = \"0.2\"\nname = \"styled-bbox-fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1708,14 +1786,14 @@ mod tests {
         )
         .expect("styles TOML should be writable");
         write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "schema_version = \"0.1\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\n",
+            temp.path().join("drawings/plan_1f/layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
-        .expect("sheet TOML should be writable");
+        .expect("layouts TOML should be writable");
         let entities = if include_entities {
             [
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"wide","at":[10.0,20.0],"rotation_deg":0.0,"value":"AB"}"#,
-                r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_wide","p1":[0.0,0.0],"p2":[100.0,0.0],"offset":20.0,"value":"100"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"wide","at":[10.0,20.0],"rotation_deg":0.0,"value":"AB"}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_wide","p1":[0.0,0.0],"p2":[100.0,0.0],"offset":20.0,"value":"100"}"#,
             ]
             .join("\n")
         } else {

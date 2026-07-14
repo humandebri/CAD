@@ -3,6 +3,7 @@ members = [
     "crates/cad-model",
     "crates/cad-check",
     "crates/cad-render-svg",
+    "crates/cad-render-pdf",
     "crates/cad-diff",
     "crates/cad-jww-codec",
     "crates/cad-import-jww",
@@ -23,6 +24,7 @@ repository = ""
 cad-model = { path = "crates/cad-model" }
 cad-check = { path = "crates/cad-check" }
 cad-render-svg = { path = "crates/cad-render-svg" }
+cad-render-pdf = { path = "crates/cad-render-pdf" }
 cad-diff = { path = "crates/cad-diff" }
 cad-jww-codec = { path = "crates/cad-jww-codec" }
 cad-import-jww = { path = "crates/cad-import-jww" }

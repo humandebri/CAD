@@ -8,8 +8,9 @@ import {
 } from "../../src/artifacts";
 import {
   DrawingLoadGuard,
+  LatestProjectPersistenceQueue,
   LatestReviewQueue,
-  isRelevantProjectSourcePath,
+  ProjectOpenGuard,
   mergeProjectStateFromReview,
   sheetSvgContainsEntity,
   shouldPreserveView,
@@ -18,6 +19,39 @@ import {
   stopProjectWatch,
   subscribeProjectWatch,
 } from "../../src/desktop-live-review";
+
+test("ignores startup open failures after a newer project open begins", () => {
+  const guard = new ProjectOpenGuard();
+  const startup = guard.begin();
+  const manual = guard.begin();
+
+  expect(guard.accepts(startup)).toBe(false);
+  expect(guard.accepts(manual)).toBe(true);
+});
+
+test("persists the newest project after an older save finishes late", async () => {
+  const guard = new ProjectOpenGuard();
+  const queue = new LatestProjectPersistenceQueue();
+  const oldStarted = deferred<void>();
+  const oldSave = deferred<void>();
+  let stored = "";
+  const oldSequence = guard.begin();
+  const old = queue.enqueue(oldSequence, (sequence) => guard.accepts(sequence), async () => {
+    oldStarted.resolve();
+    await oldSave.promise;
+    stored = "old";
+  });
+  await oldStarted.promise;
+  const latestSequence = guard.begin();
+  const latest = queue.enqueue(latestSequence, (sequence) => guard.accepts(sequence), async () => {
+    stored = "latest";
+  });
+
+  oldSave.resolve();
+  await Promise.all([old, latest]);
+
+  expect(stored).toBe("latest");
+});
 
 test("rejects an old drawing result after a newer drawing switch", () => {
   const guard = new DrawingLoadGuard();
@@ -154,15 +188,20 @@ test("watch transport uses the desktop command and event contracts", async () =>
   expect(events).toHaveLength(1);
 });
 
-test("filters project source paths and ignores generated files", () => {
-  expect(isRelevantProjectSourcePath("cad.project.toml")).toBe(true);
-  expect(isRelevantProjectSourcePath("rules/styles.toml")).toBe(true);
-  expect(isRelevantProjectSourcePath("drawings/plan/entities.ndjson")).toBe(true);
-  expect(isRelevantProjectSourcePath("drawings\\plan\\sheet.toml")).toBe(true);
-  expect(isRelevantProjectSourcePath("comments/plan.ndjson")).toBe(true);
-  expect(isRelevantProjectSourcePath("build/ai-context.json")).toBe(false);
-  expect(isRelevantProjectSourcePath(".git/index")).toBe(false);
-  expect(isRelevantProjectSourcePath("drawings/plan/entities.ndjson.swp")).toBe(false);
+test("forwards Rust-filtered watch events without a second frontend allowlist", async () => {
+  const events: ProjectWatchEvent[] = [];
+  const payload: ProjectWatchEvent = {
+    kind: "changed",
+    project_path: "/tmp/project",
+    paths: ["rules/custom.toml", "blocks/door/definition.toml"],
+  };
+
+  await subscribeProjectWatch((event) => events.push(event), async (handler) => {
+    handler(payload);
+    return () => undefined;
+  });
+
+  expect(events).toEqual([payload]);
 });
 
 test("preserves view only in the same context and checks retained selection", () => {
@@ -178,7 +217,7 @@ function artifacts(id: string): Artifacts {
   return {
     sheetSvg: `<svg data-review="${id}" />`,
     diffSvg: "<svg />",
-    check: { schema_version: "0.1", status: "ok", diagnostics: [] },
+    check: { schema_version: "0.2", status: "ok", diagnostics: [] },
     diff: { schema_version: "0.2", status: "ok", changes: [], warnings: [], configuration_changes: [] },
     comments: [],
     commentsRevision: "comments-revision",

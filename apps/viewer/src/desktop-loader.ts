@@ -44,6 +44,8 @@ export async function loadReviewSnapshotFromDesktop(
       drawingNames: review.drawing_names,
       currentDrawing: review.current_drawing,
       editor: review.editor,
+      blocks: review.blocks ?? [],
+      layouts: review.layouts ?? [],
     },
   };
 }

@@ -26,8 +26,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 pub const CRATE_NAME: &str = "cad-import-jww";
-const CAD_SCHEMA_VERSION: &str = "0.1";
+const CAD_SCHEMA_VERSION: &str = "0.2";
 const IMPORT_EPSILON_MM: f64 = 0.001;
+const BLOCK_SCALE_EPSILON: f64 = 1.0e-12;
 const IMPORT_ANGLE_EPSILON_RAD: f64 = 1e-9;
 const MAX_OUTPUT_ENTITIES: usize = 250_000;
 const MAX_EXPANSION_STEPS: usize = 1_000_000;
@@ -125,9 +126,37 @@ pub struct ImportWarning {
     pub record_type: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockMode {
+    Preserve,
+    Flatten,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportOptions {
+    pub block_mode: BlockMode,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            block_mode: BlockMode::Preserve,
+        }
+    }
+}
+
 pub fn import_jww_file(
     input_path: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
+) -> ImportResult<ImportReport> {
+    import_jww_file_with_options(input_path, out_dir, ImportOptions::default())
+}
+
+pub fn import_jww_file_with_options(
+    input_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: ImportOptions,
 ) -> ImportResult<ImportReport> {
     let input_path = input_path.as_ref();
     let out_dir = out_dir.as_ref();
@@ -156,7 +185,7 @@ pub fn import_jww_file(
             path: parent.to_path_buf(),
             source,
         })?;
-    let report = write_project(input_path, staging.path(), out_dir, &document)?;
+    let report = write_project(input_path, staging.path(), out_dir, &document, options)?;
     publish_project(staging.path(), out_dir)?;
     Ok(report)
 }
@@ -181,6 +210,7 @@ fn write_project(
     write_dir: &Path,
     project_dir: &Path,
     document: &JwwDocument,
+    options: ImportOptions,
 ) -> ImportResult<ImportReport> {
     let project_name = sanitize_name(
         input_path
@@ -189,7 +219,8 @@ fn write_project(
             .unwrap_or("jww_import"),
     );
     let drawing_name = project_name.clone();
-    let mut converted = convert_entities(document)?;
+    let mut converted =
+        convert_entities_with_mode(document, ConversionLimits::default(), options.block_mode)?;
     if converted.entities.is_empty() {
         return Err(ImportError::EmptyImport);
     }
@@ -214,6 +245,30 @@ fn write_project(
         path: write_dir.join("build"),
         source,
     })?;
+    if options.block_mode == BlockMode::Preserve && !converted.blocks.is_empty() {
+        fs::create_dir_all(write_dir.join("blocks")).map_err(|source| ImportError::Write {
+            path: write_dir.join("blocks"),
+            source,
+        })?;
+        for block in &converted.blocks {
+            let block_dir = write_dir.join("blocks").join(&block.id);
+            fs::create_dir_all(&block_dir).map_err(|source| ImportError::Write {
+                path: block_dir.clone(),
+                source,
+            })?;
+            write_text(
+                &block_dir.join("definition.toml"),
+                &format!(
+                    "schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = {:?}\nbase_point = [0.0, 0.0]\n",
+                    block.name
+                ),
+            )?;
+            write_text(
+                &block_dir.join("entities.ndjson"),
+                &(block.entities.join("\n") + "\n"),
+            )?;
+        }
+    }
 
     let content_bbox = entity_extents(&converted.entities)?;
     let origin = sheet_origin(content_bbox);
@@ -239,9 +294,9 @@ fn write_project(
         &write_dir
             .join("drawings")
             .join(&drawing_name)
-            .join("sheet.toml"),
+            .join("layouts.toml"),
         &format!(
-            "schema_version = \"{CAD_SCHEMA_VERSION}\"\npaper = \"{paper}\"\norientation = \"{orientation}\"\nscale = \"{scale}\"\norigin = [{}, {}]\n",
+            "schema_version = \"{CAD_SCHEMA_VERSION}\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"{paper}\"\norientation = \"{orientation}\"\nscale = \"{scale}\"\norigin = [{}, {}]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
             format_mm(origin[0]),
             format_mm(origin[1])
         ),
@@ -291,6 +346,14 @@ struct ConvertedProject {
     text_styles: BTreeMap<String, TextStyleRequirement>,
     dimension_styles: BTreeMap<String, String>,
     warnings: Vec<ImportWarning>,
+    blocks: Vec<PreservedBlock>,
+}
+
+#[derive(Debug)]
+struct PreservedBlock {
+    id: String,
+    name: String,
+    entities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -314,6 +377,7 @@ struct ConversionContext<'a> {
     id_index: u128,
     expansion_steps: usize,
     limits: ConversionLimits,
+    block_mode: BlockMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -435,13 +499,23 @@ impl Transform2D {
     }
 }
 
+#[cfg(test)]
 fn convert_entities(document: &JwwDocument) -> ImportResult<ConvertedProject> {
-    convert_entities_with_limits(document, ConversionLimits::default())
+    convert_entities_with_mode(document, ConversionLimits::default(), BlockMode::Flatten)
 }
 
+#[cfg(test)]
 fn convert_entities_with_limits(
     document: &JwwDocument,
     limits: ConversionLimits,
+) -> ImportResult<ConvertedProject> {
+    convert_entities_with_mode(document, limits, BlockMode::Flatten)
+}
+
+fn convert_entities_with_mode(
+    document: &JwwDocument,
+    limits: ConversionLimits,
+    block_mode: BlockMode,
 ) -> ImportResult<ConvertedProject> {
     if document.header.write_layer_group > 15 {
         return Err(ImportError::InvalidLayerAddress {
@@ -475,6 +549,7 @@ fn convert_entities_with_limits(
         id_index: 1,
         expansion_steps: 0,
         limits,
+        block_mode,
     };
     let mut block_stack = Vec::new();
     for entity in &document.entities {
@@ -506,6 +581,56 @@ fn convert_entities_with_limits(
         text_styles: context.text_styles,
         dimension_styles: context.dimension_styles,
         warnings: context.warnings,
+        blocks: if block_mode == BlockMode::Preserve {
+            document
+                .block_defs
+                .iter()
+                .map(|definition| {
+                    let definition_document = JwwDocument {
+                        header: document.header.clone(),
+                        entities: definition.entities.clone(),
+                        block_defs: document.block_defs.clone(),
+                    };
+                    let entities = convert_entities_with_mode(
+                        &definition_document,
+                        limits,
+                        BlockMode::Flatten,
+                    )
+                    .map(|converted| {
+                        converted
+                            .entities
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, line)| {
+                                let mut value: serde_json::Value =
+                                    serde_json::from_str(&line).expect("generated entity JSON");
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert(
+                                        "id".to_owned(),
+                                        serde_json::Value::String(format!(
+                                            "ent_{}",
+                                            Ulid::from_parts(
+                                                u64::from(definition.number) + 1,
+                                                (index as u128) + 1,
+                                            )
+                                        )),
+                                    );
+                                }
+                                serde_json::to_string(&value).expect("generated entity JSON")
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                    PreservedBlock {
+                        id: format!("jww_{}", definition.number),
+                        name: definition.name.clone(),
+                        entities,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -610,6 +735,42 @@ fn convert_entity(
                     block.base,
                     "block transform contains a non-finite value",
                 ));
+            } else if context.block_mode == BlockMode::Preserve && block_stack.is_empty() {
+                let block_id = format!("jww_{}", block.def_number);
+                if !context.block_defs.contains_key(&block.def_number) {
+                    context.warnings.push(import_warning(
+                        "unresolved_block",
+                        "CDataBlock",
+                        block.base,
+                        &format!("block definition {} was not found", block.def_number),
+                    ));
+                } else if let Some((scale, rotation_deg)) = preserved_block_transform(block) {
+                    remember_layer(
+                        context.document,
+                        &mut context.layer_bases,
+                        &mut context.layer_names,
+                        &mut context.warnings,
+                        block.base,
+                    );
+                    remember_pen(&mut context.pen_bases, block.base);
+                    context.ensure_output_capacity()?;
+                    context.entities.push(entity_block_ref_json(
+                        next_id(&mut context.id_index),
+                        &layer_id(block.base),
+                        &block_id,
+                        block,
+                        scale,
+                        rotation_deg,
+                    ));
+                } else {
+                    context.warnings.push(import_warning(
+                        "block_transform_flattened",
+                        "CDataBlock",
+                        block.base,
+                        "non-uniform, reflected, or zero block transform was flattened",
+                    ));
+                    expand_block(context, block, transform, block_stack)?;
+                }
             } else {
                 expand_block(context, block, transform, block_stack)?;
             }
@@ -1298,6 +1459,45 @@ fn entity_curve_solid_json(id: String, layer: &str, solid: &CircleSolid, fill: &
         "solid_param": solid.solid_param.abs(),
         "encoding_code": solid.base.pen_style,
         "fill": fill,
+    })
+    .to_string()
+}
+
+fn preserved_block_transform(block: &Block) -> Option<(f64, f64)> {
+    let magnitude = block.scale_x.abs().max(block.scale_y.abs()).max(1.0);
+    if block.scale_x.abs() <= BLOCK_SCALE_EPSILON
+        || block.scale_y.abs() <= BLOCK_SCALE_EPSILON
+        || (block.scale_x.abs() - block.scale_y.abs()).abs() > 1e-9 * magnitude
+        || block.scale_x.is_sign_positive() != block.scale_y.is_sign_positive()
+    {
+        return None;
+    }
+    let rotation = if block.scale_x.is_sign_negative() {
+        block.rotation + std::f64::consts::PI
+    } else {
+        block.rotation
+    };
+    Some((block.scale_x.abs(), rotation.to_degrees()))
+}
+
+fn entity_block_ref_json(
+    id: String,
+    layer: &str,
+    block_id: &str,
+    block: &Block,
+    scale: f64,
+    rotation_deg: f64,
+) -> String {
+    json!({
+        "schema_version": CAD_SCHEMA_VERSION,
+        "id": id,
+        "type": "block_ref",
+        "layer": layer,
+        "block": block_id,
+        "at": [block.ref_x, block.ref_y],
+        "rotation_deg": rotation_deg,
+        "scale": scale,
+        "pen": pen_id(block.base),
     })
     .to_string()
 }
@@ -2465,6 +2665,79 @@ mod tests {
     }
 
     #[test]
+    fn preserve_mode_keeps_only_representable_block_transforms() {
+        let block_def = || BlockDef {
+            number: 1,
+            name: "LINE".to_owned(),
+            entities: vec![JwwEntity::Line(Line {
+                base: EntityBase::default(),
+                start: [0.0, 0.0],
+                end: [10.0, 0.0],
+            })],
+        };
+        for (scale_x, scale_y, expected_scale, expected_rotation) in [
+            (2.0, 2.0, 2.0, 0.0),
+            (-2.0, -2.0, 2.0, 180.0),
+            (0.0001, 0.0001, 0.0001, 0.0),
+        ] {
+            let document = test_document(
+                vec![JwwEntity::Block(test_block(
+                    10.0, 20.0, scale_x, scale_y, 0.0, 1,
+                ))],
+                vec![block_def()],
+            );
+            let converted = convert_entities_with_mode(
+                &document,
+                ConversionLimits::default(),
+                BlockMode::Preserve,
+            )
+            .expect("representable block should convert");
+            let values = entity_values(&converted.entities);
+            assert_eq!(values[0]["type"], "block_ref");
+            assert_eq!(values[0]["scale"], expected_scale);
+            assert_eq!(values[0]["rotation_deg"], expected_rotation);
+            assert!(converted.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn preserve_mode_flattens_non_uniform_and_reflected_block_transforms() {
+        for (scale_x, scale_y) in [(2.0, 1.0), (-1.0, 1.0), (0.0, 1.0)] {
+            let document = test_document(
+                vec![JwwEntity::Block(test_block(
+                    10.0, 20.0, scale_x, scale_y, 0.0, 1,
+                ))],
+                vec![BlockDef {
+                    number: 1,
+                    name: "LINE".to_owned(),
+                    entities: vec![JwwEntity::Line(Line {
+                        base: EntityBase::default(),
+                        start: [0.0, 0.0],
+                        end: [10.0, 0.0],
+                    })],
+                }],
+            );
+            let converted = convert_entities_with_mode(
+                &document,
+                ConversionLimits::default(),
+                BlockMode::Preserve,
+            )
+            .expect("unrepresentable block should flatten");
+            assert!(
+                converted
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "block_transform_flattened")
+            );
+            assert!(
+                entity_values(&converted.entities)
+                    .iter()
+                    .all(|entity| entity["type"] != "block_ref")
+            );
+        }
+    }
+
+    #[test]
     fn parses_sample_fixture_and_imports_project() {
         let input =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
@@ -2612,13 +2885,13 @@ dimension=0
     #[test]
     fn typed_entity_extents_include_curve_geometry() {
         let circle = vec![
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000000","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":5000.0}"#.to_owned(),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":5000.0}"#.to_owned(),
         ];
         let ellipse = vec![
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":360.0}"#.to_owned(),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":360.0}"#.to_owned(),
         ];
         let ellipse_arc = vec![
-            r#"{"schema_version":"0.1","id":"ent_01JZ0000000000000000000002","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":90.0}"#.to_owned(),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":90.0}"#.to_owned(),
         ];
 
         let circle_bbox = entity_extents(&circle)
@@ -2659,13 +2932,20 @@ dimension=0
     }
 
     #[test]
-    fn imports_minimal_jww_block_definition_by_flattening_entities() {
+    fn explicitly_flattens_minimal_jww_block_definition() {
         let out = tempfile::tempdir().expect("tempdir should exist");
         let input = out.path().join("block-line.jww");
         fs::write(&input, minimal_jww_with_block_line()).expect("fixture should be written");
         let project = out.path().join("block-line");
 
-        let report = import_jww_file(&input, &project).expect("block fixture should import");
+        let report = import_jww_file_with_options(
+            &input,
+            &project,
+            ImportOptions {
+                block_mode: BlockMode::Flatten,
+            },
+        )
+        .expect("block fixture should import");
 
         assert_eq!(report.supported_entities, 1);
         let entities = entity_values_from_file(
@@ -2683,6 +2963,29 @@ dimension=0
                 .iter()
                 .all(|warning| warning.code != "unresolved_block")
         );
+    }
+
+    #[test]
+    fn preserves_minimal_jww_block_definition_and_reference() {
+        let out = tempfile::tempdir().expect("tempdir should exist");
+        let input = out.path().join("block-line-preserve.jww");
+        fs::write(&input, minimal_jww_with_block_line()).expect("fixture should be written");
+        let project = out.path().join("block-line-preserve");
+
+        let report = import_jww_file(&input, &project).expect("block fixture should import");
+
+        assert_eq!(report.supported_entities, 1);
+        let entities = entity_values_from_file(
+            &project
+                .join("drawings")
+                .join("block-line-preserve")
+                .join("entities.ndjson"),
+        );
+        assert_eq!(entities[0]["type"], "block_ref");
+        assert!(project.join("blocks/jww_1/definition.toml").exists());
+        assert!(project.join("blocks/jww_1/entities.ndjson").exists());
+        let loaded = cad_model::load_project(&project).expect("preserved project should load");
+        assert_eq!(loaded.blocks.len(), 1);
     }
 
     #[test]

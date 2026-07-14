@@ -1,0 +1,10 @@
+schema_version = "0.2"
+active_layout = "default"
+
+[layouts.default]
+name = "default"
+paper = "A3"
+orientation = "landscape"
+scale = "1/100"
+origin = [0.0, 0.0]
+margins = [0.0, 0.0, 0.0, 0.0]

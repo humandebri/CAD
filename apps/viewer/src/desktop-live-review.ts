@@ -14,6 +14,37 @@ import {
 
 export const PROJECT_WATCH_EVENT = "cad-project-watch";
 
+/** Prevents late project-open success or failure results from changing state. */
+export class ProjectOpenGuard {
+  private sequence = 0;
+
+  begin(): number {
+    return ++this.sequence;
+  }
+
+  accepts(sequence: number): boolean {
+    return sequence === this.sequence;
+  }
+}
+
+/** Serializes persisted side effects and drops work whose generation is stale. */
+export class LatestProjectPersistenceQueue {
+  private tail: Promise<void> = Promise.resolve();
+
+  enqueue(
+    sequence: number,
+    accepts: (sequence: number) => boolean,
+    persist: () => Promise<void>,
+  ): Promise<void> {
+    const run = this.tail.catch(() => undefined).then(async () => {
+      if (!accepts(sequence)) return;
+      await persist();
+    });
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+}
+
 export type DrawingLoadToken = {
   sequence: number;
   drawing: string;
@@ -183,22 +214,6 @@ export function mergeProjectStateFromReview(
   };
 }
 
-export function isRelevantProjectSourcePath(path: string): boolean {
-  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
-  if (normalized === "cad.project.toml") {
-    return true;
-  }
-  if (normalized.startsWith("rules/")) {
-    return normalized.endsWith(".toml");
-  }
-  if (normalized.startsWith("drawings/")) {
-    return normalized.endsWith(".toml") || normalized.endsWith(".ndjson");
-  }
-  if (normalized.startsWith("comments/")) {
-    return normalized.endsWith(".ndjson");
-  }
-  return false;
-}
 
 export function sheetSvgContainsEntity(sheetSvg: string, entityId: string): boolean {
   if (entityId === "") {

@@ -11,7 +11,7 @@ import {
 import { type InvokeReview, loadReviewSnapshotFromDesktop } from "../../src/desktop-loader";
 
 const checkReport: CheckReport = {
-  schema_version: "0.1",
+  schema_version: "0.2",
   status: "ok",
   diagnostics: [],
 };
