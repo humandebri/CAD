@@ -1,0 +1,15 @@
+{
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        {
+          "identifier": "desktop-e2e-capability",
+          "description": "E2E-only permissions for the embedded WebDriver build.",
+          "windows": ["main"],
+          "permissions": ["core:default", "dialog:default", "wdio:default"]
+        }
+      ]
+    }
+  }
+}

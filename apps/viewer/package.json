@@ -6,8 +6,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && playwright test --config playwright.unit.config.ts",
+    "test:unit": "playwright test --config playwright.unit.config.ts",
     "test:e2e": "playwright test",
+    "desktop:smoke": "cargo test --manifest-path ../../Cargo.toml -p cad-desktop desktop_file_smoke_covers_edit_comment_layer_history_and_pdf_conflicts --all-features",
+    "desktop:e2e": "node scripts/desktop-e2e.mjs",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build"
   },
@@ -21,6 +25,13 @@
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "2.11.4",
+    "@wdio/cli": "9.29.1",
+    "@wdio/local-runner": "9.29.1",
+    "@wdio/mocha-framework": "9.29.1",
+    "@wdio/native-utils": "2.5.0",
+    "@wdio/spec-reporter": "9.29.1",
+    "@wdio/tauri-plugin": "1.2.0",
+    "@wdio/tauri-service": "1.2.0",
     "tailwindcss": "^4.3.2",
     "typescript": "^6.0.3",
     "vite": "^8.1.3"
