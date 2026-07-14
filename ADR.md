@@ -1,4 +1,4 @@
-# CAD MVP Architecture Decisions
+# CAD Architecture Decisions
 
 Status: accepted
 
@@ -29,8 +29,8 @@ Jw_cad風の2D建築作図体験を、AIが直接編集できるテキスト正�
 ### Jw_cad Compatibility
 
 - 「Jw_cad準拠」は、作図文化、操作感、レイヤ/線色/線種思想の準拠を意味する。
-- JWW完全互換、Jw_cad内部挙動完全再現、既存JWWの無劣化往復変換はMVPで保証しない。
-- JWW import/exportは早期Post-MVP要件にする。
+- JWWは境界形式として扱い、preserve import と Experimental export を提供する。
+- Windows/Jw_cadでの互換検証が完了するまで、exportはExperimentalと表示する。
 - Jw_cad本体のコード、画面素材、文言、完全な画面配置は流用しない。
 
 ### Source Format
@@ -38,8 +38,8 @@ Jw_cad風の2D建築作図体験を、AIが直接編集できるテキスト正�
 - 図形本体はNDJSONにする。
 - 設定ファイルはTOMLにする。`serde_yaml` は使わない。
 - `schema_version` をプロジェクト単位とエンティティ単位に持たせる。
-- 後方互換読込は増やさず、破壊的変更は `cadc migrate` で明示変換する。
-- 通常の `check/render/diff` は最新schemaだけを受ける。
+- schema `0.2` のみを受け付ける。旧 schema の読み込み・移行・fallback は
+  実装しない。
 
 ### Project Layout
 
@@ -51,10 +51,11 @@ project/
     styles.toml
   drawings/
     plan_1f/
-      sheet.toml
+      layouts.toml
       entities.ndjson
   blocks/
-    door_910/
+    <block_id>/
+      definition.toml
       entities.ndjson
   comments/
     plan_1f.ndjson
@@ -66,7 +67,7 @@ project/
 ```
 
 - `build/`, `snapshots/`, `exports/` は生成物としてGit管理しない。
-- コメントは将来Git管理するが、MVPでは作成機能をPost-MVPに回す。viewerはコメント表示だけ対応してよい。
+- コメントは `comments/<drawing>.ndjson` に保存し、viewerから作成・状態更新できる。
 
 ### Drawing Model
 
@@ -75,26 +76,31 @@ project/
 - 角度はdegreeで保存する。
 - 小数mmを許可し、`cadc format` で小数桁を正規化する。
 - 内部計算は `f64`、保存は最大3桁程度、比較epsilonは `0.001mm` を目安にする。
-- MVPは1図面=1用紙に限定する。
-- 用紙、縮尺、原点は `sheet.toml` で管理する。
+- 1図面に複数layoutを許可し、active layoutをrender/print/exportの基準にする。
+- 用紙、縮尺、原点、余白、plot areaは `drawings/<drawing>/layouts.toml` で管理する。
 
 ### Entity Set
 
-MVPのエンティティ型は以下に限定する。
+schema `0.2` のエンティティ型は以下を対象とする。
 
 ```text
 line
 polyline
 arc
 circle
+ellipse
 text
 dimension
+point
+solid
+curve_solid
 block_ref
+hatch
 ```
 
-- 楕円、スプライン、ハッチ、画像、塗り、属性表はMVPに入れない。
-- ブロックは単純な再利用図形参照に限定する。
-- 属性付き建具、部品ライブラリ、建具表、集計はMVP外。
+- block definition/reference、hatch、layoutはchecker、renderer、diff、編集、
+  JWW、PDFで同じ正本モデルを使う。
+- 属性付き建具、部品ライブラリ、建具表、集計、BIM、3Dは対象外とする。
 
 ### Layers And Styles
 
@@ -105,7 +111,7 @@ block_ref
 - 線幅は色/レイヤ定義から解決し、エンティティごとの `line_width` override はMVPで入れない。
 - 文字スタイルと寸法スタイルはstyle ID参照にする。
 
-Post-MVPのPhase 9Bでは、JWW境界形式の忠実度を上げるためentity別の
+JWW境界形式の忠実度を上げるためentity別の
 optional pen参照を追加する。未指定entityは従来どおりlayer定義へfallback
 する。layer group、表示順、縮尺、表示状態、lock、active layerも
 `layers.toml`の正本属性として保持する。
@@ -116,39 +122,42 @@ optional pen参照を追加する。未指定entityは従来どおりlayer定義
 - 不正NDJSONは図面全体を失敗にする。
 - エラーにはファイル、行番号、エンティティID、フィールド、原因を含める。
 - 寛容描画は将来 `--best-effort` を明示した場合だけにする。
-- MVPの検査範囲は、形式検証、参照検証、幾何検証、最小レイヤ規則に限定する。
-- 閉領域チェックはMVPに入れるが、ハッチ/塗り生成はしない。
+- 形式、参照、有限値、閉路、自己交差、block cycle、layout範囲を厳格に検査する。
+- simple hatchは単一閉loopに限定し、表現不能なJWW要素はstrict blockerまたは
+  明示的lossy warningとする。
 
 ### Rendering And Diff
 
 - SVGを正規レンダー出力にする。
-- PDF直接出力、DXF export、JWW import/export、DWG import/exportはPost-MVP。
+- PDF直接出力とJWW import/exportは実装済み。DXF/DWGは対象外とする。
 - MVPに意味付き図面diff + SVG重ね表示を入れる。
 - diffはNDJSONの永続IDを使う。図形生成時にIDを発行し、座標や属性変更ではIDを変えない。
-- semantic diff JSON schema `0.2` はentity差分に加えてproject、sheet、layer、pen、style、block定義の設定差分を型付きで表現する。
+- semantic diff JSON schema `0.2` はentity差分に加えてproject、layout、layer、pen、style、block定義の設定差分を型付きで表現する。
 - SVGには `data-entity-id`、`data-layer`、`data-bbox` などのメタ情報を埋める。
 - 見た目diffでは追加、削除、変更、線幅変更、文字bbox重なり、用紙外を扱う。
 
-### AI Editing
+### Editing And History
 
 - AIは直接NDJSONを書き換える。
-- CAD側にoperationログ、独自Undo、独自トランザクションは入れない。
-- 事故防止はGit、`cadc format`、`cadc check`、`cadc render`、`cadc diff`、人間レビューに寄せる。
-- AI編集後にタイムラグなく確認したい要求は重要。MVPでは生成済みSVG/JSONをviewerで見る。Post-MVPでファイル監視、`cadc serve`、またはdesktop app統合により低遅延プレビューを実現する。
-
-Phase 9CではDesktop GUIもNDJSONを直接編集する。AI編集とGUI編集の上書き競合を
-避けるため、操作開始時のdrawing byte revisionを保存時に照合し、不一致なら変更を
-拒否して再読込する。GUI独自のoperation log、undo、backupは追加しない。
+- AI・GUI編集は共通 transaction と revision 検査を通す。
+- canonical source の分類とrevision manifestは `cad-model` を唯一の判定元とし、
+  watcher、review、PDF exportから共有する。
+- source置換は対応OSのatomic exchangeを使い、競合または曖昧なcrash recovery
+  では全候補bytesを `build/.cad-recovery/` に保全してfail closedする。
+- entities、comments、layers の before/after manifest を
+  `build/.cad-history/` に保存し、Undo/Redoと再起動後復元を提供する。
+- 履歴破損、stale revision、checker failureでは正本を変更せず、UIを再同期する。
+- `.cad-history` と build成果物はwatcher、review、diff、AI contextから除外する。
 
 ### Viewer
 
-- MVPのGUIは自前の軽量viewerにする。
-- QCAD連携はPost-MVP。
+- GUIは自前の軽量viewerにする。
+- QCAD連携は対象外とする。
 - viewerはPreact/Viteで実装する。
 - viewerはNDJSONを直接描画せず、`cadc render/diff/check` が生成したSVG/JSONを読む。
-- MVPでは単一プロジェクトパスと固定 `build/` 出力を前提にする。
-- 任意プロジェクト選択、コメント作成、ローカルAPI、ファイル監視はPost-MVP。
-- `cadc serve` はMVPから外す。ローカルAPIが必要になった段階で追加する。
+- プロジェクト選択、コメント作成、ファイル監視、layout切替、PDF exportを
+  Tauri desktopで提供する。
+- `cadc serve` とHTTP APIは追加しない。
 
 ### Implementation
 
@@ -168,7 +177,7 @@ examples/
   house-small
 ```
 
-- MVPのRust依存は以下に限定する。
+- Rust依存はCargo workspaceの各crateで管理する。
 
 ```text
 serde
@@ -183,7 +192,7 @@ svg
 insta
 ```
 
-- MVPのviewer依存は以下に限定する。
+- viewer依存はpackage lockfileで固定する。
 
 ```text
 preact
@@ -197,18 +206,16 @@ lucide-preact
 
 ### Platform And License
 
-- MVP基準環境はmacOS Apple Silicon。
-- 後続でmacOS Intel、Windows、Linuxへ広げる。
+- 開発・基準環境はmacOS Apple Silicon。Windows/Jw_cad互換はrelease gateで検証する。
 - 自前core、`cadc`、viewerはApache-2.0を推奨する。
 - QCAD連携は別plugin/別repo/明確な境界にする。
 
 ## Consequences
 
-- MVPは「CADとして編集できるGUI」ではなく、「AIが編集したNDJSON図面を厳格に検査し、SVGで確認し、意味付き差分をレビューする環境」になる。
-- 低遅延プレビュー要求は強いが、MVPではローカルAPIを入れないため、自動再生成やファイル監視はPost-MVPで扱う。
-- JWW/DXF/PDF/DWGを境界形式に回すことで、正本スキーマ、checker、SVG renderer、diffに集中できる。
+- CADとして編集できるGUIを含むローカル環境とし、active layoutを全出力の基準にする。
+- JWW/PDFは正本から生成する境界出力であり、正本は常にNDJSON/TOMLである。
 
-## Post-MVP Decision: JWW Codec And Experimental Export
+## JWW Codec And Experimental Export
 
 - JWWは正本にせず、NDJSON/TOMLとの境界形式として扱う。
 - importとversion 600 exportは共有Rust codecを使い、外部CAD processへ依存しない。

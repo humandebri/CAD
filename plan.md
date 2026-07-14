@@ -1,387 +1,75 @@
-# MVP Implementation Plan
-
-Status: implemented through Phase 9D; JWW compatibility validation remains pending
-
-Source: [ADR.md](ADR.md)
-
-## MVP Completion Criteria
-
-MVPは、AIが編集したNDJSON図面を検査し、SVGで確認し、意味付き差分をレビューできる状態で完了とする。
-
-- サンプル図面をNDJSON/TOMLで表現できる。
-- `cadc check` が厳格検査できる。
-- `cadc render --format svg` がSVGを生成できる。
-- `cadc diff --format json/svg` が意味付きdiffを生成できる。
-- Preact/Vite viewerでSVG、diff、check結果を確認できる。
-- Rust単体テスト、snapshot test、Playwright確認が通る。
-
-MVPに含めないもの:
-
-- DXF/PDF/JWW/DWG export
-- QCAD連携
-- `cadc serve`
-- コメント作成API
-- desktop app化
-- アプリ内LLM
-- クラウド同期
-
-## Phase 0: Repository Scaffold
-
-目的: 実装境界を先に固定し、以後の差分を小さく保つ。
-
-実装:
-
-- Cargo workspaceを作成する。
-- Rust crateを作成する。
-  - `crates/cad-model`
-  - `crates/cad-check`
-  - `crates/cad-render-svg`
-  - `crates/cad-diff`
-  - `crates/cad-cli`
-- viewer appを作成する。
-  - `apps/viewer`
-- サンプルプロジェクトを作成する。
-  - `examples/house-small`
-- `.gitignore` に生成物を追加する。
-  - `build/`
-  - `snapshots/`
-  - `exports/`
-- Apache-2.0ライセンス方針を明記する。
-
-検証:
-
-- `cargo test --workspace` が実行できる。
-- viewerの依存解決と起動ができる。
-- 空のworkspaceで不要な警告が出ない。
-
-完了条件:
-
-- workspace構成とサンプルディレクトリがADRと一致する。
-
-## Phase 1: CAD Source Model
-
-目的: NDJSON/TOML正本を読み、型付きモデルへ変換できるようにする。
-
-実装:
-
-- `cad.project.toml` を読む。
-- `rules/layers.toml` と `rules/styles.toml` を読む。
-- `drawings/*/sheet.toml` を読む。
-- `entities.ndjson` を読む。
-- `schema_version` をプロジェクト単位とエンティティ単位で検証する。
-- MVPエンティティ型を定義する。
-  - `line`
-  - `polyline`
-  - `arc`
-  - `circle`
-  - `text`
-  - `dimension`
-  - `block_ref`
-- mm実寸、X右Y上、degree、小数mmをモデル前提にする。
-- ULID形式の永続IDを扱う。
-- `cadc format` の土台を作る。
-
-検証:
-
-- 正常なサンプルNDJSON/TOMLを読み込める。
-- 不正JSON、不正TOML、未知schema、不明entity typeで失敗する。
-- 小数値の丸め方をsnapshot testで固定する。
-
-完了条件:
-
-- `examples/house-small` の図面を型付きモデルとして読み込める。
-
-## Phase 2: Strict Checker
-
-目的: AI編集後の破損を早期検出する。
-
-実装:
-
-- `cadc check project/ --format json --out build/check.json` を実装する。
-- 人間向け診断に `miette` を使う。
-- JSON診断をviewer用の正式契約にする。
-- エラーに以下を含める。
-  - file
-  - line
-  - entity id
-  - field
-  - code
-  - message
-- 形式検証を実装する。
-  - 必須フィールド
-  - 型
-  - 未知フィールド
-  - schema_version
-- 参照検証を実装する。
-  - 未定義レイヤ
-  - 未定義style
-  - 未定義block
-  - 重複ID
-- 幾何検証を実装する。
-  - zero length
-  - invalid arc
-  - tiny gap
-  - closed polyline
-  - self intersection
-  - bbox
-- 最小レイヤ規則を実装する。
-  - 非印刷レイヤ上の寸法/文字
-  - レイヤ定義と線種/色/線幅解決
-
-検証:
-
-- 各エラーにfixtureを用意する。
-- 不正NDJSONは図面全体を失敗にする。
-- `--best-effort` は実装しない。
-
-完了条件:
-
-- `cadc check examples/house-small --format json --out examples/house-small/build/check.json` が成功する。
-- 代表的な破損fixtureが期待どおり失敗する。
-
-## Phase 3: SVG Renderer
-
-目的: 正本から確認可能な正規SVGを生成する。
-
-実装:
-
-- `cadc render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg` を実装する。
-- SVG生成には `svg` crateを使う。
-- SVG座標へ変換する時だけY軸を反転する。
-- レイヤ、色、線種、線幅、文字style、寸法styleを解決する。
-- MVPエンティティ型をSVGへ描画する。
-- 各SVG要素へメタ情報を埋める。
-  - `data-entity-id`
-  - `data-layer`
-  - `data-bbox`
-- `bbox` 計算をrenderer/checker/diffで共有できる形にする。
-
-検証:
-
-- SVG snapshot testを作る。
-- 文字、寸法、block_ref、arcの代表例をfixture化する。
-- 出力SVGに `data-entity-id` が含まれることを検証する。
-
-完了条件:
-
-- サンプル図面のSVGを生成し、ブラウザで目視確認できる。
-
-## Phase 4: Semantic Diff
-
-目的: NDJSONの永続IDに基づき、AI編集結果をレビュー可能にする。
-
-実装:
-
-- `cadc diff base/ head/ --format json --out build/diff.json` を実装する。
-- `cadc diff base/ head/ --format svg --out build/plan_1f.diff.svg` を実装する。
-- diff分類を実装する。
-  - added
-  - removed
-  - modified
-  - unchanged
-- 変更理由をJSONに含める。
-  - geometry changed
-  - layer changed
-  - style changed
-  - text changed
-  - line width changed
-- SVG重ね表示を生成する。
-  - 追加: 緑
-  - 削除: 赤
-  - 変更: 黄
-- warningを生成する。
-  - 文字bbox重なり
-  - 用紙外
-  - 線幅変更
-
-検証:
-
-- ID保持時は変更として検出する。
-- ID追加/削除時は追加/削除として検出する。
-- 座標変更、style変更、文字変更のsnapshot testを作る。
-
-完了条件:
-
-- サンプル図面の変更前後からJSON diffとSVG diffを生成できる。
-
-## Phase 5: Viewer
-
-目的: 生成済みSVG/JSONをGUIで確認する。
-
-実装:
-
-- Preact/Vite viewerを実装する。
-- 固定パスの生成物を読む。
-  - `/build/plan_1f.svg`
-  - `/build/plan_1f.diff.svg`
-  - `/build/check.json`
-  - `/build/diff.json`
-- 通常SVGとdiff SVGを切り替える。
-- pan/zoomを実装する。
-- SVG内の `data-entity-id` を使ってentity選択を実装する。
-- check結果一覧を表示し、該当entityへ移動できるようにする。
-- diff結果一覧を表示し、追加/削除/変更を確認できるようにする。
-- コメント表示だけ対応する。コメント作成はMVP外。
-
-検証:
-
-- Playwrightでviewerを開く。
-- SVGが非空で表示されることを確認する。
-- diff切替、entity選択、check結果表示を確認する。
-- 主要viewportでテキストやパネルが重ならないことを確認する。
-
-完了条件:
-
-- `build/` の生成物だけでレビュー画面が成立する。
-
-## Phase 6: MVP Hardening
-
-目的: 実装品質と運用手順を固定する。
-
-実装:
-
-- READMEにMVPの使い方を書く。
-- サンプル修正フローを書く。
-  - AIがNDJSONを編集
-  - `cadc format`
-  - `cadc check`
-  - `cadc render`
-  - `cadc diff`
-  - viewerで確認
-- CI相当のローカルコマンドを作る。
-- fixtureとsnapshotを整理する。
-- エラーコード一覧を整備する。
-
-検証:
-
-- `cargo test --workspace`
-- `cargo run -p cad-cli -- check examples/house-small --format json --out examples/house-small/build/check.json`
-- `cargo run -p cad-cli -- render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg`
-- `cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json`
-- viewerのPlaywright確認
-
-完了条件:
-
-- 新規参加者がREADME手順だけでMVPを再現できる。
-
-## Post-MVP Roadmap
-
-### Phase 7: macOS Desktop App
-
-Status: implemented
-
-- `apps/viewer` をTauri v2でdesktop app化する。
-- frontendはTauri `invoke`でRust commandを呼ぶ。
-- Rust commandは既存crateを直接使って `check/render/diff` を実行する。
-- diff baseはGit `HEAD`、headはworking treeに固定する。
-- Git repo外、初回commitなし、`HEAD`にproject未存在の場合はdiff unavailableとして扱う。
-- Open Project、Re-run Review、current project path表示を追加する。
-- macOS `.app` bundle生成を検証する。
-
-### Phase 8: JWW One-Way Import
-
-Status: implemented
-
-- `cad-import-jww` crateを追加する。
-- `cadc import-jww <INPUT.jww> --out <PROJECT_DIR>` を追加する。
-- JWWの線、円、円弧、楕円、楕円弧、文字、寸法をNDJSON entityへ変換する。
-- JWW curveのradian角度をCAD正本のdegree角度へ変換する。
-- JWW block定義を読み、block参照を通常entityへflatten展開する。
-- JWW layer group/layerを `jww_g{group}_l{layer}` へ変換する。
-- JWW pen色/線種をTOML styleへ変換する。
-- JWW文字サイズは `size_x` / `size_y` / `spacing` からtext styleを生成する。
-- JWW用紙サイズと単一layer group scaleを `sheet.toml` へ反映する。
-- JWW header色テーブルは未解析のため、default color mapping warningを出す。
-- 既知のunsupported recordとstyle conflictを `build/import-jww-report.json` へwarningとして記録する。
-- checker不合格になる微小geometryは `geometry_skipped` warningとして記録し、NDJSONへ出さない。
-- 寸法は最小fixtureで検証し、ライセンス確認済み実fixture追加を継続課題にする。
-- block_ref正本化はせず、JWW import時だけ展開する。
-- 未知JWW classはrecord長を安全にskipできないためfatalにする。
-- block定義内のparse失敗もfatalにし、部分的なblockを出力しない。
-- block展開は生成entity 25万件、展開step 100万回を上限とし、超過時はtruncateせずimport全体を失敗させる。
-- 非有限値を含むgeometryとblockは採番・style生成前にwarning skipし、有効entityが残らなければimportを失敗させる。
-- 反転block内の文字は `mirror_y`、寸法文字は `text_rotation_deg` / `text_mirror_y` として正本へ保持する。
-- sheet範囲は生成entityを型付きparseし、共通 `entity_bbox` のunionから決定する。
-- import出力は同一filesystemの一時directoryへ生成後、no-replace renameで原子的に公開する。
-- Desktop appに `Import JWW` 導線を追加する。
-- Viewer zoomをSVG viewBox操作へ統一し、`0.05x..4096x`の範囲にする。
-- Viewer上のentity線幅をnon-scaling strokeにし、印刷用SVGの実寸線幅は維持する。
-- カーソル中心wheel zoom、範囲拡大、前表示、Jw_cad式両ボタンドラッグを追加する。
-- macOS trackpad向けにZoom AreaとPrevious Viewのtoolbar操作を追加する。
-- AI context書込をlatest-only直列queueへ通し、連続選択時の逆順完了を防ぐ。
-- Git HEAD展開はNUL区切りpathを使い、日本語project pathを保持する。
-
-### Phase 9A: Low-latency Live Preview
-
-Status: implemented
-
-- desktopで正本TOML/NDJSONの変更を250ms debounceで監視する。
-- 変更時に既存 `run_review` をlatest-only直列queueで自動再実行する。
-- `build/`、`.git/`、editor一時ファイルは監視対象外にする。
-- 一時的な読込失敗では最後の正常artifactを維持し、次の変更で自動回復する。
-- 同一project・view modeではzoom、previous view、有効なentity選択を維持する。
-- toolbarへlive review状態を表示し、手動 `Re-run Review` は復旧用に残す。
-
-### Phase 9B: JWW Fidelity, Layer Workspace, Experimental Export
-
-Status: implemented, pending Windows Jw_cad and licensed solid fixture validation
-
-- JWW reader/writerを共有する `cad-jww-codec` を追加し、version 600 exportを実装する。
-- entity別pen、layer group、表示順、縮尺、表示・lock状態、active layerを正本schemaへ追加する。
-- JWW point、polygon solid、curve solidをimport/render/check/diff/exportへ追加する。
-- 16x16レイヤパレット、検索、使用中filter、group切替、単独表示、lock、active layerを追加する。
-- layer操作を `toml_edit` で `rules/layers.toml` へ原子的に保存する。
-- `cadc export-jww` とDesktopの `Export JWW (Experimental)` を追加する。
-- strict exportは表現不能要素をblockerにし、lossy exportは欠落・代替をreportへ記録する。
-- JWW再import時のentity ID維持は保証しない。
-- JWW blockはimport時に通常entityへflattenし、`block_ref` exportはstrict blockerとして扱う。block定義の正本化は別計画とする。
-- Windows版Jw_cad実機確認と、ライセンス確認済みsolid fixtureの検証完了までExperimentalを維持する。
-
-### Phase 9C: Direct Drafting And Entity Editing
-
-Status: implemented
-
-- current drawing切替とdrawing単位のrender/diff/edit stateを追加する。
-- `cad-edit`でrevision付きNDJSON編集、原子的publish、checker回帰防止を実装する。
-- property編集、数値/drag移動、複製、削除を追加する。
-- line、polyline、circle、arc、text、dimension、pointの新規作図を追加する。
-- endpoint、midpoint、line intersection snapを追加する。
-- AIや外部editorとの競合は`revision_conflict`で拒否する。
-
-### Phase 9D: Comment Workflow
-
-Status: implemented
-
-- コメント作成とstatus変更を追加する。
-- コメントNDJSONの競合と原子的書込を定義する。
-
-### Phase 10: Desktop Distribution
-
-- macOS Apple Silicon向け署名/配布を検証する。
-
-### Phase 11: Boundary Format Export
-
-- DXF exportを追加する。
-- PDF exportを追加する。
-- JWW exportの互換検証を完了し、Experimental表示を解除する。
-- DWG対応は商用SDK境界を調査してから判断する。
-
-### Phase 12: QCAD Integration
-
-- QCAD pluginまたは外部スクリプトでNDJSON import/exportを試作する。
-- QCAD側entityとNDJSON永続IDの対応を検証する。
-- Jw_cad風操作実験の場として使う。
-
-## Implementation Order
-
-1. Phase 0
-2. Phase 1
-3. Phase 2
-4. Phase 3
-5. Phase 4
-6. Phase 5
-7. Phase 6
-8. Phase 7
-9. Phase 8
-
-各Phaseは単独でレビュー可能な差分にする。次Phaseへ進む前に、該当Phaseの完了条件を満たす。
+# CAD 実装計画
+
+## 現在の契約
+
+- schema `0.2` のみを正本として扱う。旧 schema の読み込み、移行、互換
+  fallback は実装しない。
+- `drawings/<drawing>/layouts.toml` が用紙、向き、縮尺、原点、余白、plot
+  area の唯一の正本である。`active_layout` を check、render、diff、PDF、JWW
+  export の全てで使用する。
+- 図形は `entities.ndjson`、block は `blocks/<id>/definition.toml` と
+  `entities.ndjson`、レイヤは `rules/layers.toml`、コメントは
+  `comments/<drawing>.ndjson` に保存する。
+- `build/`、`build/.cad-history/`、`.cad-transactions/`、`.cad-recovery/` は
+  生成物であり、source watcher、review、diff、AI context の入力対象外とする。
+- source の編集、コメント、レイヤ更新、Undo/Redo は revision 検査、raw
+  bytes・改行・末尾改行・permission 保持、atomic exchange、競合bytesの
+  recovery 保全を共通不変条件とする。source の分類とrevision manifestは
+  `cad-model` のAPIだけを使用する。
+- JWW import の既定値は block preserve、`--flatten` は明示的な変換モードと
+  する。JWW export は strict/lossy report を生成し、Windows/Jw_cad 検証が
+  完了するまで Experimental 表示を維持する。
+- PDF は Rust renderer が active layout を直接解釈し、printable layer のみを
+  atomic publish する。
+
+## 実装フェーズ
+
+### Phase 1: 操作基盤
+
+command registry、Esc/Enter/右クリックの統一、複数選択、window/crossing
+選択、snap、preview、drawing/live-review 切替時の command reset を提供する。
+
+### Phase 2: 編集 transaction
+
+複数 entity の translate/copy/delete、rotate、mirror、offset、trim、extend を
+一 request 一 revision 一 publish の transaction として処理する。途中失敗や
+checker error では正本を変更しない。
+
+### Phase 3: 履歴
+
+`build/.cad-history/` に entities、comments、layers の before/after manifest
+を保存し、Undo/Redo、再起動後の復元、revision conflict、100 世代制限を提供
+する。履歴破損時は正本を維持する。
+
+### Phase 4: 図面モデルと境界形式
+
+block definition/reference、hatch、layouts を checker、renderer、diff、編集、
+JWW import/export、PDF へ接続する。simple hatch と有限な layout を厳格に
+検証し、表現不能な JWW 要素は strict blocker、lossy では warning とする。
+
+## 検証ゲート
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+pnpm --dir apps/viewer typecheck
+pnpm --dir apps/viewer build
+pnpm --dir apps/viewer test
+pnpm --dir apps/viewer test:e2e
+pnpm --dir apps/viewer desktop:smoke
+pnpm --dir apps/viewer desktop:e2e
+```
+
+CI は `rust-toolchain.toml` と viewer の lockfile を固定し、上記の Rust、型検査、
+unit、Playwright、macOS embedded-WebDriver gate を同じ順序で実行する。
+Windows/Jw_cad の preserve round-trip と macOS の PDF Preview 確認は
+release gate として別途記録する。
+
+## 次のリリースゲート
+
+- native watcher を優先し、poll fallback の対象拡張子と間隔を制限する。
+- PDF の pen、line type、line width、text style fidelity を SVG と共通化する。
+- checker の大規模 polyline/hatch self-intersection を空間 index で高速化する。
+- Windows/Jw_cad preserve import → export → re-import の fixture/hash/report を
+  再現可能な artifact として記録する。
