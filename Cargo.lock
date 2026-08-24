@@ -385,12 +385,14 @@ name = "cad-check"
 version = "0.1.0"
 dependencies = [
  "cad-model",
+ "encoding_rs",
  "insta",
  "miette",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -403,6 +405,7 @@ dependencies = [
  "cad-edit",
  "cad-export-jww",
  "cad-import-jww",
+ "cad-jww-codec",
  "cad-model",
  "cad-render-pdf",
  "cad-render-svg",
@@ -427,7 +430,7 @@ dependencies = [
  "cad-render-pdf",
  "cad-render-svg",
  "chrono",
- "notify-debouncer-mini",
+ "notify",
  "serde",
  "serde_json",
  "tauri",
@@ -492,6 +495,7 @@ dependencies = [
 name = "cad-import-jww"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "cad-check",
  "cad-jww-codec",
  "cad-model",
@@ -500,8 +504,10 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
  "ulid",
 ]
 
@@ -510,6 +516,7 @@ name = "cad-jww-codec"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -521,6 +528,7 @@ dependencies = [
  "insta",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
@@ -536,8 +544,10 @@ dependencies = [
  "cad-edit",
  "cad-model",
  "serde_json",
+ "subsetter",
  "tempfile",
  "thiserror 2.0.18",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -2562,18 +2572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "notify-debouncer-mini"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17849edfaabd9a5fef1c606d99cfc615a8e99f7ac4366406d86c7942a3184cf2"
-dependencies = [
- "log",
- "notify",
- "notify-types",
- "tempfile",
-]
-
-[[package]]
 name = "notify-types"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3858,6 +3856,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "subsetter"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38803281d1c23166c5ebcb455439a5d2afe711cc909cf88af72448c297756ad6"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "supports-color"
 version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4748,6 +4755,12 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typeid"

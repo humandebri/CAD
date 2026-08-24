@@ -135,6 +135,13 @@ optional pen参照を追加する。未指定entityは従来どおりlayer定義
 - semantic diff JSON schema `0.2` はentity差分に加えてproject、layout、layer、pen、style、block定義の設定差分を型付きで表現する。
 - SVGには `data-entity-id`、`data-layer`、`data-bbox` などのメタ情報を埋める。
 - 見た目diffでは追加、削除、変更、線幅変更、文字bbox重なり、用紙外を扱う。
+- layer既定値とentity pen overrideのstroke解決は `cad-model` を唯一の契約とし、
+  SVGとPDFで共有する。PDFは色、物理線幅、線種、fill、文字style、寸法を保持する。
+- color styleの`rgb`は画面表示、任意の`print_rgb`は印刷を表す。JWW v600の
+  screen/print paletteを両方保持し、SVGは`rgb`、PDFは`print_rgb`を使用する。
+- macOS移行版の日本語PDFはOFL-1.1のM+ 1pを文書単位でdeterministic subsetし、
+  CIDFontType2とToUnicode mapとして埋め込む。外部parser/rasterizer CIは
+  portable release gateとして残す。
 
 ### Editing And History
 
@@ -219,6 +226,12 @@ lucide-preact
 
 - JWWは正本にせず、NDJSON/TOMLとの境界形式として扱う。
 - importとversion 600 exportは共有Rust codecを使い、外部CAD processへ依存しない。
-- JWW再import時のstable entity IDと無劣化往復は保証しない。
+- import時の原本bytesとBLAKE3/SHA-256/source revisionをproject内に保存する。
+- 未知classと未対応versionはread-onlyで保持し、原本抽出だけを許可する。
+- 未編集projectのpreserve exportは原本をbyte-exactで返す。編集後は原headerを
+  保持する。manifest 0.2のhash検証済みrecord sidecarで文字type/end、寸法
+  SXF/補助record、block metadataを保持し、sidecar欠損・改変、未model化field、
+  近似変換は出力せずfail closedする。
+- JWW再import時のstable entity IDと任意編集後の無劣化往復は保証しない。
 - exportはstrictを既定とし、lossy変換は明示指定とreportを必須にする。
 - Windows版Jw_cadとライセンス確認済みsolid fixtureで検証するまでExperimentalと表示する。

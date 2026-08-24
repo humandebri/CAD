@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1",
+  "fixtures": [
+    {
+      "path": "Test1.jww",
+      "sha256": "de0ecf5991bbf7b66388a3837af2a2318e56eac175592c3e48e608c85d2c16b2",
+      "jww_version": 600,
+      "compatibility_state": "editable_lossless",
+      "record_classes": {
+        "CDataEnko": 4,
+        "CDataMoji": 36,
+        "CDataSen": 1642,
+        "CDataTen": 4
+      },
+      "block_definition_count": 0
+    }
+  ]
+}

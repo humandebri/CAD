@@ -11,7 +11,9 @@ describe("CAD Review desktop", () => {
     const pdfPath = process.env.CAD_E2E_PDF_PATH;
     assert(projectPath && pdfPath, "desktop E2E paths must be configured");
     const entitiesPath = `${projectPath}/drawings/plan_1f/entities.ndjson`;
+    const historyPath = `${projectPath}/build/.cad-history/index.json`;
     const initialEntities = readFileSync(entitiesPath, "utf8");
+    const readHistory = () => JSON.parse(readFileSync(historyPath, "utf8"));
 
     await $("h1=house-small").waitForDisplayed({ timeout: 30_000 });
     const sheet = await $("button=Sheet");
@@ -52,16 +54,60 @@ describe("CAD Review desktop", () => {
       timeoutMsg: "created comment was not rendered",
     });
 
+    await browser.execute(() => {
+      globalThis.__cadWatchCycleComplete = false;
+      let sawRefreshing = false;
+      const status = document.querySelector(".live-review-status");
+      const record = () => {
+        const text = status?.textContent ?? "";
+        if (text.includes("Live: refreshing")) sawRefreshing = true;
+        if (sawRefreshing && text.includes("Live: watching")) {
+          globalThis.__cadWatchCycleComplete = true;
+          observer.disconnect();
+        }
+      };
+      const observer = new MutationObserver(record);
+      if (status !== null) {
+        observer.observe(status, {
+          attributes: true,
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+      }
+    });
     const hideLayer = await $("button[aria-label^='Hide ']");
     await hideLayer.waitForClickable();
     await activate(hideLayer);
+    await browser.waitUntil(
+      () => browser.execute(() => globalThis.__cadWatchCycleComplete === true),
+      { timeout: 10_000, timeoutMsg: "native watcher catch-up did not complete" },
+    );
 
+    const historyBeforeUndo = readHistory();
     const undo = await $("button[aria-label='Undo']");
-    await undo.waitForEnabled({ timeout: 10_000 });
+    await browser.waitUntil(
+      () => browser.execute(
+        () => !document.querySelector("button[aria-label='Undo']")?.hasAttribute("disabled"),
+      ),
+      { timeout: 10_000, timeoutMsg: "Undo did not become enabled" },
+    );
     await activate(undo);
+    await browser.waitUntil(() => readHistory().redo.length > 0, {
+      timeout: 10_000,
+      timeoutMsg: "Undo did not update the history index",
+    });
     const redo = await $("button[aria-label='Redo']");
     await redo.waitForEnabled({ timeout: 10_000 });
     await activate(redo);
+    await browser.waitUntil(
+      () => {
+        const history = readHistory();
+        return history.redo.length === 0
+          && history.undo.length === historyBeforeUndo.undo.length;
+      },
+      { timeout: 10_000, timeoutMsg: "Redo did not update the history index" },
+    );
 
     await activate(await $("button[aria-label='Export PDF']"));
     await browser.waitUntil(() => existsSync(pdfPath), {

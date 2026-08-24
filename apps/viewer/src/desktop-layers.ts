@@ -125,6 +125,34 @@ export function exportJwwFromDesktop(
   });
 }
 
+export function exportJwwPreservingFromDesktop(
+  projectPath: string,
+  drawing: string,
+  outputPath: string,
+  overwrite: boolean,
+  invokeCommand: InvokeDesktop = invokeDesktop,
+): Promise<ExportReport> {
+  return invokeCommand<ExportReport>("export_jww_preserving", {
+    projectPath,
+    drawing,
+    outputPath,
+    overwrite,
+  });
+}
+
+export function extractOriginalJwwFromDesktop(
+  projectPath: string,
+  outputPath: string,
+  overwrite: boolean,
+  invokeCommand: InvokeDesktop = invokeDesktop,
+): Promise<void> {
+  return invokeCommand<void>("extract_original_jww", {
+    projectPath,
+    outputPath,
+    overwrite,
+  });
+}
+
 export function exportDrawingPdfFromDesktop(
   request: PdfExportRequest,
   invokeCommand: InvokeDesktop = invokeDesktop,

@@ -11,6 +11,8 @@ cad-model.workspace = true
 blake3.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+subsetter.workspace = true
+ttf-parser.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

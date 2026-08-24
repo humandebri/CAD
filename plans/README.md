@@ -12,6 +12,12 @@ perform the drift check in each plan before editing. Execute in the order below.
 | 002 | Make history, project switching, and export revisions coherent | P1 | M | 001 | COMPLETED |
 | 003 | Add a real desktop verification gate and reproducible CI | P1 | M-L | 001, 002 | COMPLETED |
 | 004 | Establish one canonical layout/source contract | P1 | M | 001 | COMPLETED |
+| 005 | Reduce desktop watcher and Git HEAD review overhead | P2 | M | 001–004 | COMPLETED |
+| 006 | Make PDF output preserve canonical drawing styles | P1 | M | 001–005 | IN PROGRESS |
+| 007 | Preserve JWW display and print palettes | P1 | M | 004, 006 | IN PROGRESS |
+| 008 | Preserve JWW v600 originals and reject incompatible edits | P1 | L | 001, 004, 007 | IN PROGRESS |
+| 009 | Preserve mapped JWW v600 record fields across edits | P1 | L | 008 | IN PROGRESS |
+| 010 | Make canonical source directly editable by AI and lint JWW v600 output | P1 | L | 008, 009 | IN PROGRESS |
 
 ## Dependency notes
 
@@ -22,17 +28,29 @@ perform the drift check in each plan before editing. Execute in the order below.
   001 and 002 so its smoke tests assert the final behavior rather than mocks.
 - Plan 004 can be implemented after Plan 001, but its fixtures should be used
   by Plan 003.
+- Plan 005 relies on the canonical source manifest established by Plan 004 and
+  keeps the safety and desktop gates from Plans 001–003 unchanged.
+- Plan 006 relies on the canonical layout and source contracts and shares the
+  resolved layer/pen style between SVG and PDF.
+- Plan 007 extends that style contract with distinct display and print colors
+  and preserves the JWW v600 basic palette through import/export.
+- Plan 008 adds byte-exact original retention and a fail-closed compatibility
+  boundary verified by file-level fixtures.
+- Plan 009 adds a hash-verified per-record mapping so compatible text,
+  dimension, point, solid, and block edits retain v600-only metadata. Header
+  edits remain gated by the fixture corpus and semantic re-import checks.
+- Plan 010 makes canonical TOML/NDJSON the documented AI editing surface,
+  adds target-aware linting, and makes normal v600 export best-effort.
 
 ## Deferred work
 
-Plans 001-004 are complete. The Rust backend smoke, macOS embedded-WebDriver
-GUI path, final verification suite, and read-only review gate all pass.
+Plans 001-005 are complete. Plans 006-009 retain follow-up corpus work. Plan 010
+replaces the application-specific gate with hashed file-level conformance.
 
-- PDF pen/line-style fidelity, watcher performance, Git HEAD caching, and
-  O(n²) geometry checker optimization are intentionally deferred until the
-  safety and release gates are green.
-- Windows/Jw_cad compatibility remains a release gate, not an automated local
-  substitute.
+- O(n²) geometry checker optimization remains deferred. Native watcher
+  selection, Git HEAD caching, canonical PDF drawing styles, embedded/subset
+  OFL Japanese fonts, and external PDF parsing in CI are complete.
+- External application checks are optional evidence, not a release gate.
 
 ## Findings considered and rejected
 

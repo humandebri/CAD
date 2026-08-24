@@ -640,53 +640,39 @@ fn resolve_layer<'a>(project: &'a ProjectSource, entity: &Entity) -> RenderResul
 fn resolve_stroke(
     project: &ProjectSource,
     entity: &Entity,
-    layer: &LayerDef,
+    _layer: &LayerDef,
 ) -> RenderResult<Stroke> {
-    let entity_id = entity.id().as_str();
-    let (color_id, line_type_id, width) = if let Some(pen_id) = entity.pen() {
-        let pen = project
-            .styles
-            .pens
-            .get(pen_id)
-            .ok_or_else(|| RenderError::MissingPen {
-                entity_id: entity_id.to_owned(),
-                pen: pen_id.to_owned(),
-            })?;
-        (&pen.color, &pen.line_type, pen.line_width)
-    } else {
-        (&layer.color, &layer.line_type, layer.line_width)
-    };
-    let color = project
-        .styles
-        .colors
-        .get(color_id)
-        .ok_or_else(|| RenderError::MissingColor {
-            entity_id: entity_id.to_owned(),
-            color: color_id.clone(),
-        })?;
-    let line_type = project.styles.line_types.get(line_type_id).ok_or_else(|| {
-        RenderError::MissingLineType {
-            entity_id: entity_id.to_owned(),
-            line_type: line_type_id.clone(),
-        }
-    })?;
+    let resolved = cad_model::resolve_entity_stroke(project, entity).map_err(style_error)?;
     Ok(Stroke {
-        color: color.rgb.clone(),
-        width,
-        dash: line_type.dash.clone(),
+        color: resolved.color_rgb,
+        width: resolved.line_width_mm,
+        dash: resolved.dash,
     })
 }
 
 fn resolve_fill(project: &ProjectSource, entity: &Entity, fill: &str) -> RenderResult<String> {
-    project
-        .styles
-        .colors
-        .get(fill)
-        .map(|color| color.rgb.clone())
-        .ok_or_else(|| RenderError::MissingColor {
-            entity_id: entity.id().as_str().to_owned(),
-            color: fill.to_owned(),
-        })
+    cad_model::resolve_fill_color(project, entity, fill).map_err(style_error)
+}
+
+fn style_error(error: cad_model::StyleResolutionError) -> RenderError {
+    match error {
+        cad_model::StyleResolutionError::MissingLayer { entity_id, layer } => {
+            RenderError::MissingLayer { entity_id, layer }
+        }
+        cad_model::StyleResolutionError::MissingPen { entity_id, pen } => {
+            RenderError::MissingPen { entity_id, pen }
+        }
+        cad_model::StyleResolutionError::MissingColor { entity_id, color } => {
+            RenderError::MissingColor { entity_id, color }
+        }
+        cad_model::StyleResolutionError::MissingLineType {
+            entity_id,
+            line_type,
+        } => RenderError::MissingLineType {
+            entity_id,
+            line_type,
+        },
+    }
 }
 
 fn text_node(

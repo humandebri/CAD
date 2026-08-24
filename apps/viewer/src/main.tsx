@@ -78,6 +78,8 @@ import { loadReviewSnapshotFromDesktop } from "./desktop-loader";
 import {
   exportDrawingPdfFromDesktop,
   exportJwwFromDesktop,
+  exportJwwPreservingFromDesktop,
+  extractOriginalJwwFromDesktop,
   LatestLayerRulesQueue,
   PdfExportGuard,
 } from "./desktop-layers";
@@ -268,6 +270,7 @@ function App() {
       setHistoryMessage("");
       return;
     }
+    setHistoryState(null);
     setHistoryMessage("");
     void listDrawingHistory(
       projectState.project_path,
@@ -1438,6 +1441,104 @@ function App() {
     }
   }
 
+  async function performCompatibleJwwSave() {
+    if (!isDesktop || projectState === null || artifacts === null) {
+      return;
+    }
+    const outputPath = await save({
+      title: "Save JWW Compatible",
+      defaultPath: `${projectState.project_name}.jww`,
+      filters: [{ name: "JWW", extensions: ["jww"] }],
+    });
+    if (typeof outputPath !== "string") {
+      return;
+    }
+    setExportBusy(true);
+    try {
+      let report: ExportReport;
+      try {
+        report = await exportJwwPreservingFromDesktop(
+          projectState.project_path,
+          artifacts.currentDrawing,
+          outputPath,
+          false,
+        );
+      } catch (error: unknown) {
+        const message = formatError(error, "compatible JWW save failed");
+        if (!message.includes("output already exists")) {
+          throw error;
+        }
+        const overwrite = await confirm("Replace the existing JWW file?", {
+          title: "Save JWW Compatible",
+          kind: "warning",
+        });
+        if (!overwrite) {
+          return;
+        }
+        report = await exportJwwPreservingFromDesktop(
+          projectState.project_path,
+          artifacts.currentDrawing,
+          outputPath,
+          true,
+        );
+      }
+      setExportReport(report);
+      if (report.status === "exported") {
+        setImportMessage(report.mode === "preserved_exact"
+          ? "JWW saved byte-for-byte from the preserved original."
+          : "JWW saved in compatibility mode; Windows Jw_cad validation remains required.");
+      } else {
+        setImportMessage(`Compatible JWW save blocked: ${report.blockers.map((issue) => issue.message).join("; ")}`);
+      }
+    } catch (error: unknown) {
+      setExportReport({
+        schema_version: "0.2",
+        status: "blocked",
+        mode: "preserved_edited",
+        output_path: outputPath,
+        written_entities: 0,
+        expanded_entities: 0,
+        warnings: [],
+        blockers: [{ code: "preserve_failed", message: formatError(error, "compatible JWW save failed") }],
+      });
+      setImportMessage(formatError(error, "compatible JWW save failed"));
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function performOriginalJwwExtraction() {
+    if (!isDesktop || projectState === null) {
+      return;
+    }
+    const outputPath = await save({
+      title: "Extract Original JWW",
+      defaultPath: `${projectState.project_name}-original.jww`,
+      filters: [{ name: "JWW", extensions: ["jww"] }],
+    });
+    if (typeof outputPath !== "string") {
+      return;
+    }
+    try {
+      await extractOriginalJwwFromDesktop(projectState.project_path, outputPath, false);
+      setImportMessage("Original JWW extracted byte-for-byte.");
+    } catch (error: unknown) {
+      const message = formatError(error, "original JWW extraction failed");
+      if (!message.includes("output already exists")) {
+        setImportMessage(message);
+        return;
+      }
+      const overwrite = await confirm("Replace the existing JWW file?", {
+        title: "Extract Original JWW",
+        kind: "warning",
+      });
+      if (overwrite) {
+        await extractOriginalJwwFromDesktop(projectState.project_path, outputPath, true);
+        setImportMessage("Original JWW extracted byte-for-byte.");
+      }
+    }
+  }
+
   async function performPdfExport() {
     if (!isDesktop || projectState === null || artifacts === null || historyState === null || pdfBusy) return;
     const sequence = pdfExportGuard.begin();
@@ -2058,6 +2159,18 @@ function App() {
                 <FileOutput size={17} aria-hidden="true" />
                 Export JWW
               </button>
+              {projectState?.jww_edit_capability === "mapped_v600" && (
+                <button type="button" class="tool-button" onClick={() => void performCompatibleJwwSave()}>
+                  <FileOutput size={17} aria-hidden="true" />
+                  Save JWW Compatible
+                </button>
+              )}
+              {projectState?.jww_compatibility_state != null && (
+                <button type="button" class="tool-button" onClick={() => void performOriginalJwwExtraction()}>
+                  <FileOutput size={17} aria-hidden="true" />
+                  Extract Original
+                </button>
+              )}
             </>
           )}
           <button
@@ -2943,6 +3056,19 @@ function PanelHeader(props: {
         <h1>{projectState?.project_name ?? "plan_1f"}</h1>
         {projectState !== null && <p class="project-path">{projectState.project_path}</p>}
         {importMessage !== "" && <p class="warning-line">{importMessage}</p>}
+        {projectState?.jww_edit_capability === "mapped_v600" && (
+          <p class="success-line">JWW v600 record mapping verified; compatible edits can be saved</p>
+        )}
+        {projectState?.jww_compatibility_state === "editable_lossless"
+          && projectState.jww_edit_capability !== "mapped_v600" && (
+          <p class="warning-line">JWW original verified; this import is exact-extraction only</p>
+        )}
+        {projectState?.jww_compatibility_state != null
+          && projectState.jww_compatibility_state !== "editable_lossless" && (
+          <p class="warning-line">
+            JWW preserved read-only: {projectState.jww_compatibility_reason ?? "unsupported compatibility state"}
+          </p>
+        )}
         {liveReviewState.status === "error" && (
           <p class="warning-line">Live review: {liveReviewState.message ?? "unknown error"}</p>
         )}

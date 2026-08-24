@@ -19,10 +19,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Strictly validate CAD source")]
+    #[command(about = "Inspect JWW compatibility without importing")]
+    InspectJww {
+        #[arg(value_name = "FILE.jww")]
+        input: PathBuf,
+    },
+    #[command(about = "Lint canonical CAD source and optional JWW v600 output compatibility")]
     Check {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
+
+        #[arg(long, value_name = "NAME")]
+        drawing: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = CheckTargetArg::Cad)]
+        target: CheckTargetArg,
 
         #[arg(long, value_enum)]
         format: CheckFormat,
@@ -49,7 +60,7 @@ enum Command {
         )]
         flatten: bool,
     },
-    #[command(about = "Export a CAD drawing to experimental JWW version 600")]
+    #[command(about = "Export a CAD drawing to best-effort JWW version 600")]
     ExportJww {
         #[arg(value_name = "PROJECT")]
         project: PathBuf,
@@ -60,14 +71,37 @@ enum Command {
         #[arg(long, value_name = "FILE.jww")]
         out: PathBuf,
 
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Deprecated compatibility alias for normal best-effort output"
+        )]
         allow_lossy: bool,
+
+        #[arg(long, help = "Reject every JWW approximation or substitution")]
+        strict: bool,
 
         #[arg(long)]
         force: bool,
 
+        #[arg(
+            long,
+            help = "Require valid JWW provenance; provenance is otherwise detected automatically"
+        )]
+        preserve: bool,
+
         #[arg(long, value_name = "REPORT.json")]
         report: Option<PathBuf>,
+    },
+    #[command(about = "Extract the byte-exact original JWW from an imported project")]
+    ExtractOriginalJww {
+        #[arg(value_name = "PROJECT")]
+        project: PathBuf,
+
+        #[arg(long, value_name = "FILE.jww")]
+        out: PathBuf,
+
+        #[arg(long)]
+        force: bool,
     },
     #[command(about = "Export a CAD drawing to PDF")]
     ExportPdf {
@@ -119,10 +153,11 @@ impl Command {
             Self::Check { project, .. }
             | Self::Format { project }
             | Self::ExportJww { project, .. }
+            | Self::ExtractOriginalJww { project, .. }
             | Self::ExportPdf { project, .. }
             | Self::Render { project, .. } => vec![project.as_path()],
             Self::Diff { base, head, .. } => vec![base.as_path(), head.as_path()],
-            Self::ImportJww { .. } => Vec::new(),
+            Self::ImportJww { .. } | Self::InspectJww { .. } => Vec::new(),
         }
     }
 }
@@ -130,6 +165,12 @@ impl Command {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CheckFormat {
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CheckTargetArg {
+    Cad,
+    JwwV600,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -157,13 +198,36 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Command::InspectJww { input }) => {
+            let bytes = fs::read(&input)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", input.display()))?;
+            let inspection = cad_jww_codec::inspect_document(&bytes);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspection).into_diagnostic()?
+            );
+        }
         Some(Command::Check {
             project,
+            drawing,
+            target,
             format: CheckFormat::Json,
             out,
         }) => {
-            let report = cad_check::check_project(&project);
-            write_json_report(&out, &report)?;
+            let target = match target {
+                CheckTargetArg::Cad => cad_check::CheckTarget::Cad,
+                CheckTargetArg::JwwV600 => cad_check::CheckTarget::JwwV600,
+            };
+            let report = cad_check::check_project_for_target(&project, target, drawing.as_deref());
+            if out == Path::new("-") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).into_diagnostic()?
+                );
+            } else {
+                write_json_report(&out, &report)?;
+            }
             if !report.is_ok() {
                 return Err(miette!(
                     "check failed with {} diagnostic(s)",
@@ -202,7 +266,9 @@ fn main() -> Result<()> {
             drawing,
             out,
             allow_lossy,
+            strict,
             force,
+            preserve,
             report,
         }) => {
             if report
@@ -211,13 +277,19 @@ fn main() -> Result<()> {
             {
                 return Err(miette!("--out and --report must refer to different files"));
             }
-            let export = cad_export_jww::export_jww_file(
+            if (strict || preserve) && allow_lossy {
+                return Err(miette!(
+                    "--strict/--preserve and --allow-lossy cannot be combined"
+                ));
+            }
+            let export = cad_export_jww::export_jww_file_auto(
                 &project,
                 &drawing,
                 &out,
-                cad_export_jww::ExportOptions {
-                    allow_lossy,
+                cad_export_jww::AutoExportOptions {
+                    strict: strict || preserve,
                     overwrite: force,
+                    require_preservation: preserve,
                 },
             )
             .into_diagnostic()?;
@@ -238,6 +310,14 @@ fn main() -> Result<()> {
                     export.blockers.len()
                 ));
             }
+        }
+        Some(Command::ExtractOriginalJww {
+            project,
+            out,
+            force,
+        }) => {
+            cad_export_jww::extract_original_jww(&project, &out, force).into_diagnostic()?;
+            println!("extracted original JWW to {}", out.display());
         }
         Some(Command::ExportPdf {
             project,
@@ -443,7 +523,10 @@ fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, format_ndjson_file, normalize_numbers, paths_refer_to_same_file};
+    use super::{
+        CheckTargetArg, Cli, Command, format_ndjson_file, normalize_numbers,
+        paths_refer_to_same_file,
+    };
     use clap::Parser;
     use std::fs;
     use std::path::Path;
@@ -493,6 +576,79 @@ mod tests {
     }
 
     #[test]
+    fn parses_jww_preservation_contracts() {
+        let export = Cli::try_parse_from([
+            "cadc",
+            "export-jww",
+            "project",
+            "--drawing",
+            "plan",
+            "--out",
+            "plan.jww",
+            "--preserve",
+        ])
+        .expect("preserve export should parse");
+        assert!(matches!(
+            export.command,
+            Some(Command::ExportJww { preserve: true, .. })
+        ));
+        let strict = Cli::try_parse_from([
+            "cadc",
+            "export-jww",
+            "project",
+            "--drawing",
+            "plan",
+            "--out",
+            "plan.jww",
+            "--strict",
+        ])
+        .expect("strict export should parse");
+        assert!(matches!(
+            strict.command,
+            Some(Command::ExportJww { strict: true, .. })
+        ));
+        let lint = Cli::try_parse_from([
+            "cadc",
+            "check",
+            "project",
+            "--drawing",
+            "plan",
+            "--target",
+            "jww-v600",
+            "--format",
+            "json",
+            "--out",
+            "-",
+        ])
+        .expect("JWW target lint should parse");
+        assert!(matches!(
+            lint.command,
+            Some(Command::Check {
+                target: CheckTargetArg::JwwV600,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cadc", "inspect-jww", "source.jww"])
+                .expect("inspection should parse")
+                .command,
+            Some(Command::InspectJww { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cadc",
+                "extract-original-jww",
+                "project",
+                "--out",
+                "original.jww",
+            ])
+            .expect("extraction should parse")
+            .command,
+            Some(Command::ExtractOriginalJww { .. })
+        ));
+    }
+
+    #[test]
     fn every_source_reading_command_declares_its_recovery_roots() {
         let cases = [
             (
@@ -511,6 +667,16 @@ mod tests {
                     "plan",
                     "--out",
                     "out.jww",
+                ],
+                1,
+            ),
+            (
+                vec![
+                    "cadc",
+                    "extract-original-jww",
+                    "project",
+                    "--out",
+                    "original.jww",
                 ],
                 1,
             ),
@@ -554,6 +720,15 @@ mod tests {
             import
                 .command
                 .expect("import command")
+                .source_projects()
+                .is_empty()
+        );
+        let inspect = Cli::try_parse_from(["cadc", "inspect-jww", "source.jww"])
+            .expect("inspection should parse");
+        assert!(
+            inspect
+                .command
+                .expect("inspect command")
                 .source_projects()
                 .is_empty()
         );

@@ -1,28 +1,21 @@
 //! apps/viewer/src-tauri: desktop bridge for local CAD review artifacts.
 //! The webview calls Rust commands; Rust calls CAD crates directly and uses Git only to read HEAD.
 
+mod head_snapshot;
+mod project_watch;
+
 use chrono::{SecondsFormat, Utc};
-use notify_debouncer_mini::{
-    Config as DebounceConfig, DebounceEventResult, Debouncer, new_debouncer_opt,
-    notify::{Config as NotifyConfig, PollWatcher, RecursiveMode},
-};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 use tauri::{Emitter, Manager, Runtime, State};
 use ulid::Ulid;
 
+use head_snapshot::HeadSnapshotCache;
+use project_watch::{PROJECT_WATCH_DEBOUNCE_MS, ProjectWatcher, create_project_watcher};
+
 const PROJECT_WATCH_EVENT: &str = "cad-project-watch";
-const PROJECT_WATCH_DEBOUNCE_MS: u64 = 250;
-
-type ProjectDebouncer = Debouncer<PollWatcher>;
-
 #[derive(Default)]
 struct ProjectWatchManager {
     current: Mutex<Option<ProjectWatcher>>,
@@ -50,17 +43,15 @@ struct SnapCache {
     index: Arc<cad_edit::SnapIndex>,
 }
 
-struct ProjectWatcher {
-    _project_path: String,
-    _debouncer: ProjectDebouncer,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectState {
     project_path: String,
     project_name: String,
     is_git_project: bool,
     import_warning_count: Option<usize>,
+    jww_compatibility_state: Option<cad_model::JwwCompatibilityState>,
+    jww_compatibility_reason: Option<String>,
+    jww_edit_capability: Option<cad_model::JwwEditCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -310,10 +301,15 @@ fn open_project(project_path: String) -> Result<ProjectState, String> {
 
 #[tauri::command]
 fn run_review(
+    head_cache: State<'_, HeadSnapshotCache>,
     project_path: String,
     drawing_name: Option<String>,
 ) -> Result<ReviewArtifacts, String> {
-    run_review_for_drawing(Path::new(&project_path), drawing_name.as_deref())
+    run_review_for_drawing_with_cache(
+        Path::new(&project_path),
+        drawing_name.as_deref(),
+        &head_cache,
+    )
 }
 
 #[tauri::command]
@@ -324,6 +320,8 @@ fn apply_drawing_edit(
     request: cad_edit::DrawingEditRequest,
 ) -> Result<cad_edit::DrawingEditResult, String> {
     recover_project_sources(Path::new(&project_path))?;
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    ensure_jww_drawing_edit_compatible(Path::new(&project_path), &request)?;
     let _guard = edit_manager
         .update
         .lock()
@@ -345,6 +343,7 @@ fn undo_drawing_edit(
     request: cad_edit::DrawingHistoryRequest,
 ) -> Result<cad_edit::DrawingEditResult, String> {
     recover_project_sources(Path::new(&project_path))?;
+    ensure_jww_source_editable(Path::new(&project_path))?;
     let _guard = edit_manager
         .update
         .lock()
@@ -366,6 +365,7 @@ fn redo_drawing_edit(
     request: cad_edit::DrawingHistoryRequest,
 ) -> Result<cad_edit::DrawingEditResult, String> {
     recover_project_sources(Path::new(&project_path))?;
+    ensure_jww_source_editable(Path::new(&project_path))?;
     let _guard = edit_manager
         .update
         .lock()
@@ -536,6 +536,13 @@ fn update_layer_rules(
     project_path: String,
     patch: LayerRulesPatch,
 ) -> Result<LayerMutationResult, String> {
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    if cad_model::load_jww_preservation_manifest(Path::new(&project_path))
+        .map_err(|error| format!("failed to validate JWW compatibility: {error}"))?
+        .is_some()
+    {
+        return Err("jww_incompatible_edit: layer and palette edits cannot yet preserve the original JWW v600 header losslessly".to_owned());
+    }
     let _guard = manager
         .update
         .lock()
@@ -559,9 +566,33 @@ fn export_jww(
         cad_export_jww::ExportOptions {
             allow_lossy,
             overwrite,
+            strict_approximations: false,
         },
     )
     .map_err(|error| format!("failed to export JWW: {error}"))
+}
+
+#[tauri::command]
+fn export_jww_preserving(
+    project_path: String,
+    drawing: String,
+    output_path: String,
+    overwrite: bool,
+) -> Result<cad_export_jww::ExportReport, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    cad_export_jww::export_jww_file_preserving(project_path, &drawing, output_path, overwrite)
+        .map_err(|error| format!("failed to preserve JWW: {error}"))
+}
+
+#[tauri::command]
+fn extract_original_jww(
+    project_path: String,
+    output_path: String,
+    overwrite: bool,
+) -> Result<(), String> {
+    recover_project_sources(Path::new(&project_path))?;
+    cad_export_jww::extract_original_jww(project_path, output_path, overwrite)
+        .map_err(|error| format!("failed to extract original JWW: {error}"))
 }
 
 #[tauri::command]
@@ -596,14 +627,16 @@ fn export_drawing_pdf(
 
 #[tauri::command]
 fn write_ai_context(
+    head_cache: State<'_, HeadSnapshotCache>,
     project_path: String,
     view_mode: String,
     selected_entity_id: String,
 ) -> Result<AiContextState, String> {
-    Ok(write_ai_context_for_path(
+    Ok(write_ai_context_for_path_with_cache(
         Path::new(&project_path),
         &view_mode,
         &selected_entity_id,
+        &head_cache,
     ))
 }
 
@@ -927,6 +960,7 @@ fn save_last_project<R: Runtime>(
 pub fn run() {
     let builder = tauri::Builder::default()
         .manage(ProjectWatchManager::default())
+        .manage(HeadSnapshotCache::default())
         .manage(LayerRulesUpdateManager::default())
         .manage(DrawingEditManager::default())
         .manage(SnapCacheManager::default());
@@ -947,6 +981,8 @@ pub fn run() {
             query_snap,
             import_jww,
             export_jww,
+            export_jww_preserving,
+            extract_original_jww,
             export_drawing_pdf,
             update_layer_rules,
             create_comment,
@@ -961,94 +997,83 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn create_project_watcher<F>(
-    root: &Path,
-    project_path: String,
-    emit: F,
-) -> Result<ProjectWatcher, String>
-where
-    F: Fn(ProjectWatchEvent) + Send + 'static,
-{
-    let watch_root = fs::canonicalize(root)
-        .map_err(|error| format!("failed to canonicalize project watcher root: {error}"))?;
-    let event_root = watch_root.clone();
-    let event_project_path = project_path.clone();
-    let notify_config = NotifyConfig::default()
-        .with_poll_interval(Duration::from_millis(100))
-        .with_compare_contents(true);
-    let config = DebounceConfig::default()
-        .with_timeout(Duration::from_millis(PROJECT_WATCH_DEBOUNCE_MS))
-        .with_notify_config(notify_config);
-    let mut debouncer =
-        new_debouncer_opt::<_, PollWatcher>(config, move |result: DebounceEventResult| {
-            if let Some(event) = project_watch_event(&event_root, &event_project_path, result) {
-                emit(event);
-            }
-        })
-        .map_err(|error| format!("failed to create project watcher: {error}"))?;
-    debouncer
-        .watcher()
-        .watch(&watch_root, RecursiveMode::Recursive)
-        .map_err(|error| format!("failed to watch project: {error}"))?;
-    Ok(ProjectWatcher {
-        _project_path: project_path,
-        _debouncer: debouncer,
-    })
-}
-
-fn project_watch_event(
-    root: &Path,
-    project_path: &str,
-    result: DebounceEventResult,
-) -> Option<ProjectWatchEvent> {
-    match result {
-        Ok(events) => {
-            let paths = events
-                .into_iter()
-                .filter_map(|event| source_relative_path(root, &event.path))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if paths.is_empty() {
-                None
-            } else {
-                Some(ProjectWatchEvent {
-                    kind: ProjectWatchEventKind::Changed,
-                    project_path: project_path.to_owned(),
-                    paths,
-                    message: None,
-                })
-            }
-        }
-        Err(error) => Some(ProjectWatchEvent {
-            kind: ProjectWatchEventKind::Error,
-            project_path: project_path.to_owned(),
-            paths: Vec::new(),
-            message: Some(error.to_string()),
-        }),
-    }
-}
-
-fn source_relative_path(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    cad_model::classify_project_source_path(relative)?;
-    Some(relative.to_string_lossy().into_owned())
-}
-
 fn recover_project_sources(project_path: &Path) -> Result<(), String> {
     cad_edit::with_history_lock(|| cad_edit::recover_source_transactions(project_path))
         .map_err(|error| format!("failed to recover source transaction: {error}"))
+}
+
+fn ensure_jww_source_editable(project_path: &Path) -> Result<(), String> {
+    let Some(compatibility) = cad_model::jww_project_compatibility(project_path)
+        .map_err(|error| format!("failed to validate JWW compatibility: {error}"))?
+    else {
+        return Ok(());
+    };
+    if compatibility.state == cad_model::JwwCompatibilityState::EditableLossless
+        && compatibility.original_verified
+        && compatibility.edit_capability == cad_model::JwwEditCapability::MappedV600
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "jww_read_only: {}",
+            compatibility.reason.unwrap_or_else(|| {
+                "the preserved JWW has no verified editable record mapping".to_owned()
+            })
+        ))
+    }
+}
+
+fn ensure_jww_drawing_edit_compatible(
+    project_path: &Path,
+    request: &cad_edit::DrawingEditRequest,
+) -> Result<(), String> {
+    if cad_model::load_jww_preservation_manifest(project_path)
+        .map_err(|error| format!("failed to validate JWW compatibility: {error}"))?
+        .is_none()
+    {
+        return Ok(());
+    }
+    if jww_operation_changes_unpreserved_fields(&request.operation) {
+        return Err(
+            "jww_incompatible_edit: layout and hatch records are not yet losslessly editable"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn jww_operation_changes_unpreserved_fields(operation: &cad_edit::EditOperation) -> bool {
+    match operation {
+        cad_edit::EditOperation::Batch { operations } => operations
+            .iter()
+            .any(jww_operation_changes_unpreserved_fields),
+        cad_edit::EditOperation::Create { entity }
+        | cad_edit::EditOperation::Replace { entity, .. } => matches!(
+            entity.get("type").and_then(serde_json::Value::as_str),
+            Some("hatch")
+        ),
+        cad_edit::EditOperation::UpdateHatch { .. }
+        | cad_edit::EditOperation::UpdateLayout { .. } => true,
+        _ => false,
+    }
 }
 
 fn open_project_state(project_path: &Path) -> Result<ProjectState, String> {
     recover_project_sources(project_path)?;
     let source = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project: {error}"))?;
+    let compatibility = cad_model::jww_project_compatibility(project_path)
+        .map_err(|error| format!("failed to validate JWW compatibility: {error}"))?;
     Ok(ProjectState {
         project_path: project_path.to_string_lossy().into_owned(),
         project_name: source.project.name,
-        is_git_project: git_root(project_path).is_ok(),
+        is_git_project: head_snapshot::git_root(project_path).is_ok(),
         import_warning_count: None,
+        jww_compatibility_state: compatibility.as_ref().map(|state| state.state),
+        jww_compatibility_reason: compatibility
+            .as_ref()
+            .and_then(|state| state.reason.clone()),
+        jww_edit_capability: compatibility.map(|state| state.edit_capability),
     })
 }
 
@@ -1057,9 +1082,22 @@ fn run_review_for_path(project_path: &Path) -> Result<ReviewArtifacts, String> {
     run_review_for_drawing(project_path, None)
 }
 
+#[cfg(test)]
 fn run_review_for_drawing(
     project_path: &Path,
     requested_drawing: Option<&str>,
+) -> Result<ReviewArtifacts, String> {
+    run_review_for_drawing_with_cache(
+        project_path,
+        requested_drawing,
+        &HeadSnapshotCache::default(),
+    )
+}
+
+fn run_review_for_drawing_with_cache(
+    project_path: &Path,
+    requested_drawing: Option<&str>,
+    head_cache: &HeadSnapshotCache,
 ) -> Result<ReviewArtifacts, String> {
     recover_project_sources(project_path)?;
     let head = cad_model::load_project(project_path)
@@ -1104,15 +1142,12 @@ fn run_review_for_drawing(
         .drawings
         .retain(|drawing| drawing.name == drawing_name);
 
-    let diff_result = build_head_base_project(project_path).and_then(|base_dir| {
-        cad_model::load_project(base_dir.path())
-            .map_err(|error| format!("failed to load HEAD project: {error}"))
-            .map(|mut base| {
-                base.drawings.retain(|drawing| drawing.name == drawing_name);
-                let diff = cad_diff::diff_projects(&base, &filtered_head);
-                let diff_svg = cad_diff::diff_projects_svg(&base, &filtered_head);
-                (diff, diff_svg)
-            })
+    let diff_result = head_cache.load(project_path).map(|base| {
+        let mut base = (*base).clone();
+        base.drawings.retain(|drawing| drawing.name == drawing_name);
+        let diff = cad_diff::diff_projects(&base, &filtered_head);
+        let diff_svg = cad_diff::diff_projects_svg(&base, &filtered_head);
+        (diff, diff_svg)
     });
 
     let (diff, diff_svg, diff_unavailable) = match diff_result {
@@ -1423,10 +1458,25 @@ fn layer_rules_revision(project_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("failed to read layers.toml revision: {error}"))
 }
 
+#[cfg(test)]
 fn write_ai_context_for_path(
     project_path: &Path,
     view_mode: &str,
     selected_entity_id: &str,
+) -> AiContextState {
+    write_ai_context_for_path_with_cache(
+        project_path,
+        view_mode,
+        selected_entity_id,
+        &HeadSnapshotCache::default(),
+    )
+}
+
+fn write_ai_context_for_path_with_cache(
+    project_path: &Path,
+    view_mode: &str,
+    selected_entity_id: &str,
+    head_cache: &HeadSnapshotCache,
 ) -> AiContextState {
     if let Err(error) = recover_project_sources(project_path) {
         return ai_context_state(AiContextStatus::Error, None, None, Some(error));
@@ -1468,7 +1518,7 @@ fn write_ai_context_for_path(
         );
     }
 
-    match build_ai_context(project_path, view_mode, selected_entity_id) {
+    match build_ai_context(project_path, view_mode, selected_entity_id, head_cache) {
         Ok((context, markdown)) => {
             let build_dir = match safe_generated_dir(project_path, Path::new("build")) {
                 Ok(path) => path,
@@ -1646,6 +1696,7 @@ fn build_ai_context(
     project_path: &Path,
     view_mode: &str,
     selected_entity_id: &str,
+    head_cache: &HeadSnapshotCache,
 ) -> Result<(AiContext, String), String> {
     let initial_manifest = cad_model::source_manifest(project_path)
         .map_err(|error| format!("failed to load canonical source manifest: {error}"))?;
@@ -1666,7 +1717,7 @@ fn build_ai_context(
         .filter(|comment| comment.entity_ids.iter().any(|id| id == selected_entity_id))
         .collect::<Vec<_>>();
     let (diff_changes, diff_warnings) =
-        selected_diff_context(project_path, &project, selected_entity_id);
+        selected_diff_context(project_path, &project, selected_entity_id, head_cache);
     let bbox = cad_model::entity_bbox(&record.entity).map(|bbox| AiContextBBox {
         min: bbox.min,
         max: bbox.max,
@@ -1737,11 +1788,9 @@ fn selected_diff_context(
     project_path: &Path,
     head: &cad_model::ProjectSource,
     selected_entity_id: &str,
+    head_cache: &HeadSnapshotCache,
 ) -> (Vec<cad_diff::DiffChange>, Vec<cad_diff::DiffWarning>) {
-    let Ok(base_dir) = build_head_base_project(project_path) else {
-        return (Vec::new(), Vec::new());
-    };
-    let Ok(base) = cad_model::load_project(base_dir.path()) else {
+    let Ok(base) = head_cache.load(project_path) else {
         return (Vec::new(), Vec::new());
     };
     let diff = cad_diff::diff_projects(&base, head);
@@ -1881,115 +1930,6 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn build_head_base_project(project_path: &Path) -> Result<tempfile::TempDir, String> {
-    let repo = git_root(project_path)?;
-    let repo =
-        fs::canonicalize(repo).map_err(|error| format!("failed to canonicalize repo: {error}"))?;
-    let project_path = fs::canonicalize(project_path)
-        .map_err(|error| format!("failed to canonicalize project: {error}"))?;
-    let relative_project = project_path
-        .strip_prefix(&repo)
-        .map_err(|_| "project is not inside the Git repository".to_owned())?;
-    let relative_project_arg = git_project_pathspec(relative_project);
-
-    let head_files = git_output_bytes(
-        &repo,
-        &[
-            OsStr::new("ls-tree"),
-            OsStr::new("-r"),
-            OsStr::new("-z"),
-            OsStr::new("--name-only"),
-            OsStr::new("HEAD"),
-            OsStr::new("--"),
-            OsStr::new(&relative_project_arg),
-        ],
-    )?;
-    let head_files = head_files
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
-        .collect::<Vec<_>>();
-    if head_files.is_empty() {
-        return Err("project has no tracked files in Git".to_owned());
-    }
-
-    let temp = tempfile::tempdir().map_err(|error| format!("failed to create tempdir: {error}"))?;
-    for git_path in head_files {
-        let mut object_path = OsString::from("HEAD:");
-        object_path.push(git_path.as_os_str());
-        let content = git_output_bytes(&repo, &[OsStr::new("show"), object_path.as_os_str()])?;
-        let relative_file = git_path
-            .strip_prefix(relative_project)
-            .map_err(|_| format!("tracked file {git_path:?} is outside project"))?;
-        let destination = temp.path().join(relative_file);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create temp parent: {error}"))?;
-        }
-        fs::write(destination, content)
-            .map_err(|error| format!("failed to write HEAD file: {error}"))?;
-    }
-    Ok(temp)
-}
-
-fn git_root(project_path: &Path) -> Result<PathBuf, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|error| format!("failed to run git: {error}"))?;
-    if !output.status.success() {
-        return Err(command_stderr("git rev-parse", &output.stderr));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("git rev-parse output was not UTF-8: {error}"))?;
-    Ok(PathBuf::from(stdout.trim()))
-}
-
-fn git_output_bytes(repo: &Path, args: &[&OsStr]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|error| format!("failed to run git: {error}"))?;
-    if !output.status.success() {
-        let command = args
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        return Err(command_stderr(&format!("git {command}"), &output.stderr));
-    }
-    Ok(output.stdout)
-}
-
-fn command_stderr(command: &str, stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_owned();
-    if message.is_empty() {
-        format!("{command} failed")
-    } else {
-        format!("{command} failed: {message}")
-    }
-}
-
-fn path_to_git_arg(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn git_project_pathspec(relative_project: &Path) -> String {
-    let pathspec = path_to_git_arg(relative_project);
-    if pathspec.is_empty() {
-        ".".to_owned()
-    } else {
-        pathspec
-    }
-}
-
 fn last_project_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -2001,16 +1941,58 @@ fn last_project_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, S
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::mpsc;
+    use std::process::Command;
 
     static WATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn jww_preservation_rejects_unmodeled_drawing_edits() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/jww-fixtures/Test1.jww");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("imported");
+        cad_import_jww::import_jww_file(&fixture, &project).expect("JWW import");
+        let request = cad_edit::DrawingEditRequest {
+            drawing: "test1".to_owned(),
+            expected_revision: String::new(),
+            operation: cad_edit::EditOperation::UpdateLayout {
+                layout: "default".to_owned(),
+                properties: serde_json::json!({"paper": "A3"}),
+            },
+        };
+
+        let error = ensure_jww_drawing_edit_compatible(&project, &request)
+            .expect_err("layout edit must fail closed");
+
+        assert!(error.starts_with("jww_incompatible_edit:"));
+    }
+
+    #[test]
+    fn read_only_jww_provenance_rejects_source_mutation() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/jww-fixtures/Test1.jww");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("imported");
+        cad_import_jww::import_jww_file(&fixture, &project).expect("JWW import");
+        let manifest = project.join(cad_model::JWW_PRESERVATION_RELATIVE_PATH);
+        let source = fs::read_to_string(&manifest).expect("preservation manifest");
+        fs::write(
+            &manifest,
+            source.replace("editable_lossless", "preserved_read_only"),
+        )
+        .expect("read-only state");
+
+        let error = ensure_jww_source_editable(&project).expect_err("mutation must be rejected");
+
+        assert!(error.starts_with("jww_read_only:"));
+    }
+
+    #[test]
     fn git_tracked_project_can_be_loaded_from_head() {
         let repo = fixture_repo();
-        let base_dir =
-            build_head_base_project(&repo.project_path).expect("HEAD project should build");
-        let project = cad_model::load_project(base_dir.path()).expect("HEAD project should load");
+        let project = HeadSnapshotCache::default()
+            .load(&repo.project_path)
+            .expect("HEAD project should build");
 
         assert_eq!(project.project.name, "desktop-fixture");
         assert_eq!(project.drawings[0].entities.len(), 1);
@@ -2029,8 +2011,9 @@ mod tests {
         run_git(temp.path(), &["add", "."]);
         run_git(temp.path(), &["commit", "-m", "initial"]);
 
-        let base_dir = build_head_base_project(temp.path()).expect("HEAD project should build");
-        let project = cad_model::load_project(base_dir.path()).expect("HEAD project should load");
+        let project = HeadSnapshotCache::default()
+            .load(temp.path())
+            .expect("HEAD project should build");
 
         assert_eq!(project.project.name, "desktop-fixture");
         assert_eq!(project.drawings[0].entities.len(), 1);
@@ -2050,8 +2033,9 @@ mod tests {
         run_git(temp.path(), &["add", "."]);
         run_git(temp.path(), &["commit", "-m", "initial"]);
 
-        let base_dir = build_head_base_project(&project_path).expect("HEAD project should build");
-        let project = cad_model::load_project(base_dir.path()).expect("HEAD project should load");
+        let project = HeadSnapshotCache::default()
+            .load(&project_path)
+            .expect("HEAD project should build");
 
         assert_eq!(project.project.name, "desktop-fixture");
         assert_eq!(project.drawings[0].entities.len(), 1);
@@ -2179,7 +2163,7 @@ mod tests {
         .expect("JWW should import");
 
         assert_eq!(state.project_name, "test1");
-        assert_eq!(state.import_warning_count, Some(2));
+        assert_eq!(state.import_warning_count, Some(1));
         assert!(out_dir.join("build/import-jww-report.json").exists());
     }
 
@@ -2705,77 +2689,6 @@ mod tests {
     }
 
     #[test]
-    fn project_watch_event_filters_and_deduplicates_debounced_changes() {
-        let temp = tempfile::tempdir().expect("tempdir should be created");
-        write_project(temp.path(), false);
-        let root = fs::canonicalize(temp.path()).expect("root should canonicalize");
-        let source = root.join("drawings/plan_1f/entities.ndjson");
-        let changes = vec![
-            notify_debouncer_mini::DebouncedEvent::new(
-                root.join("build/ai-context.json"),
-                notify_debouncer_mini::DebouncedEventKind::Any,
-            ),
-            notify_debouncer_mini::DebouncedEvent::new(
-                source.clone(),
-                notify_debouncer_mini::DebouncedEventKind::Any,
-            ),
-            notify_debouncer_mini::DebouncedEvent::new(
-                source,
-                notify_debouncer_mini::DebouncedEventKind::AnyContinuous,
-            ),
-        ];
-        let event = project_watch_event(&root, &path_string(&root), Ok(changes))
-            .expect("source changes should produce an event");
-
-        assert_eq!(event.kind, ProjectWatchEventKind::Changed);
-        assert_eq!(
-            event.paths,
-            vec!["drawings/plan_1f/entities.ndjson".to_owned()]
-        );
-    }
-
-    #[test]
-    fn project_watcher_emits_real_source_changes() {
-        let _watch_guard = WATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::Builder::new()
-            .prefix("cad-watch-")
-            .tempdir_in("/private/tmp")
-            .expect("tempdir should be created");
-        write_project(temp.path(), false);
-        let (sender, receiver) = mpsc::channel();
-        let _watcher =
-            create_project_watcher(temp.path(), path_string(temp.path()), move |event| {
-                let _ = sender.send(event);
-            })
-            .expect("project watcher should start");
-
-        // Removable/macOS volumes can deliver FSEvents with multi-second latency
-        // under concurrent test load, so keep retrying writes within a bounded window.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut attempt = 0;
-        let event = loop {
-            attempt += 1;
-            let line = format!(
-                r#"{{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[{}.0,0.0]}}"#,
-                1200 + attempt
-            );
-            write_entities(temp.path(), &[&line]);
-            match receiver.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => break event,
-                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("source write should emit a debounced watcher event: {error}"),
-            }
-        };
-        assert_eq!(event.kind, ProjectWatchEventKind::Changed);
-        assert_eq!(
-            event.paths,
-            vec!["drawings/plan_1f/entities.ndjson".to_owned()]
-        );
-    }
-
-    #[test]
     fn replacing_project_watcher_stops_old_project_events() {
         let _watch_guard = WATCH_TEST_LOCK
             .lock()
@@ -2804,23 +2717,6 @@ mod tests {
                 .expect("watcher should exist")
                 ._project_path,
             path_string(&second)
-        );
-    }
-
-    #[test]
-    fn project_watch_errors_are_reported_as_events() {
-        let error = notify_debouncer_mini::notify::Error::generic("watch failed");
-        let event = project_watch_event(Path::new("/project"), "/project", Err(error))
-            .expect("watch error should produce an event");
-
-        assert_eq!(event.kind, ProjectWatchEventKind::Error);
-        assert_eq!(event.project_path, "/project");
-        assert!(event.paths.is_empty());
-        assert!(
-            event
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("watch failed"))
         );
     }
 
@@ -2951,6 +2847,32 @@ mod tests {
             &fs::read(output).expect("JWW should be readable")[..8],
             b"JwwData."
         );
+    }
+
+    #[test]
+    fn preservation_commands_publish_the_exact_imported_jww() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/jww-fixtures/Test1.jww");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("imported");
+        cad_import_jww::import_jww_file(&fixture, &project).expect("JWW import");
+        let preserved = temp.path().join("preserved.jww");
+        let extracted = temp.path().join("original.jww");
+
+        let report = export_jww_preserving(
+            path_string(&project),
+            "test1".to_owned(),
+            path_string(&preserved),
+            false,
+        )
+        .expect("preserved export");
+        extract_original_jww(path_string(&project), path_string(&extracted), false)
+            .expect("original extraction");
+
+        assert_eq!(report.mode, cad_export_jww::ExportMode::PreservedExact);
+        let original = fs::read(fixture).expect("fixture bytes");
+        assert_eq!(fs::read(preserved).expect("preserved bytes"), original);
+        assert_eq!(fs::read(extracted).expect("extracted bytes"), original);
     }
 
     #[test]

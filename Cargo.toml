@@ -32,6 +32,7 @@ cad-export-jww = { path = "crates/cad-export-jww" }
 cad-edit = { path = "crates/cad-edit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 toml = "1"
 toml_edit = "0.25"
 clap = { version = "4", features = ["derive"] }
@@ -44,10 +45,12 @@ svg = "0.18"
 insta = "1"
 encoding_rs = "0.8"
 chrono = "0.4.45"
-notify-debouncer-mini = "0.7"
+notify = "8.2"
 blake3 = "1.8.5"
 geo = { version = "0.33.1", default-features = false }
 rstar = "0.13.0"
+subsetter = { version = "0.2.6", default-features = false }
+ttf-parser = "0.25.1"
 tauri = "2.11.5"
 tauri-build = "2.6.3"
 tauri-plugin-dialog = "2.7.1"

@@ -1,6 +1,9 @@
 //! Direct PDF rendering for the canonical CAD drawing model.
 
-use cad_model::{Entity, LayoutConfig, ProjectSource, SheetOrientation};
+use cad_model::{
+    Entity, LayoutConfig, ProjectSource, ResolvedStroke, SheetOrientation, TextAlign, TextStyleDef,
+};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -8,6 +11,8 @@ use thiserror::Error;
 pub const CRATE_NAME: &str = "cad-render-pdf";
 const MM_TO_PT: f64 = 72.0 / 25.4;
 const MAX_BLOCK_DEPTH: usize = 32;
+const M_PLUS_REGULAR: &[u8] = include_bytes!("../assets/mplus/mplus-1p-regular.ttf");
+const PDF_FONT_NAME: &str = "CADMPL+Mplus1p-Regular";
 
 #[must_use]
 pub fn crate_name() -> &'static str {
@@ -39,6 +44,8 @@ pub enum PdfError {
     InvalidLayout(String),
     #[error("project checker failed: {0}")]
     CheckFailed(String),
+    #[error("PDF style resolution failed: {0}")]
+    Style(String),
     #[error("output already exists: {0}")]
     OutputExists(PathBuf),
     #[error("failed to write {path}")]
@@ -173,13 +180,14 @@ pub fn render_drawing_pdf(
     };
     validate_layout(layout, paper_width, paper_height)?;
     let scale = parse_scale(&layout.scale)?;
-    let mut content = PdfContent::new(paper_width, paper_height, scale, layout);
+    let mut content = PdfContent::new(paper_width, paper_height, scale, layout)?;
     for record in &drawing.entities {
         if is_printable_entity(project, &record.entity) {
-            content.entity(project, &record.entity, 0, Transform::identity());
+            content.entity(project, &record.entity, 0, Transform::identity())?;
         }
     }
-    Ok(build_pdf(paper_width, paper_height, &content.commands))
+    let (commands, font) = content.finish()?;
+    build_pdf(paper_width, paper_height, &commands, &font)
 }
 
 fn is_printable_entity(project: &ProjectSource, entity: &Entity) -> bool {
@@ -319,14 +327,20 @@ impl Transform {
 
 struct PdfContent<'a> {
     commands: Vec<String>,
+    font: PdfFontSubset,
     scale: f64,
     layout: &'a LayoutConfig,
     paper_height: f64,
 }
 
 impl<'a> PdfContent<'a> {
-    fn new(paper_width: f64, paper_height: f64, scale: f64, layout: &'a LayoutConfig) -> Self {
-        Self {
+    fn new(
+        paper_width: f64,
+        paper_height: f64,
+        scale: f64,
+        layout: &'a LayoutConfig,
+    ) -> PdfResult<Self> {
+        Ok(Self {
             commands: {
                 let mut commands = Vec::new();
                 let left = layout.margins[0] * MM_TO_PT;
@@ -363,10 +377,15 @@ impl<'a> PdfContent<'a> {
                 }
                 commands
             },
+            font: PdfFontSubset::new()?,
             scale,
             layout,
             paper_height,
-        }
+        })
+    }
+
+    fn finish(self) -> PdfResult<(Vec<String>, EmbeddedPdfFont)> {
+        Ok((self.commands, self.font.finish()?))
     }
 
     fn point(&self, point: [f64; 2], transform: Transform) -> [f64; 2] {
@@ -379,16 +398,45 @@ impl<'a> PdfContent<'a> {
         [x, y]
     }
 
+    fn begin_style(&mut self, stroke: &ResolvedStroke) -> PdfResult<()> {
+        let [red, green, blue] = pdf_rgb(&stroke.print_color_rgb)?;
+        let dash = stroke
+            .dash
+            .iter()
+            .map(|value| fmt(value * MM_TO_PT / self.scale))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.commands.push(format!(
+            "q {} {} {} RG {} w [{}] 0 d",
+            fmt(red),
+            fmt(green),
+            fmt(blue),
+            fmt(stroke.line_width_mm * MM_TO_PT),
+            dash
+        ));
+        Ok(())
+    }
+
+    fn set_fill_color(&mut self, color: &str) -> PdfResult<()> {
+        let [red, green, blue] = pdf_rgb(color)?;
+        self.commands
+            .push(format!("{} {} {} rg", fmt(red), fmt(green), fmt(blue)));
+        Ok(())
+    }
+
     fn entity(
         &mut self,
         project: &ProjectSource,
         entity: &Entity,
         depth: usize,
         transform: Transform,
-    ) {
+    ) -> PdfResult<()> {
         if depth > MAX_BLOCK_DEPTH {
-            return;
+            return Ok(());
         }
+        let stroke = cad_model::resolve_entity_stroke(project, entity)
+            .map_err(|error| PdfError::Style(error.to_string()))?;
+        self.begin_style(&stroke)?;
         match entity {
             Entity::Line { p1, p2, .. } => self.line(transform, *p1, *p2),
             Entity::Polyline { points, closed, .. } => self.polyline(transform, points, *closed),
@@ -417,17 +465,98 @@ impl<'a> PdfContent<'a> {
                 *start_deg,
                 *end_deg,
             ),
-            Entity::Solid { points, .. } => self.polygon(transform, points, true),
-            Entity::Hatch { loops, .. } => self.hatch(transform, loops),
+            Entity::Solid { points, fill, .. } => {
+                let fill = cad_model::resolve_print_fill_color(project, entity, fill)
+                    .map_err(|error| PdfError::Style(error.to_string()))?;
+                self.set_fill_color(&fill)?;
+                self.polygon(transform, points, true);
+            }
+            Entity::Hatch { loops, fill, .. } => {
+                let fill = fill
+                    .as_deref()
+                    .map(|fill| cad_model::resolve_print_fill_color(project, entity, fill))
+                    .transpose()
+                    .map_err(|error| PdfError::Style(error.to_string()))?
+                    .unwrap_or_else(|| stroke.print_color_rgb.clone());
+                self.set_fill_color(&fill)?;
+                self.hatch(transform, loops);
+            }
             Entity::Text {
                 at,
                 value,
                 rotation_deg,
+                mirror_y,
+                style,
                 ..
-            } => self.text(transform, *at, value, *rotation_deg),
-            Entity::Dimension { p1, p2, .. } => self.line(transform, *p1, *p2),
-            Entity::Point { at, .. } => self.circle(transform, *at, 0.5),
-            Entity::CurveSolid { center, radius, .. } => self.circle(transform, *center, *radius),
+            } => {
+                let style = project.styles.text_styles.get(style).ok_or_else(|| {
+                    PdfError::Style(format!(
+                        "text entity {:?} references missing style {style:?}",
+                        entity.id().as_str()
+                    ))
+                })?;
+                self.text(
+                    transform,
+                    *at,
+                    value,
+                    *rotation_deg,
+                    *mirror_y,
+                    style,
+                    &stroke.print_color_rgb,
+                    None,
+                )?;
+            }
+            Entity::Dimension {
+                style,
+                p1,
+                p2,
+                offset,
+                text_rotation_deg,
+                text_mirror_y,
+                value,
+                ..
+            } => self.dimension(
+                project,
+                entity,
+                transform,
+                style,
+                *p1,
+                *p2,
+                *offset,
+                *text_rotation_deg,
+                *text_mirror_y,
+                value.as_deref(),
+                &stroke,
+            )?,
+            Entity::Point { at, .. } => {
+                self.set_fill_color(&stroke.print_color_rgb)?;
+                self.circle_fill(transform, *at, 0.5);
+            }
+            Entity::CurveSolid {
+                center,
+                radius,
+                flatness,
+                rotation_deg,
+                start_deg,
+                end_deg,
+                solid_param,
+                fill,
+                ..
+            } => {
+                let fill = cad_model::resolve_print_fill_color(project, entity, fill)
+                    .map_err(|error| PdfError::Style(error.to_string()))?;
+                self.set_fill_color(&fill)?;
+                self.curve_solid(
+                    transform,
+                    *center,
+                    radius.abs(),
+                    radius.abs() * flatness.abs(),
+                    *rotation_deg,
+                    *start_deg,
+                    *end_deg,
+                    *solid_param,
+                );
+            }
             Entity::BlockRef {
                 block,
                 at,
@@ -444,12 +573,14 @@ impl<'a> PdfContent<'a> {
                     ));
                     for record in &definition.entities {
                         if is_printable_entity(project, &record.entity) {
-                            self.entity(project, &record.entity, depth + 1, nested);
+                            self.entity(project, &record.entity, depth + 1, nested)?;
                         }
                     }
                 }
             }
         }
+        self.commands.push("Q".to_owned());
+        Ok(())
     }
 
     fn line(&mut self, transform: Transform, p1: [f64; 2], p2: [f64; 2]) {
@@ -516,6 +647,11 @@ impl<'a> PdfContent<'a> {
         self.arc(transform, center, radius, 0.0, 360.0);
     }
 
+    fn circle_fill(&mut self, transform: Transform, center: [f64; 2], radius: f64) {
+        let points = sampled_ellipse(center, radius, radius, 0.0, 0.0, 360.0);
+        self.polygon(transform, &points, true);
+    }
+
     fn arc(&mut self, transform: Transform, center: [f64; 2], radius: f64, start: f64, end: f64) {
         let steps = ((end - start).abs() / 15.0).ceil().max(2.0) as usize;
         let points = (0..=steps)
@@ -556,33 +692,343 @@ impl<'a> PdfContent<'a> {
         self.polyline(transform, &points, false);
     }
 
-    fn text(&mut self, transform: Transform, at: [f64; 2], value: &str, rotation: f64) {
-        let point = self.point(at, transform);
-        let safe = value
-            .chars()
-            .map(|character| if character.is_ascii() { character } else { '?' })
-            .collect::<String>()
-            .replace('\\', "\\\\")
-            .replace('(', "\\(")
-            .replace(')', "\\)");
+    #[allow(clippy::too_many_arguments)]
+    fn text(
+        &mut self,
+        transform: Transform,
+        at: [f64; 2],
+        value: &str,
+        rotation: f64,
+        mirror_y: bool,
+        style: &TextStyleDef,
+        color: &str,
+        align: Option<TextAlign>,
+    ) -> PdfResult<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        self.set_fill_color(color)?;
+        let align = align.as_ref().unwrap_or(&style.align);
+        let length = text_length(value, style);
+        let start = match align {
+            TextAlign::Left => 0.0,
+            TextAlign::Center => -length / 2.0,
+            TextAlign::Right => -length,
+        };
         let angle = rotation.to_radians();
-        let cos = angle.cos();
-        let sin = angle.sin();
-        let a = transform.a * cos + transform.c * sin;
-        let world_y = transform.b * cos + transform.d * sin;
-        let b = -world_y;
-        let c = world_y;
-        let d = a;
+        let x_axis = [angle.cos(), angle.sin()];
+        // PDF glyph space is Y-up, while model Y is mapped through the paper's
+        // top edge. Reverse the local text Y axis unless mirror_y explicitly
+        // requests the reflected glyph transform.
+        let y_sign = if mirror_y { 1.0 } else { -1.0 };
+        let y_axis = [-angle.sin() * y_sign, angle.cos() * y_sign];
+        let origin = |x: f64, y: f64| {
+            self.point(
+                [
+                    at[0] + x_axis[0] * x + y_axis[0] * y,
+                    at[1] + x_axis[1] * x + y_axis[1] * y,
+                ],
+                transform,
+            )
+        };
+        let base = origin(0.0, 0.0);
+        let width = origin(style.width, 0.0);
+        let height = origin(0.0, style.height);
+        let matrix = [
+            width[0] - base[0],
+            width[1] - base[1],
+            height[0] - base[0],
+            height[1] - base[1],
+        ];
+        let advance = style.width + style.spacing;
+        let positions = value
+            .chars()
+            .enumerate()
+            .map(|(index, character)| (origin(start + index as f64 * advance, 0.0), character))
+            .collect::<Vec<_>>();
         self.commands.push(format!(
-            "BT /F1 10 Tf {} {} {} {} {} {} Tm ({}) Tj ET",
-            fmt(a),
-            fmt(b),
-            fmt(c),
-            fmt(d),
-            fmt(point[0]),
-            fmt(point[1]),
-            safe
+            "BT /{} 1 Tf",
+            pdf_font_resource(&style.font_family)
         ));
+        for (position, character) in positions {
+            self.commands.push(format!(
+                "{} {} {} {} {} {} Tm <{}> Tj",
+                fmt(matrix[0]),
+                fmt(matrix[1]),
+                fmt(matrix[2]),
+                fmt(matrix[3]),
+                fmt(position[0]),
+                fmt(position[1]),
+                self.font.cid_hex(character)?
+            ));
+        }
+        self.commands.push("ET".to_owned());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dimension(
+        &mut self,
+        project: &ProjectSource,
+        entity: &Entity,
+        transform: Transform,
+        style_id: &str,
+        p1: [f64; 2],
+        p2: [f64; 2],
+        offset: f64,
+        text_rotation: f64,
+        text_mirror_y: bool,
+        value: Option<&str>,
+        stroke: &ResolvedStroke,
+    ) -> PdfResult<()> {
+        let dimension_style = project
+            .styles
+            .dimension_styles
+            .get(style_id)
+            .ok_or_else(|| {
+                PdfError::Style(format!(
+                    "dimension entity {:?} references missing style {style_id:?}",
+                    entity.id().as_str()
+                ))
+            })?;
+        let text_style = project
+            .styles
+            .text_styles
+            .get(&dimension_style.text_style)
+            .ok_or_else(|| {
+                PdfError::Style(format!(
+                    "dimension entity {:?} references missing text style {:?}",
+                    entity.id().as_str(),
+                    dimension_style.text_style
+                ))
+            })?;
+        let (d1, d2) = cad_model::dimension_offset_segment(p1, p2, offset).ok_or_else(|| {
+            PdfError::Style(format!(
+                "dimension entity {:?} has invalid geometry",
+                entity.id().as_str()
+            ))
+        })?;
+        let extension_start = |source: [f64; 2], target: [f64; 2]| {
+            let dx = target[0] - source[0];
+            let dy = target[1] - source[1];
+            let length = (dx * dx + dy * dy).sqrt();
+            if length <= f64::EPSILON {
+                source
+            } else {
+                let gap = dimension_style.extension_gap.min(length);
+                [source[0] + dx / length * gap, source[1] + dy / length * gap]
+            }
+        };
+        self.line(transform, extension_start(p1, d1), d1);
+        self.line(transform, extension_start(p2, d2), d2);
+        self.line(transform, d1, d2);
+        self.dimension_arrow(
+            transform,
+            d1,
+            d2,
+            dimension_style.arrow_size,
+            &stroke.print_color_rgb,
+        )?;
+        self.dimension_arrow(
+            transform,
+            d2,
+            d1,
+            dimension_style.arrow_size,
+            &stroke.print_color_rgb,
+        )?;
+        let measured = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
+        let label = value.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "{:.*} {}",
+                usize::from(dimension_style.precision),
+                measured,
+                dimension_style.unit
+            )
+        });
+        self.text(
+            transform,
+            [(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+            &label,
+            text_rotation,
+            text_mirror_y,
+            text_style,
+            &stroke.print_color_rgb,
+            Some(TextAlign::Center),
+        )
+    }
+
+    fn dimension_arrow(
+        &mut self,
+        transform: Transform,
+        tip: [f64; 2],
+        toward: [f64; 2],
+        size: f64,
+        color: &str,
+    ) -> PdfResult<()> {
+        let dx = toward[0] - tip[0];
+        let dy = toward[1] - tip[1];
+        let length = (dx * dx + dy * dy).sqrt();
+        if length <= f64::EPSILON {
+            return Ok(());
+        }
+        let ux = dx / length;
+        let uy = dy / length;
+        let base = [tip[0] + ux * size, tip[1] + uy * size];
+        let half = size * 0.35;
+        let points = [
+            tip,
+            [base[0] - uy * half, base[1] + ux * half],
+            [base[0] + uy * half, base[1] - ux * half],
+        ];
+        self.set_fill_color(color)?;
+        self.polygon(transform, &points, true);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn curve_solid(
+        &mut self,
+        transform: Transform,
+        center: [f64; 2],
+        radius_x: f64,
+        radius_y: f64,
+        rotation: f64,
+        start: f64,
+        end: f64,
+        solid_param: f64,
+    ) {
+        let mut points = sampled_ellipse(center, radius_x, radius_y, rotation, start, end);
+        let full = (end - start).abs() >= 360.0 - 1e-9;
+        if solid_param > 0.0 && solid_param < radius_x {
+            let ratio = solid_param / radius_x;
+            let mut inner =
+                sampled_ellipse(center, solid_param, radius_y * ratio, rotation, start, end);
+            inner.reverse();
+            points.extend(inner);
+        } else if !full {
+            points.push(center);
+        }
+        self.polygon(transform, &points, true);
+    }
+}
+
+fn text_length(value: &str, style: &TextStyleDef) -> f64 {
+    let count = value.chars().count();
+    ((count as f64) * style.width + (count.saturating_sub(1) as f64) * style.spacing).max(0.0)
+}
+
+struct PdfFontSubset {
+    face: ttf_parser::Face<'static>,
+    remapper: subsetter::GlyphRemapper,
+    unicode_by_cid: BTreeMap<u16, char>,
+    width_by_cid: BTreeMap<u16, u16>,
+}
+
+struct EmbeddedPdfFont {
+    bytes: Vec<u8>,
+    unicode_by_cid: BTreeMap<u16, char>,
+    width_by_cid: BTreeMap<u16, u16>,
+    units_per_em: u16,
+    ascender: i16,
+    descender: i16,
+    cap_height: i16,
+    bbox: ttf_parser::Rect,
+}
+
+impl PdfFontSubset {
+    fn new() -> PdfResult<Self> {
+        let face = ttf_parser::Face::parse(M_PLUS_REGULAR, 0)
+            .map_err(|error| PdfError::Style(format!("bundled M+ font is invalid: {error:?}")))?;
+        Ok(Self {
+            face,
+            remapper: subsetter::GlyphRemapper::new(),
+            unicode_by_cid: BTreeMap::new(),
+            width_by_cid: BTreeMap::new(),
+        })
+    }
+
+    fn cid_hex(&mut self, character: char) -> PdfResult<String> {
+        let glyph = self.face.glyph_index(character).ok_or_else(|| {
+            PdfError::Style(format!(
+                "bundled PDF font has no glyph for U+{:04X}",
+                u32::from(character)
+            ))
+        })?;
+        let cid = self.remapper.remap(glyph.0);
+        self.unicode_by_cid.entry(cid).or_insert(character);
+        // CAD text width is an explicit character-cell width. Advertising a
+        // 1000-unit CID advance keeps extraction and selection consistent with
+        // the independently positioned cells instead of the font's proportional
+        // Latin metrics.
+        self.width_by_cid.insert(cid, 1000);
+        Ok(format!("{cid:04X}"))
+    }
+
+    fn finish(self) -> PdfResult<EmbeddedPdfFont> {
+        let bytes = subsetter::subset(M_PLUS_REGULAR, 0, &self.remapper).map_err(|error| {
+            PdfError::Style(format!("failed to subset bundled M+ font: {error}"))
+        })?;
+        Ok(EmbeddedPdfFont {
+            bytes,
+            unicode_by_cid: self.unicode_by_cid,
+            width_by_cid: self.width_by_cid,
+            units_per_em: self.face.units_per_em(),
+            ascender: self.face.ascender(),
+            descender: self.face.descender(),
+            cap_height: self
+                .face
+                .capital_height()
+                .unwrap_or_else(|| self.face.ascender()),
+            bbox: self.face.global_bounding_box(),
+        })
+    }
+}
+
+fn scale_font_metric(value: i32, units_per_em: u16) -> i32 {
+    ((f64::from(value) * 1000.0) / f64::from(units_per_em)).round() as i32
+}
+
+fn sampled_ellipse(
+    center: [f64; 2],
+    radius_x: f64,
+    radius_y: f64,
+    rotation: f64,
+    start: f64,
+    end: f64,
+) -> Vec<[f64; 2]> {
+    let steps = ((end - start).abs() / 7.5).ceil().max(4.0) as usize;
+    let rotation = rotation.to_radians();
+    (0..=steps)
+        .map(|index| {
+            let angle = (start + (end - start) * index as f64 / steps as f64).to_radians();
+            let local = [radius_x * angle.cos(), radius_y * angle.sin()];
+            [
+                center[0] + local[0] * rotation.cos() - local[1] * rotation.sin(),
+                center[1] + local[0] * rotation.sin() + local[1] * rotation.cos(),
+            ]
+        })
+        .collect()
+}
+
+fn pdf_rgb(value: &str) -> PdfResult<[f64; 3]> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    if value.len() != 6 || !value.is_ascii() {
+        return Err(PdfError::Style(format!("invalid RGB color #{value}")));
+    }
+    let component = |range: std::ops::Range<usize>| {
+        u8::from_str_radix(&value[range], 16)
+            .map(|component| f64::from(component) / 255.0)
+            .map_err(|_| PdfError::Style(format!("invalid RGB color #{value}")))
+    };
+    Ok([component(0..2)?, component(2..4)?, component(4..6)?])
+}
+
+fn pdf_font_resource(font_family: &str) -> &'static str {
+    let family = font_family.to_ascii_lowercase();
+    if family.contains("serif") || family.contains("mincho") || family.contains("明朝") {
+        "F2"
+    } else {
+        "F1"
     }
 }
 
@@ -590,7 +1036,12 @@ fn fmt(value: f64) -> String {
     format!("{value:.4}")
 }
 
-fn build_pdf(width_mm: f64, height_mm: f64, commands: &[String]) -> Vec<u8> {
+fn build_pdf(
+    width_mm: f64,
+    height_mm: f64,
+    commands: &[String],
+    font: &EmbeddedPdfFont,
+) -> PdfResult<Vec<u8>> {
     let width = width_mm * MM_TO_PT;
     let height = height_mm * MM_TO_PT;
     let stream = if commands.is_empty() {
@@ -598,24 +1049,48 @@ fn build_pdf(width_mm: f64, height_mm: f64, commands: &[String]) -> Vec<u8> {
     } else {
         format!("{}\nQ", commands.join("\n"))
     };
-    let objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-        format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
-        ),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
-        format!(
-            "<< /Length {} >>\nstream\n{}\nendstream",
-            stream.len(),
-            stream
-        ),
+    let units = font.units_per_em;
+    let bbox = font.bbox;
+    let widths = font
+        .width_by_cid
+        .iter()
+        .map(|(cid, width)| format!("{cid} [{width}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let to_unicode = to_unicode_cmap(&font.unicode_by_cid);
+    let objects = vec![
+        ascii_object("<< /Type /Catalog /Pages 2 0 R >>"),
+        ascii_object("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        ascii_object(&format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 4 0 R /F2 4 0 R >> >> /Contents 9 0 R >>"
+        )),
+        ascii_object(&format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{PDF_FONT_NAME} /Encoding /Identity-H /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>"
+        )),
+        ascii_object(&format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{PDF_FONT_NAME} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 6 0 R /DW 1000 /W [{widths}] /CIDToGIDMap /Identity >>"
+        )),
+        ascii_object(&format!(
+            "<< /Type /FontDescriptor /FontName /{PDF_FONT_NAME} /Flags 32 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 8 0 R >>",
+            scale_font_metric(i32::from(bbox.x_min), units),
+            scale_font_metric(i32::from(bbox.y_min), units),
+            scale_font_metric(i32::from(bbox.x_max), units),
+            scale_font_metric(i32::from(bbox.y_max), units),
+            scale_font_metric(i32::from(font.ascender), units),
+            scale_font_metric(i32::from(font.descender), units),
+            scale_font_metric(i32::from(font.cap_height), units),
+        )),
+        stream_object(to_unicode.as_bytes(), None),
+        stream_object(&font.bytes, Some(font.bytes.len())),
+        stream_object(stream.as_bytes(), None),
     ];
     let mut pdf = b"%PDF-1.4\n%\xFF\xFF\xFF\xFF\n".to_vec();
     let mut offsets = Vec::new();
     for (index, object) in objects.iter().enumerate() {
         offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
     }
     let xref = pdf.len();
     pdf.extend_from_slice(
@@ -632,7 +1107,47 @@ fn build_pdf(width_mm: f64, height_mm: f64, commands: &[String]) -> Vec<u8> {
         )
         .as_bytes(),
     );
-    pdf
+    Ok(pdf)
+}
+
+fn ascii_object(value: &str) -> Vec<u8> {
+    value.as_bytes().to_vec()
+}
+
+fn stream_object(bytes: &[u8], length1: Option<usize>) -> Vec<u8> {
+    let mut object = match length1 {
+        Some(length1) => {
+            format!("<< /Length {} /Length1 {length1} >>\nstream\n", bytes.len()).into_bytes()
+        }
+        None => format!("<< /Length {} >>\nstream\n", bytes.len()).into_bytes(),
+    };
+    object.extend_from_slice(bytes);
+    object.extend_from_slice(b"\nendstream");
+    object
+}
+
+fn to_unicode_cmap(unicode_by_cid: &BTreeMap<u16, char>) -> String {
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /CADMPlusToUnicode def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    for chunk in unicode_by_cid.iter().collect::<Vec<_>>().chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for (cid, character) in chunk {
+            cmap.push_str(&format!("<{cid:04X}> <{}>\n", utf16be_hex(**character)));
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    cmap
+}
+
+fn utf16be_hex(character: char) -> String {
+    let mut units = [0_u16; 2];
+    character
+        .encode_utf16(&mut units)
+        .iter()
+        .map(|unit| format!("{unit:04X}"))
+        .collect()
 }
 
 fn publish(output: &Path, bytes: &[u8], overwrite: bool) -> PdfResult<()> {
@@ -665,10 +1180,37 @@ mod tests {
             margins: [0.0; 4],
             plot_area: None,
         };
-        let content = PdfContent::new(210.0, 297.0, 1.0, &layout);
-        let pdf = build_pdf(210.0, 297.0, &content.commands);
+        let content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
+        let (commands, font) = content.finish().expect("embedded font");
+        let pdf = build_pdf(210.0, 297.0, &commands, &font).expect("PDF");
         assert!(pdf.starts_with(b"%PDF-1.4"));
         assert!(String::from_utf8_lossy(&pdf).contains("595.2756 841.8898"));
+    }
+
+    #[test]
+    fn rejects_non_ascii_rgb_without_panicking() {
+        let error = pdf_rgb("aééx").expect_err("invalid RGB should fail");
+        assert!(matches!(error, PdfError::Style(_)));
+    }
+
+    #[test]
+    fn embedded_font_subset_is_deterministic_and_rejects_missing_glyphs() {
+        let make_subset = || {
+            let mut font = PdfFontSubset::new().expect("bundled font");
+            assert_eq!(font.cid_hex('和').expect("Japanese glyph"), "0001");
+            assert_eq!(font.cid_hex('室').expect("Japanese glyph"), "0002");
+            font.finish().expect("font subset")
+        };
+        let first = make_subset();
+        let second = make_subset();
+        assert_eq!(first.bytes, second.bytes);
+        assert!(first.bytes.len() < M_PLUS_REGULAR.len());
+
+        let mut font = PdfFontSubset::new().expect("bundled font");
+        let error = font
+            .cid_hex('\u{1F9EA}')
+            .expect_err("unsupported emoji must not become a replacement glyph");
+        assert!(error.to_string().contains("U+1F9EA"));
     }
 
     #[test]
@@ -738,13 +1280,18 @@ mod tests {
             margins: [0.0; 4],
             plot_area: None,
         };
-        let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout);
+        let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
 
-        content.entity(&project, &reference, 0, Transform::identity());
+        content
+            .entity(&project, &reference, 0, Transform::identity())
+            .expect("block should render");
 
         let commands = content.commands.join("\n");
         assert!(commands.contains("283.4646 274.9606 m 283.4646 218.2677 l S"));
-        assert!(commands.contains("BT /F1 10 Tf 0.0000 -2.0000 2.0000 0.0000"));
+        assert!(commands.contains("BT /F1 1 Tf"));
+        assert!(commands.contains("-708.6614"));
+        assert!(commands.contains("1417.3228"));
+        assert!(commands.contains("<0001> Tj"));
     }
 
     #[test]
@@ -764,9 +1311,11 @@ mod tests {
             margins: [0.0; 4],
             plot_area: None,
         };
-        let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout);
+        let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
 
-        content.entity(&project, &hatch, 0, Transform::identity());
+        content
+            .entity(&project, &hatch, 0, Transform::identity())
+            .expect("hatch should render");
 
         let fill = content
             .commands
@@ -782,6 +1331,122 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn applies_pen_dash_unicode_text_and_dimension_style() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).expect("example");
+        project.styles.colors.insert(
+            "red".to_owned(),
+            cad_model::ColorDef {
+                rgb: "#FF0000".to_owned(),
+                print_rgb: Some("#00FF00".to_owned()),
+                print_width: 0.5,
+            },
+        );
+        project.styles.line_types.insert(
+            "dash".to_owned(),
+            cad_model::LineTypeDef {
+                dash: vec![120.0, 60.0],
+            },
+        );
+        project.styles.pens.insert(
+            "red_dash".to_owned(),
+            cad_model::PenStyleDef {
+                color: "red".to_owned(),
+                line_type: "dash".to_owned(),
+                line_width: 0.5,
+            },
+        );
+        let text: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","pen":"red_dash","style":"note","at":[1000.0,1000.0],"rotation_deg":0.0,"value":"和室"}"#,
+        )
+        .expect("text");
+        let dimension: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","pen":"red_dash","style":"dim_100","p1":[0.0,0.0],"p2":[910.0,0.0],"offset":120.0,"value":null}"#,
+        )
+        .expect("dimension");
+        let layout = LayoutConfig {
+            name: "default".to_owned(),
+            paper: "A4".to_owned(),
+            orientation: SheetOrientation::Landscape,
+            scale: "1/100".to_owned(),
+            origin: [0.0, 0.0],
+            margins: [10.0; 4],
+            plot_area: None,
+        };
+        let mut content = PdfContent::new(297.0, 210.0, 100.0, &layout).expect("PDF content");
+        content
+            .entity(&project, &text, 0, Transform::identity())
+            .expect("text should render");
+        content
+            .entity(&project, &dimension, 0, Transform::identity())
+            .expect("dimension should render");
+
+        let commands = content.commands.join("\n");
+        assert!(commands.contains("0.0000 1.0000 0.0000 RG"));
+        assert!(commands.contains("0.0000 1.0000 0.0000 rg"));
+        assert!(!commands.contains("1.0000 0.0000 0.0000 rg"));
+        assert!(commands.contains("1.4173 w [3.4016 1.7008] 0 d"));
+        assert!(commands.contains(" h f"));
+
+        let (commands, font) = content.finish().expect("embedded font");
+        assert!(font.bytes.len() < M_PLUS_REGULAR.len());
+        let pdf = build_pdf(297.0, 210.0, &commands, &font).expect("PDF");
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Subtype /Type0"));
+        assert!(source.contains("/Encoding /Identity-H"));
+        assert!(source.contains("/FontFile2"));
+        assert!(source.contains("/ToUnicode"));
+        assert!(!source.contains("Heisei"));
+        assert_valid_xref(&pdf);
+        if let Ok(path) = std::env::var("CAD_PDF_TEST_OUTPUT") {
+            fs::write(path, pdf).expect("visual PDF fixture should be written");
+        }
+    }
+
+    fn assert_valid_xref(pdf: &[u8]) {
+        let marker = b"startxref\n";
+        let marker_index = pdf
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .expect("startxref marker");
+        let offset_start = marker_index + marker.len();
+        let offset_end = pdf[offset_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| offset_start + index)
+            .expect("startxref value");
+        let xref_offset = std::str::from_utf8(&pdf[offset_start..offset_end])
+            .expect("xref offset should be ASCII")
+            .parse::<usize>()
+            .expect("xref offset should be numeric");
+        assert!(pdf[xref_offset..].starts_with(b"xref\n0 "));
+
+        let lines = pdf[xref_offset..]
+            .split(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let object_count = std::str::from_utf8(lines[1])
+            .expect("xref count should be ASCII")
+            .split_whitespace()
+            .nth(1)
+            .expect("xref count")
+            .parse::<usize>()
+            .expect("xref count should be numeric");
+        for object_number in 1..object_count {
+            let offset = std::str::from_utf8(lines[2 + object_number])
+                .expect("xref entry should be ASCII")
+                .split_whitespace()
+                .next()
+                .expect("xref entry offset")
+                .parse::<usize>()
+                .expect("xref entry offset should be numeric");
+            assert!(
+                pdf[offset..].starts_with(format!("{object_number} 0 obj").as_bytes()),
+                "xref entry {object_number} points at the wrong object"
+            );
+        }
     }
 
     #[test]

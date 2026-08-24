@@ -1,6 +1,9 @@
 # JWW Fixtures
 
-These fixtures are used only for one-way JWW import regression tests.
+These fixtures cover JWW inspection, byte-exact original retention, import,
+preservation export, generated export, and re-import regression tests.
+`manifest.json` fixes the required hashes and decoded record inventory.
+External application checks are optional evidence, not a release gate.
 
 ## Test1.jww
 

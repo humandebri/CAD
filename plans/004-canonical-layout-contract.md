@@ -43,7 +43,7 @@ the current schema `0.2` behavior.
 
 - Supporting schema 0.1
 - `cadc migrate` or automatic sheet-to-layout conversion
-- PDF style fidelity and Windows/Jw_cad validation
+- PDF style fidelity and JWW file-level compatibility validation
 
 ## Steps
 
@@ -69,7 +69,7 @@ tests pass; no test requires schema 0.1.
 
 Update ADR, README, and `plan.md` to state: schema 0.2 only, layouts.toml is
 canonical, blocks are preserved by default, PDF/JWW are implemented but JWW
-remains Experimental pending Windows validation, and the next hardening plans
+remains limited to the recorded fixture corpus, and the next hardening plans
 are the release gates in `plans/README.md`. Remove contradictory MVP statements
 instead of adding more superseding paragraphs.
 

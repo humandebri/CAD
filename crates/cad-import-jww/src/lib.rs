@@ -17,6 +17,7 @@ use rustix::fs::{CWD, RenameFlags, renameat_with};
 use rustix::io::Errno;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::f64::consts::PI;
@@ -40,6 +41,8 @@ pub fn crate_name() -> &'static str {
 
 #[derive(Debug, Error)]
 pub enum ImportError {
+    #[error("failed to inspect CAD source while preserving JWW")]
+    Model(#[from] cad_model::ModelError),
     #[error("failed to read {path}")]
     Read {
         path: PathBuf,
@@ -80,6 +83,10 @@ pub enum ImportError {
     EmptyImport,
     #[error("failed to serialize import output")]
     Serialize(#[from] serde_json::Error),
+    #[error("failed to serialize JWW preservation manifest")]
+    SerializePreservation(#[from] toml::ser::Error),
+    #[error("JWW file is malformed: {0}")]
+    Malformed(String),
 }
 
 impl From<cad_jww_codec::CodecError> for ImportError {
@@ -116,6 +123,9 @@ pub struct ImportReport {
     pub jww_paper_size: u32,
     pub jww_memo: String,
     pub supported_entities: usize,
+    pub compatibility_state: cad_model::JwwCompatibilityState,
+    pub compatibility_reason: Option<String>,
+    pub edit_capability: cad_model::JwwEditCapability,
     pub warnings: Vec<ImportWarning>,
 }
 
@@ -169,7 +179,14 @@ pub fn import_jww_file_with_options(
         path: input_path.to_path_buf(),
         source,
     })?;
-    let document = read_document(&data)?;
+    let inspection = cad_jww_codec::inspect_document(&data);
+    if inspection.state == cad_jww_codec::JwwCompatibilityState::Malformed {
+        return Err(ImportError::Malformed(
+            inspection
+                .reason
+                .unwrap_or_else(|| "unknown codec error".to_owned()),
+        ));
+    }
     let parent = out_dir
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -185,7 +202,19 @@ pub fn import_jww_file_with_options(
             path: parent.to_path_buf(),
             source,
         })?;
-    let report = write_project(input_path, staging.path(), out_dir, &document, options)?;
+    let report = if inspection.state == cad_jww_codec::JwwCompatibilityState::EditableLossless {
+        let document = read_document(&data)?;
+        write_project(
+            input_path,
+            staging.path(),
+            out_dir,
+            &data,
+            &document,
+            options,
+        )?
+    } else {
+        write_read_only_project(input_path, staging.path(), out_dir, &data, &inspection)?
+    };
     publish_project(staging.path(), out_dir)?;
     Ok(report)
 }
@@ -209,6 +238,7 @@ fn write_project(
     input_path: &Path,
     write_dir: &Path,
     project_dir: &Path,
+    original_bytes: &[u8],
     document: &JwwDocument,
     options: ImportOptions,
 ) -> ImportResult<ImportReport> {
@@ -224,13 +254,6 @@ fn write_project(
     if converted.entities.is_empty() {
         return Err(ImportError::EmptyImport);
     }
-    converted.warnings.push(ImportWarning {
-        code: "color_mapping_defaulted".to_owned(),
-        message: "JWW header color table is not parsed; default pen color mapping is used"
-            .to_owned(),
-        record_type: "style".to_owned(),
-    });
-
     fs::create_dir_all(write_dir.join("rules")).map_err(|source| ImportError::Write {
         path: write_dir.join("rules"),
         source,
@@ -308,6 +331,16 @@ fn write_project(
             .join("entities.ndjson"),
         &(converted.entities.join("\n") + "\n"),
     )?;
+    let provenance = build_record_provenance(document, &converted, &drawing_name)?;
+    write_jww_preservation(
+        write_dir,
+        original_bytes,
+        &drawing_name,
+        cad_model::JwwCompatibilityState::EditableLossless,
+        Some(document.header.version),
+        None,
+        provenance.as_deref(),
+    )?;
 
     let report = ImportReport {
         schema_version: CAD_SCHEMA_VERSION.to_owned(),
@@ -319,6 +352,13 @@ fn write_project(
         jww_paper_size: document.header.paper_size,
         jww_memo: document.header.memo.clone(),
         supported_entities: converted.entities.len(),
+        compatibility_state: cad_model::JwwCompatibilityState::EditableLossless,
+        compatibility_reason: None,
+        edit_capability: if provenance.is_some() {
+            cad_model::JwwEditCapability::MappedV600
+        } else {
+            cad_model::JwwEditCapability::ExactOnly
+        },
         warnings: converted.warnings,
     };
     write_text(
@@ -326,6 +366,269 @@ fn write_project(
         &format!("{}\n", serde_json::to_string_pretty(&report)?),
     )?;
     Ok(report)
+}
+
+fn write_read_only_project(
+    input_path: &Path,
+    write_dir: &Path,
+    project_dir: &Path,
+    original_bytes: &[u8],
+    inspection: &cad_jww_codec::JwwCompatibilityInspection,
+) -> ImportResult<ImportReport> {
+    let project_name = sanitize_name(
+        input_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("jww_preserved"),
+    );
+    let drawing_name = project_name.clone();
+    fs::create_dir_all(write_dir.join("rules")).map_err(|source| ImportError::Write {
+        path: write_dir.join("rules"),
+        source,
+    })?;
+    fs::create_dir_all(write_dir.join("drawings").join(&drawing_name)).map_err(|source| {
+        ImportError::Write {
+            path: write_dir.join("drawings").join(&drawing_name),
+            source,
+        }
+    })?;
+    fs::create_dir_all(write_dir.join("build")).map_err(|source| ImportError::Write {
+        path: write_dir.join("build"),
+        source,
+    })?;
+    write_text(
+        &write_dir.join("cad.project.toml"),
+        &format!("schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = \"{project_name}\"\n"),
+    )?;
+    write_text(
+        &write_dir.join("rules/layers.toml"),
+        "active_layer = \"jww_read_only\"\n\n[layers.jww_read_only]\nname = \"JWW preserved (read-only)\"\norder = 0\nlocked = true\nvisible = true\nprintable = true\ncolor = \"jww_read_only\"\nline_type = \"solid\"\nline_width = 0.25\n",
+    )?;
+    write_text(
+        &write_dir.join("rules/styles.toml"),
+        "[colors.jww_read_only]\nrgb = \"#666666\"\nprint_width = 0.25\n\n[line_types.solid]\ndash = []\n\n[pens]\n\n[text_styles]\n\n[dimension_styles]\n",
+    )?;
+    write_text(
+        &write_dir
+            .join("drawings")
+            .join(&drawing_name)
+            .join("layouts.toml"),
+        "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A4\"\norientation = \"portrait\"\nscale = \"1/1\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+    )?;
+    write_text(
+        &write_dir
+            .join("drawings")
+            .join(&drawing_name)
+            .join("entities.ndjson"),
+        "",
+    )?;
+    let state = match inspection.state {
+        cad_jww_codec::JwwCompatibilityState::PreservedReadOnly => {
+            cad_model::JwwCompatibilityState::PreservedReadOnly
+        }
+        cad_jww_codec::JwwCompatibilityState::UnsupportedVersion => {
+            cad_model::JwwCompatibilityState::UnsupportedVersion
+        }
+        cad_jww_codec::JwwCompatibilityState::Malformed => {
+            cad_model::JwwCompatibilityState::Malformed
+        }
+        cad_jww_codec::JwwCompatibilityState::EditableLossless => {
+            cad_model::JwwCompatibilityState::EditableLossless
+        }
+    };
+    write_jww_preservation(
+        write_dir,
+        original_bytes,
+        &drawing_name,
+        state,
+        inspection.version,
+        inspection.reason.clone(),
+        None,
+    )?;
+    let report = ImportReport {
+        schema_version: CAD_SCHEMA_VERSION.to_owned(),
+        source_path: input_path.to_string_lossy().into_owned(),
+        project_path: project_dir.to_string_lossy().into_owned(),
+        project_name,
+        drawing_name,
+        jww_version: inspection.version.unwrap_or(0),
+        jww_paper_size: 0,
+        jww_memo: String::new(),
+        supported_entities: 0,
+        compatibility_state: state,
+        compatibility_reason: inspection.reason.clone(),
+        edit_capability: cad_model::JwwEditCapability::ExactOnly,
+        warnings: vec![ImportWarning {
+            code: "jww_preserved_read_only".to_owned(),
+            message: inspection
+                .reason
+                .clone()
+                .unwrap_or_else(|| "JWW cannot be edited losslessly".to_owned()),
+            record_type: "JWW".to_owned(),
+        }],
+    };
+    write_text(
+        &write_dir.join("build/import-jww-report.json"),
+        &format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    Ok(report)
+}
+
+fn write_jww_preservation(
+    write_dir: &Path,
+    original_bytes: &[u8],
+    drawing_name: &str,
+    state: cad_model::JwwCompatibilityState,
+    jww_version: Option<u32>,
+    reason: Option<String>,
+    records: Option<&[u8]>,
+) -> ImportResult<()> {
+    let interop = write_dir.join("interop/jww");
+    fs::create_dir_all(&interop).map_err(|source| ImportError::Write {
+        path: interop.clone(),
+        source,
+    })?;
+    let original_path = write_dir.join(cad_model::JWW_ORIGINAL_RELATIVE_PATH);
+    fs::write(&original_path, original_bytes).map_err(|source| ImportError::Write {
+        path: original_path,
+        source,
+    })?;
+    if let Some(records) = records {
+        let records_path = write_dir.join(cad_model::JWW_RECORDS_RELATIVE_PATH);
+        fs::write(&records_path, records).map_err(|source| ImportError::Write {
+            path: records_path,
+            source,
+        })?;
+    }
+    let manifest = cad_model::JwwPreservationManifest {
+        schema_version: if records.is_some() { "0.2" } else { "0.1" }.to_owned(),
+        state,
+        jww_version,
+        drawing_name: drawing_name.to_owned(),
+        original_relative_path: cad_model::JWW_ORIGINAL_RELATIVE_PATH.to_owned(),
+        original_blake3: blake3::hash(original_bytes).to_hex().to_string(),
+        original_sha256: format!("{:x}", Sha256::digest(original_bytes)),
+        reason,
+        source_revisions: cad_model::jww_relevant_source_manifest(write_dir)?,
+        edit_capability: if records.is_some() {
+            cad_model::JwwEditCapability::MappedV600
+        } else {
+            cad_model::JwwEditCapability::ExactOnly
+        },
+        records_relative_path: records.map(|_| cad_model::JWW_RECORDS_RELATIVE_PATH.to_owned()),
+        records_blake3: records.map(|bytes| blake3::hash(bytes).to_hex().to_string()),
+        records_sha256: records.map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+    };
+    write_text(
+        &write_dir.join(cad_model::JWW_PRESERVATION_RELATIVE_PATH),
+        &toml::to_string_pretty(&manifest)?,
+    )
+}
+
+fn build_record_provenance(
+    document: &JwwDocument,
+    converted: &ConvertedProject,
+    drawing_name: &str,
+) -> ImportResult<Option<Vec<u8>>> {
+    let Some(drawing_entries) =
+        provenance_entities(drawing_name, &converted.entities, &document.entities)?
+    else {
+        return Ok(None);
+    };
+    let mut entries = vec![cad_jww_codec::JwwProvenanceEntry::Header {
+        schema_version: cad_jww_codec::RECORD_PROVENANCE_SCHEMA_VERSION.to_owned(),
+        header: Box::new(document.header.clone()),
+    }];
+    entries.extend(drawing_entries);
+    for block in &converted.blocks {
+        let Some(number) = block
+            .id
+            .strip_prefix("jww_")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return Ok(None);
+        };
+        let Some(definition) = document
+            .block_defs
+            .iter()
+            .find(|definition| definition.number == number)
+        else {
+            return Ok(None);
+        };
+        let Some(block_entries) = provenance_entities(
+            &format!("block:{}", block.id),
+            &block.entities,
+            &definition.entities,
+        )?
+        else {
+            return Ok(None);
+        };
+        entries.push(cad_jww_codec::JwwProvenanceEntry::BlockDefinition {
+            block_id: block.id.clone(),
+            base: definition.base.into(),
+            number: definition.number,
+            is_referenced: definition.is_referenced,
+            reserved: definition.reserved,
+            name: definition.name.clone(),
+        });
+        entries.extend(block_entries);
+    }
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json::to_writer(&mut bytes, &entry)?;
+        bytes.push(b'\n');
+    }
+    Ok(Some(bytes))
+}
+
+fn provenance_entities(
+    owner: &str,
+    canonical: &[String],
+    decoded: &[JwwEntity],
+) -> ImportResult<Option<Vec<cad_jww_codec::JwwProvenanceEntry>>> {
+    if canonical.len() != decoded.len() {
+        return Ok(None);
+    }
+    let mut entries = Vec::with_capacity(canonical.len());
+    for (ordinal, (line, decoded)) in canonical.iter().zip(decoded).enumerate() {
+        let canonical_entity: serde_json::Value = serde_json::from_str(line)?;
+        let Some(entity_id) = canonical_entity.get("id").and_then(|value| value.as_str()) else {
+            return Ok(None);
+        };
+        let Some(entity_type) = canonical_entity
+            .get("type")
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(None);
+        };
+        if !provenance_type_matches(entity_type, decoded) {
+            return Ok(None);
+        }
+        let record = cad_jww_codec::decoded_entity_to_record(decoded);
+        entries.push(cad_jww_codec::JwwProvenanceEntry::Entity {
+            owner: owner.to_owned(),
+            ordinal,
+            entity_id: entity_id.to_owned(),
+            canonical_entity: line.clone(),
+            record_float_bits: cad_jww_codec::record_float_bits(&record),
+            record,
+        });
+    }
+    Ok(Some(entries))
+}
+
+fn provenance_type_matches(entity_type: &str, decoded: &JwwEntity) -> bool {
+    matches!(
+        (entity_type, decoded),
+        ("line", JwwEntity::Line(_))
+            | ("arc" | "circle" | "ellipse", JwwEntity::Arc(_))
+            | ("point", JwwEntity::Point(_))
+            | ("text", JwwEntity::Text(_))
+            | ("solid", JwwEntity::Solid(_))
+            | ("curve_solid", JwwEntity::CircleSolid(_))
+            | ("block_ref", JwwEntity::Block(_))
+            | ("dimension", JwwEntity::Dimension(_))
+    )
 }
 
 fn write_text(path: &Path, text: &str) -> ImportResult<()> {
@@ -347,6 +650,9 @@ struct ConvertedProject {
     dimension_styles: BTreeMap<String, String>,
     warnings: Vec<ImportWarning>,
     blocks: Vec<PreservedBlock>,
+    screen_pen_colors: [u32; 10],
+    print_pen_colors: [u32; 10],
+    print_pen_widths: [u32; 10],
 }
 
 #[derive(Debug)]
@@ -631,6 +937,9 @@ fn convert_entities_with_mode(
         } else {
             Vec::new()
         },
+        screen_pen_colors: document.header.screen_pen_colors,
+        print_pen_colors: document.header.print_pen_colors,
+        print_pen_widths: document.header.print_pen_widths,
     })
 }
 
@@ -972,7 +1281,12 @@ fn push_solid(context: &mut ConversionContext<'_>, solid: &Solid) -> ImportResul
         solid.base,
     );
     remember_pen(&mut context.pen_bases, solid.base);
-    let fill = remember_fill(&mut context.fill_colors, solid.base, solid.color);
+    let fill = remember_fill(
+        &context.document.header.screen_pen_colors,
+        &mut context.fill_colors,
+        solid.base,
+        solid.color,
+    );
     context.ensure_output_capacity()?;
     context.entities.push(entity_solid_json(
         next_id(&mut context.id_index),
@@ -1004,7 +1318,12 @@ fn push_circle_solid(context: &mut ConversionContext<'_>, solid: &CircleSolid) -
         solid.base,
     );
     remember_pen(&mut context.pen_bases, solid.base);
-    let fill = remember_fill(&mut context.fill_colors, solid.base, solid.color);
+    let fill = remember_fill(
+        &context.document.header.screen_pen_colors,
+        &mut context.fill_colors,
+        solid.base,
+        solid.color,
+    );
     context.ensure_output_capacity()?;
     context.entities.push(entity_curve_solid_json(
         next_id(&mut context.id_index),
@@ -1084,6 +1403,8 @@ fn transform_text(text: &Text, transform: &Transform2D) -> Text {
     Text {
         base: text.base,
         start: transform.apply_point(text.start),
+        end: transform.apply_point(text.end),
+        text_type: text.text_type,
         size_x: text.size_x * scale,
         size_y: text.size_y * scale,
         spacing: text.spacing * scale,
@@ -1099,6 +1420,13 @@ fn transform_dimension(dimension: &Dimension, transform: &Transform2D) -> Dimens
         base: dimension.base,
         line: transform_line(&dimension.line, transform),
         text: transform_text(&dimension.text, transform),
+        sxf_mode: dimension.sxf_mode,
+        aux_lines: std::array::from_fn(|index| {
+            transform_line(&dimension.aux_lines[index], transform)
+        }),
+        aux_points: std::array::from_fn(|index| {
+            transform_point_entity(&dimension.aux_points[index], transform)
+        }),
     }
 }
 
@@ -1162,6 +1490,7 @@ fn remember_pen(pens: &mut BTreeMap<String, EntityBase>, base: EntityBase) {
 }
 
 fn remember_fill(
+    pen_colors: &[u32; 10],
     colors: &mut BTreeMap<String, String>,
     base: EntityBase,
     arbitrary: Option<u32>,
@@ -1170,13 +1499,13 @@ fn remember_fill(
         let id = format!("jww_solid_rgb_{:06X}", rgb & 0x00ff_ffff);
         colors
             .entry(id.clone())
-            .or_insert_with(|| format!("#{:06X}", rgb & 0x00ff_ffff));
+            .or_insert_with(|| colorref_hex(rgb));
         id
     } else {
         let id = color_id(base);
         colors
             .entry(id.clone())
-            .or_insert_with(|| pen_color_rgb(base.pen_color).to_owned());
+            .or_insert_with(|| pen_color_hex(pen_colors, base.pen_color));
         id
     }
 }
@@ -1620,7 +1949,7 @@ fn layers_toml(project: &ConvertedProject, document: &JwwDocument) -> String {
             layer_visible(document, *base),
             color_id(*base),
             line_type_id(*base),
-            format_mm(line_width(*base))
+            format_mm(line_width(*base, &project.print_pen_widths))
         ));
     }
     out
@@ -1660,7 +1989,10 @@ fn toml_escape(value: &str) -> String {
 }
 
 fn styles_toml(project: &ConvertedProject) -> String {
-    let mut colors = BTreeSet::new();
+    // Preserve the complete basic JWW palette, including colors not referenced
+    // by current entities, so later edits and re-export retain the file's pen
+    // semantics instead of silently restoring application defaults.
+    let mut colors = (0_u16..10).collect::<BTreeSet<_>>();
     let mut line_types = BTreeSet::new();
     for base in project
         .layer_bases
@@ -1672,9 +2004,17 @@ fn styles_toml(project: &ConvertedProject) -> String {
     }
     let mut out = String::new();
     for color in colors {
+        let print_width = project
+            .print_pen_widths
+            .get(usize::from(color))
+            .copied()
+            .filter(|width| *width > 0)
+            .map_or(0.25, |width| f64::from(width) / 100.0);
         out.push_str(&format!(
-            "[colors.jww_color_{color}]\nrgb = \"{}\"\nprint_width = 0.25\n\n",
-            pen_color_rgb(color)
+            "[colors.jww_color_{color}]\nrgb = \"{}\"\nprint_rgb = \"{}\"\nprint_width = {}\n\n",
+            pen_color_hex(&project.screen_pen_colors, color),
+            pen_color_hex(&project.print_pen_colors, color),
+            format_mm(print_width),
         ));
     }
     for (id, rgb) in &project.fill_colors {
@@ -1698,7 +2038,7 @@ fn styles_toml(project: &ConvertedProject) -> String {
                 "[pens.{id}]\ncolor = \"{}\"\nline_type = \"{}\"\nline_width = {}\n\n",
                 color_id(*base),
                 line_type_id(*base),
-                format_mm(line_width(*base)),
+                format_mm(line_width(*base, &project.print_pen_widths)),
             ));
         }
     }
@@ -1726,26 +2066,31 @@ fn styles_toml(project: &ConvertedProject) -> String {
     out
 }
 
-fn line_width(base: EntityBase) -> f64 {
-    if base.pen_width == 0 {
-        0.25
-    } else {
+fn line_width(base: EntityBase, print_pen_widths: &[u32; 10]) -> f64 {
+    if base.pen_width != 0 {
         (base.pen_width as f64 / 100.0).max(0.05)
+    } else {
+        print_pen_widths
+            .get(usize::from(base.pen_color))
+            .copied()
+            .filter(|width| *width > 0)
+            .map_or(0.25, |width| (f64::from(width) / 100.0).max(0.01))
     }
 }
 
-fn pen_color_rgb(color: u16) -> &'static str {
-    match color {
-        1 => "#000000",
-        2 => "#FF0000",
-        3 => "#00AA00",
-        4 => "#0000FF",
-        5 => "#FFFF00",
-        6 => "#FF00FF",
-        7 => "#00FFFF",
-        8 => "#FFFFFF",
-        _ => "#333333",
-    }
+fn pen_color_hex(colors: &[u32; 10], color: u16) -> String {
+    colors
+        .get(usize::from(color))
+        .copied()
+        .map(colorref_hex)
+        .unwrap_or_else(|| "#333333".to_owned())
+}
+
+fn colorref_hex(color: u32) -> String {
+    let red = color & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = (color >> 16) & 0xff;
+    format!("#{red:02X}{green:02X}{blue:02X}")
 }
 
 fn dash_pattern(line_type: u8) -> &'static str {
@@ -1910,6 +2255,41 @@ mod tests {
     }
 
     #[test]
+    fn public_fixture_matches_machine_readable_manifest() {
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture_root.join("manifest.json")).expect("fixture manifest"),
+        )
+        .expect("valid fixture manifest");
+        let entry = &manifest["fixtures"][0];
+        let bytes = fs::read(fixture_root.join(entry["path"].as_str().expect("fixture path")))
+            .expect("fixture bytes");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            entry["sha256"].as_str().expect("fixture sha256")
+        );
+
+        let inspection = cad_jww_codec::inspect_document(&bytes);
+        assert_eq!(
+            inspection.version,
+            entry["jww_version"].as_u64().map(|v| v as u32)
+        );
+        assert_eq!(
+            serde_json::to_value(inspection.state).expect("state"),
+            entry["compatibility_state"]
+        );
+        assert_eq!(
+            serde_json::to_value(&inspection.record_classes).expect("record inventory"),
+            entry["record_classes"]
+        );
+        assert_eq!(
+            inspection.block_definition_count,
+            entry["block_definition_count"].as_u64().map(|v| v as usize)
+        );
+    }
+
+    #[test]
     fn rejects_invalid_block_definition_count() {
         let data = 10_001u32.to_le_bytes();
 
@@ -1935,6 +2315,7 @@ mod tests {
                         JwwEntity::Block(test_block(0.0, 0.0, 1.0, 1.0, 0.0, 2)),
                         JwwEntity::Block(test_block(0.0, 0.0, 1.0, 1.0, 0.0, 2)),
                     ],
+                    ..Default::default()
                 },
                 BlockDef {
                     number: 2,
@@ -1944,6 +2325,7 @@ mod tests {
                         start: [0.0, 0.0],
                         end: [10.0, 0.0],
                     })],
+                    ..Default::default()
                 },
             ],
         );
@@ -2030,6 +2412,7 @@ mod tests {
                         end: [10.0, 0.0],
                     },
                     text: invalid_dimension_text,
+                    ..Default::default()
                 }),
                 JwwEntity::Block(test_block(f64::NAN, 0.0, 1.0, 1.0, 0.0, 1)),
             ],
@@ -2259,7 +2642,9 @@ mod tests {
                     mirror_y: false,
                     font_name: "Hiragino Sans".to_owned(),
                     content: "0".to_owned(),
+                    ..Default::default()
                 },
+                ..Default::default()
             })],
             Vec::new(),
         );
@@ -2295,8 +2680,10 @@ mod tests {
                         mirror_y: false,
                         font_name: "Hiragino Sans".to_owned(),
                         content: "B".to_owned(),
+                        ..Default::default()
                     }),
                 ],
+                ..Default::default()
             }],
         );
 
@@ -2375,6 +2762,7 @@ mod tests {
                     end: [100.0, 0.0],
                 },
                 text: test_text("100", [50.0, 10.0], 3.5),
+                ..Default::default()
             })],
             Vec::new(),
         );
@@ -2402,6 +2790,7 @@ mod tests {
                         end: [100.0, 0.0],
                     },
                     text: test_text("100", [50.0, 10.0], 0.0005),
+                    ..Default::default()
                 }),
             ],
             Vec::new(),
@@ -2464,6 +2853,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_zero_entity_width_from_the_jww_print_width_table() {
+        let mut document = test_document(
+            vec![JwwEntity::Line(Line {
+                base: EntityBase {
+                    pen_color: 2,
+                    pen_width: 0,
+                    ..EntityBase::default()
+                },
+                start: [0.0, 0.0],
+                end: [100.0, 0.0],
+            })],
+            Vec::new(),
+        );
+        document.header.print_pen_widths[2] = 42;
+        let converted = convert_ok(&document);
+        let layers = layers_toml(&converted, &document);
+        let styles = styles_toml(&converted);
+
+        assert!(layers.contains("line_width = 0.42"));
+        assert!(styles.contains("[pens.jww_pen_c2_l0_w0]\n"));
+        assert!(styles.contains("line_width = 0.42"));
+    }
+
+    #[test]
     fn warns_for_mixed_layer_group_scale() {
         let mut document = test_document(
             vec![
@@ -2508,6 +2921,7 @@ mod tests {
                     number: 1,
                     name: "OUTER".to_owned(),
                     entities: vec![JwwEntity::Block(test_block(5.0, 0.0, 1.0, 1.0, 0.0, 2))],
+                    ..Default::default()
                 },
                 BlockDef {
                     number: 2,
@@ -2517,6 +2931,7 @@ mod tests {
                         start: [0.0, 0.0],
                         end: [1.0, 0.0],
                     })],
+                    ..Default::default()
                 },
             ],
         );
@@ -2548,6 +2963,7 @@ mod tests {
                 number: 1,
                 name: "LOOP".to_owned(),
                 entities: vec![JwwEntity::Block(test_block(0.0, 0.0, 1.0, 1.0, 0.0, 1))],
+                ..Default::default()
             }],
         ));
         assert!(
@@ -2575,6 +2991,7 @@ mod tests {
                     flatness: 1.0,
                     is_full_circle: true,
                 })],
+                ..Default::default()
             }],
         );
 
@@ -2600,6 +3017,7 @@ mod tests {
                     JwwEntity::Arc(test_arc(10.0, 0.0, PI / 2.0, 0.0, 1.0, false)),
                     JwwEntity::Arc(test_arc(20.0, 0.0, PI / 2.0, 0.0, 0.5, false)),
                 ],
+                ..Default::default()
             }],
         );
 
@@ -2629,8 +3047,10 @@ mod tests {
                             end: [100.0, 0.0],
                         },
                         text: test_text("100", [50.0, 10.0], 2.5),
+                        ..Default::default()
                     }),
                 ],
+                ..Default::default()
             }],
         );
 
@@ -2674,6 +3094,7 @@ mod tests {
                 start: [0.0, 0.0],
                 end: [10.0, 0.0],
             })],
+            ..Default::default()
         };
         for (scale_x, scale_y, expected_scale, expected_rotation) in [
             (2.0, 2.0, 2.0, 0.0),
@@ -2715,6 +3136,7 @@ mod tests {
                         start: [0.0, 0.0],
                         end: [10.0, 0.0],
                     })],
+                    ..Default::default()
                 }],
             );
             let converted = convert_entities_with_mode(
@@ -2738,6 +3160,78 @@ mod tests {
     }
 
     #[test]
+    fn unknown_v600_class_is_preserved_as_a_read_only_project() {
+        let mut bytes = cad_jww_codec::write_document(&cad_jww_codec::Document {
+            records: vec![cad_jww_codec::Record::Line {
+                base: cad_jww_codec::Base::default(),
+                p1: [0.0, 0.0],
+                p2: [10.0, 0.0],
+            }],
+            ..cad_jww_codec::Document::default()
+        })
+        .expect("fixture should encode");
+        let marker = bytes
+            .windows(b"CDataSen".len())
+            .position(|window| window == b"CDataSen")
+            .expect("class marker");
+        bytes[marker..marker + b"CDataSen".len()].copy_from_slice(b"CDataFoo");
+        let out = tempfile::tempdir().expect("tempdir");
+        let input = out.path().join("unknown.jww");
+        let project = out.path().join("unknown_imported");
+        fs::write(&input, &bytes).expect("fixture");
+
+        let report = import_jww_file(&input, &project).expect("read-only import");
+
+        assert_eq!(
+            report.compatibility_state,
+            cad_model::JwwCompatibilityState::PreservedReadOnly
+        );
+        assert_eq!(report.supported_entities, 0);
+        assert_eq!(
+            fs::read(project.join(cad_model::JWW_ORIGINAL_RELATIVE_PATH)).expect("original"),
+            bytes
+        );
+        cad_model::load_project(&project).expect("read-only shell project should load");
+    }
+
+    #[test]
+    fn unsupported_version_is_preserved_as_a_read_only_project() {
+        let mut bytes = cad_jww_codec::write_document(&cad_jww_codec::Document {
+            records: vec![cad_jww_codec::Record::Line {
+                base: cad_jww_codec::Base::default(),
+                p1: [0.0, 0.0],
+                p2: [10.0, 0.0],
+            }],
+            ..cad_jww_codec::Document::default()
+        })
+        .expect("fixture should encode");
+        bytes[8..12].copy_from_slice(&500_u32.to_le_bytes());
+        let out = tempfile::tempdir().expect("tempdir");
+        let input = out.path().join("unsupported.jww");
+        let project = out.path().join("unsupported_imported");
+        fs::write(&input, &bytes).expect("fixture");
+
+        let report = import_jww_file(&input, &project).expect("read-only import");
+
+        assert_eq!(
+            report.compatibility_state,
+            cad_model::JwwCompatibilityState::UnsupportedVersion
+        );
+        assert_eq!(report.jww_version, 500);
+        assert_eq!(
+            fs::read(project.join(cad_model::JWW_ORIGINAL_RELATIVE_PATH)).expect("original"),
+            bytes
+        );
+        let compatibility = cad_model::jww_project_compatibility(&project)
+            .expect("compatibility")
+            .expect("JWW provenance");
+        assert_eq!(
+            compatibility.state,
+            cad_model::JwwCompatibilityState::UnsupportedVersion
+        );
+    }
+
+    #[test]
     fn parses_sample_fixture_and_imports_project() {
         let input =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
@@ -2746,6 +3240,27 @@ mod tests {
         let report = import_jww_file(&input, &project).expect("sample should import");
 
         assert!(report.supported_entities > 0);
+        assert_eq!(
+            report.compatibility_state,
+            cad_model::JwwCompatibilityState::EditableLossless
+        );
+        assert_eq!(
+            fs::read(project.join(cad_model::JWW_ORIGINAL_RELATIVE_PATH)).expect("original"),
+            fs::read(&input).expect("fixture")
+        );
+        let compatibility = cad_model::jww_project_compatibility(&project)
+            .expect("compatibility")
+            .expect("JWW provenance");
+        assert!(compatibility.original_verified);
+        assert!(compatibility.changed_source_paths.is_empty());
+        assert_eq!(
+            compatibility.edit_capability,
+            cad_model::JwwEditCapability::MappedV600
+        );
+        assert_eq!(
+            report.edit_capability,
+            cad_model::JwwEditCapability::MappedV600
+        );
         assert_eq!(report.project_path, project.to_string_lossy());
         assert!(
             fs::read_dir(out.path())
@@ -2757,6 +3272,17 @@ mod tests {
                     .starts_with(".cad-jww-import-"))
         );
         let loaded = cad_model::load_project(&project).expect("imported project should load");
+        assert_eq!(
+            loaded.styles.colors["jww_color_1"].rgb, "#00C0C0",
+            "JWW header color 1 must drive imported display and PDF color"
+        );
+        assert_eq!(loaded.styles.colors["jww_color_2"].rgb, "#000000");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "color_mapping_defaulted")
+        );
         let check = cad_check::check_project(&project);
         assert!(
             check.is_ok(),
@@ -2785,7 +3311,7 @@ mod tests {
             ),
             @r###"
 supported=1686
-warnings=2
+warnings=1
 line=1642
 arc=4
 circle=0
@@ -2794,6 +3320,37 @@ point=4
 dimension=0
         "###
         );
+    }
+
+    #[test]
+    fn tampered_record_provenance_fails_closed() {
+        let input =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
+        let out = tempfile::tempdir().expect("tempdir should exist");
+        let project = out.path().join("imported");
+        import_jww_file(&input, &project).expect("sample should import");
+        let records = project.join(cad_model::JWW_RECORDS_RELATIVE_PATH);
+        let mut bytes = fs::read(&records).expect("record provenance");
+        bytes.push(b' ');
+        fs::write(&records, bytes).expect("tamper provenance");
+
+        let compatibility = cad_model::jww_project_compatibility(&project)
+            .expect("compatibility")
+            .expect("JWW provenance");
+
+        assert_eq!(
+            compatibility.state,
+            cad_model::JwwCompatibilityState::Malformed
+        );
+        assert_eq!(
+            compatibility.edit_capability,
+            cad_model::JwwEditCapability::ExactOnly
+        );
+    }
+
+    #[test]
+    fn converts_jww_colorref_to_canonical_rgb() {
+        assert_eq!(colorref_hex(0x00563412), "#123456");
     }
 
     #[test]
@@ -2999,7 +3556,7 @@ dimension=0
 
         let error = import_jww_file(&input, &project).expect_err("broken block should fail");
 
-        assert!(matches!(error, ImportError::UnexpectedEof(_)));
+        assert!(matches!(error, ImportError::Malformed(_)));
         assert!(!project.exists());
     }
 
@@ -3049,6 +3606,17 @@ dimension=0
                     write_layer: 0,
                     protect: 0,
                 }),
+                screen_pen_colors: [
+                    0x00ffffff, 0x00c0c000, 0, 0x0000c000, 0x0000c0c0, 0x00c000c0, 0x000000ff,
+                    0x00808080, 0x008000ff, 0x00ff80ff,
+                ],
+                screen_pen_widths: [1; 10],
+                print_pen_colors: [
+                    0x00ffffff, 0x00c0c000, 0, 0x0000c000, 0x0000c0c0, 0x00c000c0, 0x000000ff,
+                    0x00808080, 0x008000ff, 0x00ff80ff,
+                ],
+                print_pen_widths: [1; 10],
+                print_point_radii: [0.1; 10],
             },
             entities,
             block_defs,
@@ -3085,6 +3653,7 @@ dimension=0
             mirror_y: false,
             font_name: "Hiragino Sans".to_owned(),
             content: content.to_owned(),
+            ..Default::default()
         }
     }
 

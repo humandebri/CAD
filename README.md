@@ -4,9 +4,9 @@ Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
 ## Current Phase
 
-Phase 5A makes schema 0.2 source/history transactions crash-recoverable,
-uses `layouts.toml` as the paper authority, shares PDF export between CLI and
-desktop, and gates the macOS desktop path with a real-file GUI smoke test.
+Phase 5E-A provides crash-safe schema 0.2 editing, canonical layouts, native
+desktop watching, cached Git review, real-file macOS GUI verification, and
+styled PDF output suitable for Jw_cad migration review.
 
 ## Layout
 
@@ -74,7 +74,7 @@ and file permissions. TOML files are validated but not rewritten.
 
 1. Edit `examples/house-small/drawings/plan_1f/entities.ndjson`.
 2. Run `cargo run -p cad-cli -- format examples/house-small`.
-3. Run `cargo run -p cad-cli -- check examples/house-small --format json --out examples/house-small/build/check.json`.
+3. Run `cargo run -p cad-cli -- check examples/house-small --target cad --format json --out examples/house-small/build/check.json`.
 4. Run `cargo run -p cad-cli -- render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg`.
 5. Run `cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json`.
 6. Run `cargo run -p cad-cli -- diff examples/house-small examples/house-small-modified --format svg --out examples/house-small/build/plan_1f.diff.svg`.
@@ -171,16 +171,29 @@ the generated SVG retains its physical print widths.
 
 ## JWW Boundary Codec
 
-JWW remains a boundary format. Imported NDJSON/TOML becomes the source of truth,
-and re-importing an exported JWW does not preserve entity IDs.
+JWW remains a boundary format. Imported NDJSON/TOML becomes the editable source
+of truth, while the exact input bytes and their BLAKE3/SHA-256 provenance are
+retained under `interop/jww/`. Editable v600 imports also write a hash-verified
+`records.ndjson` mapping; imports that cannot establish a one-to-one mapping
+are marked `exact_only`. Re-importing a generated JWW does not preserve
+entity IDs.
 `cad-jww-codec` owns binary header, class PID, entity-list, and block-list
 decoding and version 600 encoding; the importer only maps decoded records into
 the CAD source schema.
 
 ```bash
 cargo run -p cad-cli -- import-jww examples/jww-fixtures/Test1.jww --out /tmp/test1_imported
-cargo run -p cad-cli -- export-jww /tmp/test1_imported --drawing Test1 --out /tmp/Test1.jww
+cargo run -p cad-cli -- inspect-jww examples/jww-fixtures/Test1.jww
+cargo run -p cad-cli -- check /tmp/test1_imported --drawing test1 --target jww-v600 --format json --out -
+cargo run -p cad-cli -- export-jww /tmp/test1_imported --drawing test1 --out /tmp/Test1.jww --report /tmp/Test1-report.json
+cargo run -p cad-cli -- extract-original-jww /tmp/test1_imported --out /tmp/Test1-original.jww
 ```
+
+After import, the canonical TOML and NDJSON files are the editable source of
+truth. AI agents edit those files directly, keep stable entity IDs, and run the
+CAD and JWW-target checkers after each edit batch. `interop/`, provenance,
+history, transaction, recovery, and generated files are not editable source.
+Repository-specific agent rules are in [`AGENTS.md`](AGENTS.md).
 
 The importer currently handles JWW line, circle, arc, ellipse, elliptical arc,
 text, dimension, point, polygon solid, curve solid, block, layer, pen color,
@@ -197,12 +210,16 @@ expansion steps; exceeding either limit fails the import instead of truncating
 the drawing. JWW text size is converted from `size_x`,
 `size_y`, and `spacing` into generated CAD text styles. JWW paper size and
 layout scale are reflected in `drawings/<drawing>/layouts.toml`; mixed
-layer-group scales fall back to `1/1` with a warning. JWW header color tables
-are not parsed yet,
-so default pen color mapping is reported as a warning.
+layer-group scales fall back to `1/1` with a warning. JWW v600 display and
+print color tables and print-width values are retained in style definitions.
+`rgb` drives the SVG display, while optional `print_rgb` drives PDF and the JWW
+print palette. Import/export tests preserve all ten basic palette entries even
+when a color is not referenced by an entity.
 Known unsupported records and style conflicts are reported as warnings in
-`build/import-jww-report.json`. Unknown JWW classes are fatal because their
-record length cannot be skipped safely.
+`build/import-jww-report.json`. A v600 file containing an unknown class, or a
+file with an unsupported version, is imported as a read-only preservation
+project: its exact bytes can be extracted, but CAD source edits are rejected.
+Malformed files still fail import.
 Geometry that would fail the strict checker, such as sub-0.001mm lines or
 zero-span arcs, is skipped with a warning during import. Geometry and block
 records containing non-finite numeric values are also skipped before ID or
@@ -214,32 +231,57 @@ concurrent import cannot overwrite an existing destination directory.
 Reflected JWW block text is preserved in CAD source with `text.mirror_y`.
 Dimension text uses `dimension.text_rotation_deg` and
 `dimension.text_mirror_y`; all three fields are explicit in schema `0.2`.
+For a mapped existing JWW dimension, strict preservation accepts only a
+displayed-value change and retains the original dimension line, text geometry,
+SXF fields, auxiliary lines, and auxiliary points. Normal best-effort export
+regenerates an edited dimension when geometry, offset, style, layer/pen,
+rotation, or mirroring changes and records the approximation in its JSON
+report.
 
-Experimental export writes JWW version 600 with CP932 strings. It supports
+Preserve export reads the original and record provenance as one hash-verified
+snapshot and rechecks the canonical source manifest immediately before atomic
+publication. It also rejects invalid projects, dangling or duplicate block
+definition numbers, and preserved block base-point changes without replacing
+an existing output.
+
+Best-effort export writes JWW version 600 with CP932 strings. It supports
 line, polyline expansion, arc, circle, ellipse, text, dimension, point,
 polygon solid, curve solid, deterministic block references, and simple hatch
 loops. Active layout paper and scale are written to the JWW header. Strict mode does not create an output
-when a drawing contains an unsupported construct. `--allow-lossy` records every
-skip or substitution in the export report. Existing files require `--force` in
-the CLI; failed generation leaves the existing file intact. The exporter stays
-Experimental until its output is compared in Windows Jw_cad. Point records and
-the public `Test1.jww` fixture are covered; solid compatibility still requires a
-licensed public fixture containing polygon, circle, ellipse, arc, and ring
-solids before it is considered complete.
+when a drawing requires an approximation. Normal mode records every expansion,
+substitution, or omission in the export report; `--strict` promotes those
+conditions to blockers. Existing files require `--force` in the CLI, and failed
+generation leaves the existing file intact. Point records and the public
+`Test1.jww` fixture are covered; solid compatibility still requires a licensed
+public fixture containing polygon, circle, ellipse, arc, and ring solids.
+
+JWW provenance is selected automatically. With no relevant source change it
+publishes the original JWW byte-for-byte. For an edited compatible project it
+retains the original v600 header and untouched records, while edited entities
+may replace one original record with multiple generated records. If header,
+layout, or palette changes cannot be merged, normal mode generates a complete
+v600 file and records `preservation_fallback_generated`; `--strict` blocks the
+fallback. This is measured file-format compatibility, not a claim of complete
+Jw_cad compatibility.
 
 JWW block definitions and references are retained in schema `0.2`, and export
 uses the retained block list. Unsupported block constructs remain a strict
 export blocker rather than a lossy
 reconstruction. Lossless block round-trip is outside the current source schema.
-Windows/Jw_cad compatibility is tracked in
-[`examples/jww-fixtures/COMPATIBILITY_CHECKLIST.md`](examples/jww-fixtures/COMPATIBILITY_CHECKLIST.md);
-completed runs use the templates under
-[`examples/jww-fixtures/validation/`](examples/jww-fixtures/validation/).
+File-format compatibility is gated by the hashed corpus in
+[`examples/jww-fixtures/manifest.json`](examples/jww-fixtures/manifest.json),
+byte-exact unchanged export, record inventory, and semantic re-import checks.
+External application checks may be recorded as optional evidence, but Windows
+or Jw_cad execution is not a release requirement.
 
 PDF export uses the active layout's paper, orientation, scale, origin, margins,
 and plot area and publishes the result atomically. Only visible, printable
 layers are rendered; block references are transformed and simple hatch loops
-are filled.
+are filled. PDF stroke color, physical line width, dash pattern, fill color,
+text size/width/spacing/alignment, dimension geometry, and curve solids use the
+same canonical style data as SVG. Japanese text uses an OFL-licensed M+ 1p
+TrueType subset embedded as a CID font with a ToUnicode map. PDF appearance and
+text extraction therefore do not depend on fonts installed on the viewer.
 
 ## Fixtures And Snapshots
 

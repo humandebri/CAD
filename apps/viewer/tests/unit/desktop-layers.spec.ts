@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 import {
   exportDrawingPdfFromDesktop,
   exportJwwFromDesktop,
+  exportJwwPreservingFromDesktop,
+  extractOriginalJwwFromDesktop,
   LatestLayerRulesQueue,
   PdfExportGuard,
   updateLayerRulesFromDesktop,
@@ -126,6 +128,29 @@ test.describe("desktop layer transport", () => {
       allowLossy: false,
       overwrite: true,
     }]]);
+  });
+
+  test("uses the lossless JWW preservation command contracts", async () => {
+    const calls: unknown[][] = [];
+    const invoke = async <T>(command: string, args: Record<string, unknown>) => {
+      calls.push([command, args]);
+      return { status: "exported", mode: "preserved_exact" } as T;
+    };
+    await exportJwwPreservingFromDesktop("/project", "plan", "/tmp/plan.jww", false, invoke);
+    await extractOriginalJwwFromDesktop("/project", "/tmp/original.jww", true, invoke);
+    expect(calls).toEqual([
+      ["export_jww_preserving", {
+        projectPath: "/project",
+        drawing: "plan",
+        outputPath: "/tmp/plan.jww",
+        overwrite: false,
+      }],
+      ["extract_original_jww", {
+        projectPath: "/project",
+        outputPath: "/tmp/original.jww",
+        overwrite: true,
+      }],
+    ]);
   });
 
   test("uses the layout-aware PDF export command contract", async () => {

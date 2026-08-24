@@ -4,6 +4,7 @@
 //! diagnostics consumed by the CLI and later viewer phases.
 
 use cad_model::{Entity, EntityRecord, ModelError, ProjectSource, entity_bbox};
+use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -29,6 +30,13 @@ pub enum CheckStatus {
 pub enum Severity {
     Error,
     Warning,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckTarget {
+    #[default]
+    Cad,
+    JwwV600,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,11 +89,465 @@ pub fn check_project(root: impl AsRef<Path>) -> CheckReport {
     }
 }
 
+pub fn check_project_for_target(
+    root: impl AsRef<Path>,
+    target: CheckTarget,
+    drawing_name: Option<&str>,
+) -> CheckReport {
+    let root = root.as_ref();
+    match cad_model::load_project(root) {
+        Ok(project) => {
+            let mut effective_target = target;
+            let mut preservation_diagnostics = Vec::new();
+            if target == CheckTarget::JwwV600 {
+                match cad_model::load_jww_preservation_manifest(root) {
+                    Ok(Some(manifest)) => match cad_model::jww_relevant_source_manifest(root) {
+                        Ok(current) if current == manifest.source_revisions => {
+                            effective_target = CheckTarget::Cad;
+                        }
+                        Ok(_)
+                            if manifest.edit_capability
+                                == cad_model::JwwEditCapability::ExactOnly =>
+                        {
+                            preservation_diagnostics.push(CheckDiagnostic {
+                                severity: Severity::Error,
+                                file: cad_model::JWW_PRESERVATION_RELATIVE_PATH.to_owned(),
+                                line: None,
+                                entity_id: None,
+                                field: None,
+                                code: "jww.exact_only_source_changed".to_owned(),
+                                message: "this JWW import has no safe record mapping; edited source cannot be exported"
+                                    .to_owned(),
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            preservation_diagnostics.push(model_error_to_diagnostic(root, &error));
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => {
+                        preservation_diagnostics.push(model_error_to_diagnostic(root, &error));
+                    }
+                }
+            }
+            let mut diagnostics =
+                check_loaded_project_for_target(&project, effective_target, drawing_name)
+                    .diagnostics;
+            diagnostics.extend(preservation_diagnostics);
+            CheckReport::new(diagnostics)
+        }
+        Err(error) => CheckReport::new(vec![model_error_to_diagnostic(root, &error)]),
+    }
+}
+
 #[must_use]
 pub fn check_loaded_project(project: &ProjectSource) -> CheckReport {
     let mut checker = Checker::new(project);
     checker.check();
     CheckReport::new(checker.diagnostics)
+}
+
+#[must_use]
+pub fn check_loaded_project_for_target(
+    project: &ProjectSource,
+    target: CheckTarget,
+    drawing_name: Option<&str>,
+) -> CheckReport {
+    let mut diagnostics = check_loaded_project(project).diagnostics;
+    if target == CheckTarget::JwwV600 {
+        diagnostics.extend(jww_v600_diagnostics(project, drawing_name));
+    }
+    CheckReport::new(diagnostics)
+}
+
+fn jww_v600_diagnostics(
+    project: &ProjectSource,
+    drawing_name: Option<&str>,
+) -> Vec<CheckDiagnostic> {
+    let mut diagnostics = Vec::new();
+    check_cp932_metadata(
+        &mut diagnostics,
+        "cad.project.toml",
+        "name",
+        &project.project.name,
+    );
+    for (group_id, group) in &project.layers.groups {
+        check_cp932_metadata(
+            &mut diagnostics,
+            "rules/layers.toml",
+            &format!("groups.{group_id}.name"),
+            &group.name,
+        );
+    }
+    for (layer_id, layer) in &project.layers.layers {
+        check_cp932_metadata(
+            &mut diagnostics,
+            "rules/layers.toml",
+            &format!("layers.{layer_id}.name"),
+            &layer.name,
+        );
+    }
+    for (block_id, block) in &project.blocks {
+        check_cp932_metadata(
+            &mut diagnostics,
+            &format!("blocks/{block_id}/definition.toml"),
+            "name",
+            &block.config.name,
+        );
+    }
+    let drawing = drawing_name
+        .and_then(|name| project.drawings.iter().find(|drawing| drawing.name == name))
+        .or_else(|| (project.drawings.len() == 1).then(|| &project.drawings[0]));
+    let Some(drawing) = drawing else {
+        diagnostics.push(CheckDiagnostic {
+            severity: Severity::Error,
+            file: "drawings".to_owned(),
+            line: None,
+            entity_id: None,
+            field: None,
+            code: if drawing_name.is_some() {
+                "jww.drawing_not_found"
+            } else {
+                "jww.drawing_required"
+            }
+            .to_owned(),
+            message: drawing_name.map_or_else(
+                || "--drawing is required when a project contains multiple drawings".to_owned(),
+                |name| format!("drawing {name:?} was not found"),
+            ),
+        });
+        return diagnostics;
+    };
+
+    if project.layers.groups.len() > 16 {
+        push_jww_diagnostic(
+            &mut diagnostics,
+            Severity::Error,
+            "rules/layers.toml",
+            None,
+            None,
+            "jww.layer_group_limit",
+            "JWW v600 supports at most 16 layer groups".to_owned(),
+        );
+    }
+    for group_id in project.layers.groups.keys() {
+        let count = project
+            .layers
+            .layers
+            .values()
+            .filter(|layer| layer.group.as_deref() == Some(group_id))
+            .count();
+        if count > 16 {
+            push_jww_diagnostic(
+                &mut diagnostics,
+                Severity::Error,
+                "rules/layers.toml",
+                None,
+                Some(format!("groups.{group_id}")),
+                "jww.layer_limit",
+                format!("layer group {group_id:?} contains {count} layers; JWW v600 supports 16"),
+            );
+        }
+    }
+    if drawing
+        .layouts
+        .active()
+        .is_some_and(|layout| matches!(layout.orientation, cad_model::SheetOrientation::Landscape))
+    {
+        push_jww_diagnostic(
+            &mut diagnostics,
+            Severity::Warning,
+            &format!("drawings/{}/layouts.toml", drawing.name),
+            None,
+            Some("layouts.active.orientation".to_owned()),
+            "jww.layout_orientation_approximated",
+            "JWW v600 has no independent layout orientation flag".to_owned(),
+        );
+    }
+
+    let file = format!("drawings/{}/entities.ndjson", drawing.name);
+    let top_level_records = drawing
+        .entities
+        .iter()
+        .map(|record| jww_record_count(&record.entity))
+        .sum::<usize>();
+    if top_level_records > 65_534 {
+        push_jww_diagnostic(
+            &mut diagnostics,
+            Severity::Error,
+            &file,
+            None,
+            None,
+            "jww.record_limit",
+            format!(
+                "best-effort expansion produces {top_level_records} records; JWW v600 supports 65534"
+            ),
+        );
+    }
+    for (block_id, block) in &project.blocks {
+        let count = block
+            .entities
+            .iter()
+            .map(|record| jww_record_count(&record.entity))
+            .sum::<usize>();
+        if count > 65_534 {
+            push_jww_diagnostic(
+                &mut diagnostics,
+                Severity::Error,
+                &format!("blocks/{block_id}/entities.ndjson"),
+                None,
+                None,
+                "jww.block_record_limit",
+                format!("block expansion produces {count} records; JWW v600 supports 65534"),
+            );
+        }
+    }
+    for record in &drawing.entities {
+        check_jww_entity_style(&mut diagnostics, project, &file, record);
+        match &record.entity {
+            Entity::Polyline { .. } => push_jww_entity_warning(
+                &mut diagnostics,
+                &file,
+                record,
+                "jww.polyline_expanded",
+                "polyline is exported as individual JWW line records",
+            ),
+            Entity::Hatch { .. } => push_jww_entity_warning(
+                &mut diagnostics,
+                &file,
+                record,
+                "jww.hatch_pattern_approximated",
+                "hatch pattern is exported as deterministic solid geometry",
+            ),
+            Entity::Dimension {
+                value,
+                style,
+                text_mirror_y,
+                ..
+            } => {
+                push_jww_entity_warning(
+                    &mut diagnostics,
+                    &file,
+                    record,
+                    "jww.dimension_style_approximated",
+                    "dimension style semantics are approximated by JWW v600 fields",
+                );
+                if *text_mirror_y {
+                    push_jww_entity_warning(
+                        &mut diagnostics,
+                        &file,
+                        record,
+                        "jww.mirrored_text_approximated",
+                        "mirrored dimension text is exported without mirroring",
+                    );
+                }
+                if let Some(value) = value {
+                    check_cp932(&mut diagnostics, &file, record, value);
+                }
+                if let Some(dimension_style) = project.styles.dimension_styles.get(style)
+                    && let Some(text_style) =
+                        project.styles.text_styles.get(&dimension_style.text_style)
+                    && text_style.font_family != "MS Gothic"
+                {
+                    push_jww_entity_warning(
+                        &mut diagnostics,
+                        &file,
+                        record,
+                        "jww.font_substituted",
+                        "font is substituted with MS Gothic in JWW v600",
+                    );
+                }
+            }
+            Entity::Text {
+                value,
+                style,
+                mirror_y,
+                ..
+            } => {
+                if *mirror_y {
+                    push_jww_entity_warning(
+                        &mut diagnostics,
+                        &file,
+                        record,
+                        "jww.mirrored_text_approximated",
+                        "mirrored text is exported without mirroring",
+                    );
+                }
+                check_cp932(&mut diagnostics, &file, record, value);
+                if project
+                    .styles
+                    .text_styles
+                    .get(style)
+                    .is_some_and(|style| style.font_family != "MS Gothic")
+                {
+                    push_jww_entity_warning(
+                        &mut diagnostics,
+                        &file,
+                        record,
+                        "jww.font_substituted",
+                        "font is substituted with MS Gothic in JWW v600",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    diagnostics
+}
+
+fn check_jww_entity_style(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    project: &ProjectSource,
+    file: &str,
+    record: &EntityRecord,
+) {
+    let Some(layer) = project.layers.layers.get(record.entity.layer()) else {
+        return;
+    };
+    let (color_id, line_type_id, line_width) = record
+        .entity
+        .pen()
+        .and_then(|pen_id| project.styles.pens.get(pen_id))
+        .map_or((&layer.color, &layer.line_type, layer.line_width), |pen| {
+            (&pen.color, &pen.line_type, pen.line_width)
+        });
+    let color_supported = color_id
+        .strip_prefix("jww_color_")
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_some()
+        || project.styles.colors.get(color_id).is_some_and(|color| {
+            matches!(
+                color.rgb.to_ascii_uppercase().as_str(),
+                "#000000"
+                    | "#FF0000"
+                    | "#00AA00"
+                    | "#0000FF"
+                    | "#FFFF00"
+                    | "#FF00FF"
+                    | "#00FFFF"
+                    | "#FFFFFF"
+            )
+        });
+    if !color_supported {
+        push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.stroke_color_approximated",
+            "stroke color is mapped to the nearest supported JWW pen color",
+        );
+    }
+    let line_type_supported = line_type_id == "solid"
+        || line_type_id
+            .strip_prefix("jww_line_")
+            .and_then(|value| value.parse::<u8>().ok())
+            .is_some();
+    if !line_type_supported {
+        push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.line_type_approximated",
+            "line type is mapped to the JWW solid line type",
+        );
+    }
+    if line_width > f64::from(u16::MAX) / 100.0 {
+        push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.line_width_clamped",
+            "line width exceeds the JWW v600 field and will be clamped",
+        );
+    }
+}
+
+fn check_cp932_metadata(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    file: &str,
+    field: &str,
+    value: &str,
+) {
+    if SHIFT_JIS.encode(value).2 {
+        push_jww_diagnostic(
+            diagnostics,
+            Severity::Warning,
+            file,
+            None,
+            Some(field.to_owned()),
+            "jww.unencodable_text_replaced",
+            format!("{field} contains characters that will be replaced during CP932 encoding"),
+        );
+    }
+}
+
+fn jww_record_count(entity: &Entity) -> usize {
+    match entity {
+        Entity::Polyline { points, closed, .. } => {
+            points.len().saturating_sub(1) + usize::from(*closed && points.len() > 2)
+        }
+        Entity::Hatch { loops, .. } => loops
+            .iter()
+            .map(|points| points.len().saturating_sub(2))
+            .sum(),
+        _ => 1,
+    }
+}
+
+fn check_cp932(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    file: &str,
+    record: &EntityRecord,
+    value: &str,
+) {
+    if SHIFT_JIS.encode(value).2 {
+        push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.unencodable_text_replaced",
+            "text contains characters that will be replaced during CP932 encoding",
+        );
+    }
+}
+
+fn push_jww_entity_warning(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    file: &str,
+    record: &EntityRecord,
+    code: &str,
+    message: &str,
+) {
+    push_jww_diagnostic(
+        diagnostics,
+        Severity::Warning,
+        file,
+        Some(record),
+        None,
+        code,
+        message.to_owned(),
+    );
+}
+
+fn push_jww_diagnostic(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    severity: Severity,
+    file: &str,
+    record: Option<&EntityRecord>,
+    field: Option<String>,
+    code: &str,
+    message: String,
+) {
+    diagnostics.push(CheckDiagnostic {
+        severity,
+        file: file.to_owned(),
+        line: record.map(|record| record.line),
+        entity_id: record.map(|record| record.entity.id().as_str().to_owned()),
+        field,
+        code: code.to_owned(),
+        message,
+    });
 }
 
 struct Checker<'a> {
@@ -214,6 +676,17 @@ impl<'a> Checker<'a> {
                     "style.invalid_rgb",
                     Some(format!("colors.{color_id}.rgb")),
                     format!("color {color_id:?} must use #RRGGBB"),
+                );
+            }
+            if color
+                .print_rgb
+                .as_deref()
+                .is_some_and(|rgb| !is_rgb_hex(rgb))
+            {
+                self.push_style(
+                    "style.invalid_print_rgb",
+                    Some(format!("colors.{color_id}.print_rgb")),
+                    format!("color {color_id:?} print_rgb must use #RRGGBB"),
                 );
             }
             if !color.print_width.is_finite() || color.print_width <= 0.0 {
@@ -954,7 +1427,8 @@ fn model_error_to_diagnostic(root: &Path, error: &ModelError) -> CheckDiagnostic
         ModelError::Read { path, .. }
         | ModelError::ListDir { path, .. }
         | ModelError::Toml { path, .. }
-        | ModelError::UnsafeSourcePath { path, .. } => CheckDiagnostic {
+        | ModelError::UnsafeSourcePath { path, .. }
+        | ModelError::JwwPreservation { path, .. } => CheckDiagnostic {
             severity: Severity::Error,
             file: relative_path(root, path),
             line: None,
@@ -1016,6 +1490,7 @@ fn model_error_code(error: &ModelError) -> &'static str {
         ModelError::UnsupportedSchema { .. } => "format.unsupported_schema",
         ModelError::InvalidEntityId { .. } => "format.invalid_entity_id",
         ModelError::UnsafeSourcePath { .. } => "security.unsafe_source_path",
+        ModelError::JwwPreservation { .. } => "format.invalid_jww_preservation",
     }
 }
 
@@ -1317,6 +1792,100 @@ mod tests {
         let report = check_project(temp.path());
 
         assert_code(&report, "layer.non_print_annotation");
+    }
+
+    #[test]
+    fn jww_target_reports_approximations_as_warnings() {
+        let temp = fixture_project();
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            [
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[10.0,0.0],[10.0,10.0]],"closed":false}"#,
+                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("entities should be writable");
+
+        let report = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+
+        assert_eq!(report.status, CheckStatus::Ok);
+        assert_code(&report, "jww.polyline_expanded");
+        assert_code(&report, "jww.mirrored_text_approximated");
+        assert_code(&report, "jww.unencodable_text_replaced");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.starts_with("jww."))
+                .all(|diagnostic| diagnostic.severity == Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn jww_target_requires_drawing_for_multi_drawing_project() {
+        let temp = fixture_project();
+        let second = temp.path().join("drawings/second");
+        create_dir_all(&second).expect("second drawing directory");
+        write(
+            second.join("layouts.toml"),
+            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"portrait\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+        )
+        .expect("second layouts");
+        write(second.join("entities.ndjson"), "").expect("second entities");
+
+        let report = check_project_for_target(temp.path(), CheckTarget::JwwV600, None);
+
+        assert_eq!(report.status, CheckStatus::Error);
+        assert_code(&report, "jww.drawing_required");
+    }
+
+    #[test]
+    fn unchanged_preserved_source_skips_approximation_lint_and_exact_only_edit_blocks() {
+        let temp = fixture_project();
+        let source_revisions =
+            cad_model::jww_relevant_source_manifest(temp.path()).expect("source manifest");
+        let interop = temp.path().join("interop/jww");
+        create_dir_all(&interop).expect("interop directory");
+        let manifest = cad_model::JwwPreservationManifest {
+            schema_version: "0.1".to_owned(),
+            state: cad_model::JwwCompatibilityState::PreservedReadOnly,
+            jww_version: Some(600),
+            drawing_name: "plan_1f".to_owned(),
+            original_relative_path: cad_model::JWW_ORIGINAL_RELATIVE_PATH.to_owned(),
+            original_blake3: "unused".to_owned(),
+            original_sha256: "unused".to_owned(),
+            reason: Some("unknown class".to_owned()),
+            source_revisions,
+            edit_capability: cad_model::JwwEditCapability::ExactOnly,
+            records_relative_path: None,
+            records_blake3: None,
+            records_sha256: None,
+        };
+        write(
+            interop.join("preservation.toml"),
+            toml::to_string_pretty(&manifest).expect("manifest TOML"),
+        )
+        .expect("preservation manifest");
+
+        let unchanged =
+            check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+        assert_eq!(unchanged.status, CheckStatus::Ok);
+        assert!(
+            unchanged
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.code.starts_with("jww."))
+        );
+
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            line_entity("ent_01JZ0000000000000000000000", "0-1").replace("910.0", "920.0"),
+        )
+        .expect("direct source edit");
+        let edited = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+        assert_eq!(edited.status, CheckStatus::Error);
+        assert_code(&edited, "jww.exact_only_source_changed");
     }
 
     #[test]

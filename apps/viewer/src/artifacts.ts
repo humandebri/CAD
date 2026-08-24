@@ -270,6 +270,12 @@ export type ExportIssue = {
 export type ExportReport = {
   schema_version: string;
   status: "exported" | "blocked";
+  mode:
+    | "generated_experimental"
+    | "generated_best_effort"
+    | "generated_strict"
+    | "preserved_exact"
+    | "preserved_edited";
   output_path: string;
   written_entities: number;
   expanded_entities: number;
@@ -291,6 +297,9 @@ export type ProjectState = {
   project_name: string;
   is_git_project: boolean;
   import_warning_count?: number | null;
+  jww_compatibility_state?: "editable_lossless" | "preserved_read_only" | "unsupported_version" | "malformed" | null;
+  jww_compatibility_reason?: string | null;
+  jww_edit_capability?: "exact_only" | "mapped_v600" | null;
 };
 
 export type DesktopReviewSnapshot = {

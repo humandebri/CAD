@@ -5,6 +5,7 @@
 //! checker, renderer, or diff behavior.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -59,6 +60,8 @@ pub enum ModelError {
     InvalidEntityId { value: String },
     #[error("unsafe canonical source path {path}: {reason}")]
     UnsafeSourcePath { path: PathBuf, reason: String },
+    #[error("invalid JWW preservation state at {path}: {reason}")]
+    JwwPreservation { path: PathBuf, reason: String },
 }
 
 pub type ModelResult<T> = Result<T, ModelError>;
@@ -74,6 +77,8 @@ pub enum ProjectSourceKind {
     Comment,
     BlockDefinition,
     BlockEntities,
+    JwwOriginal,
+    JwwPreservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +86,68 @@ pub struct SourceFileRevision {
     pub relative_path: String,
     pub revision: String,
     pub exists: bool,
+}
+
+pub const JWW_ORIGINAL_RELATIVE_PATH: &str = "interop/jww/original.jww";
+pub const JWW_PRESERVATION_RELATIVE_PATH: &str = "interop/jww/preservation.toml";
+pub const JWW_RECORDS_RELATIVE_PATH: &str = "interop/jww/records.ndjson";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JwwEditCapability {
+    #[default]
+    ExactOnly,
+    MappedV600,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JwwCompatibilityState {
+    EditableLossless,
+    PreservedReadOnly,
+    UnsupportedVersion,
+    Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwwPreservationManifest {
+    pub schema_version: String,
+    pub state: JwwCompatibilityState,
+    pub jww_version: Option<u32>,
+    pub drawing_name: String,
+    pub original_relative_path: String,
+    pub original_blake3: String,
+    pub original_sha256: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub source_revisions: Vec<SourceFileRevision>,
+    #[serde(default)]
+    pub edit_capability: JwwEditCapability,
+    #[serde(default)]
+    pub records_relative_path: Option<String>,
+    #[serde(default)]
+    pub records_blake3: Option<String>,
+    #[serde(default)]
+    pub records_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JwwProjectCompatibility {
+    pub state: JwwCompatibilityState,
+    pub reason: Option<String>,
+    pub original_verified: bool,
+    pub changed_source_paths: Vec<String>,
+    pub edit_capability: JwwEditCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedJwwPreservationSnapshot {
+    pub manifest: JwwPreservationManifest,
+    pub original_bytes: Vec<u8>,
+    pub record_provenance_bytes: Option<Vec<u8>>,
+    pub source_manifest: Vec<SourceFileRevision>,
 }
 
 #[must_use]
@@ -93,6 +160,15 @@ pub fn classify_project_source_path(relative: &Path) -> Option<ProjectSourceKind
     }
     if relative == Path::new("cad.project.toml") {
         return Some(ProjectSourceKind::Project);
+    }
+    if relative == Path::new(JWW_ORIGINAL_RELATIVE_PATH) {
+        return Some(ProjectSourceKind::JwwOriginal);
+    }
+    if relative == Path::new(JWW_PRESERVATION_RELATIVE_PATH) {
+        return Some(ProjectSourceKind::JwwPreservation);
+    }
+    if relative == Path::new(JWW_RECORDS_RELATIVE_PATH) {
+        return Some(ProjectSourceKind::JwwPreservation);
     }
     let components = relative.components().collect::<Vec<_>>();
     let component = |index: usize| components.get(index)?.as_os_str().to_str();
@@ -143,7 +219,14 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
             if relative.components().count() == 1
                 && !matches!(
                     relative.file_name().and_then(|name| name.to_str()),
-                    Some("rules" | "drawings" | "comments" | "blocks" | "cad.project.toml")
+                    Some(
+                        "rules"
+                            | "drawings"
+                            | "comments"
+                            | "blocks"
+                            | "interop"
+                            | "cad.project.toml"
+                    )
                 )
             {
                 continue;
@@ -154,11 +237,16 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
             })?;
             if file_type.is_symlink() {
                 let parts = relative.components().collect::<Vec<_>>();
-                let may_hide_source_directory = parts.len() == 2
+                let may_hide_source_directory = (parts.len() == 1
                     && matches!(
                         parts.first().and_then(|part| part.as_os_str().to_str()),
-                        Some("drawings" | "blocks")
-                    );
+                        Some("rules" | "drawings" | "comments" | "blocks" | "interop")
+                    ))
+                    || (parts.len() == 2
+                        && matches!(
+                            parts.first().and_then(|part| part.as_os_str().to_str()),
+                            Some("drawings" | "blocks" | "interop")
+                        ));
                 if classify_project_source_path(relative).is_some() || may_hide_source_directory {
                     return Err(ModelError::UnsafeSourcePath {
                         path,
@@ -171,7 +259,7 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
                 if relative.components().count() == 1
                     && !matches!(
                         relative.file_name().and_then(|name| name.to_str()),
-                        Some("rules" | "drawings" | "comments" | "blocks")
+                        Some("rules" | "drawings" | "comments" | "blocks" | "interop")
                     )
                 {
                     continue;
@@ -197,6 +285,232 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
     visit(root, root, &mut output)?;
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(output)
+}
+
+pub fn jww_relevant_source_manifest(
+    root: impl AsRef<Path>,
+) -> ModelResult<Vec<SourceFileRevision>> {
+    source_manifest(root).map(|files| {
+        files
+            .into_iter()
+            .filter(|file| {
+                !matches!(
+                    classify_project_source_path(Path::new(&file.relative_path)),
+                    Some(ProjectSourceKind::Comment | ProjectSourceKind::JwwPreservation)
+                )
+            })
+            .collect()
+    })
+}
+
+pub fn load_jww_preservation_manifest(
+    root: impl AsRef<Path>,
+) -> ModelResult<Option<JwwPreservationManifest>> {
+    let root = root.as_ref();
+    let path = root.join(JWW_PRESERVATION_RELATIVE_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = read_canonical_source(root, &path)?;
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|source| ModelError::Toml { path, source })
+}
+
+fn validate_jww_preservation_manifest(
+    root: &Path,
+    manifest: &JwwPreservationManifest,
+) -> ModelResult<()> {
+    let manifest_path = root.join(JWW_PRESERVATION_RELATIVE_PATH);
+    if !matches!(manifest.schema_version.as_str(), "0.1" | "0.2") {
+        return Err(ModelError::JwwPreservation {
+            path: manifest_path,
+            reason: format!(
+                "unsupported preservation schema {:?}",
+                manifest.schema_version
+            ),
+        });
+    }
+    if manifest.original_relative_path != JWW_ORIGINAL_RELATIVE_PATH {
+        return Err(ModelError::JwwPreservation {
+            path: manifest_path,
+            reason: "original_relative_path is not canonical".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn jww_bytes_match(bytes: &[u8], expected_blake3: &str, expected_sha256: &str) -> bool {
+    blake3::hash(bytes).to_hex().as_str() == expected_blake3
+        && format!("{:x}", Sha256::digest(bytes)) == expected_sha256
+}
+
+fn read_jww_record_provenance_bytes(
+    root: &Path,
+    manifest: &JwwPreservationManifest,
+) -> ModelResult<Option<Vec<u8>>> {
+    if !jww_record_metadata_is_canonical(manifest) {
+        return Err(ModelError::JwwPreservation {
+            path: root.join(JWW_PRESERVATION_RELATIVE_PATH),
+            reason: "preservation schema and edit capability metadata are inconsistent".to_owned(),
+        });
+    }
+    match manifest.edit_capability {
+        JwwEditCapability::ExactOnly => Ok(None),
+        JwwEditCapability::MappedV600 => {
+            read_canonical_source_bytes(root, &root.join(JWW_RECORDS_RELATIVE_PATH)).map(Some)
+        }
+    }
+}
+
+fn jww_record_metadata_is_canonical(manifest: &JwwPreservationManifest) -> bool {
+    match manifest.edit_capability {
+        JwwEditCapability::ExactOnly => {
+            manifest.schema_version == "0.1"
+                && manifest.records_relative_path.is_none()
+                && manifest.records_blake3.is_none()
+                && manifest.records_sha256.is_none()
+        }
+        JwwEditCapability::MappedV600 => {
+            manifest.schema_version == CURRENT_SCHEMA_VERSION
+                && manifest.records_relative_path.as_deref() == Some(JWW_RECORDS_RELATIVE_PATH)
+                && manifest.records_blake3.is_some()
+                && manifest.records_sha256.is_some()
+        }
+    }
+}
+
+pub fn verified_jww_preservation_snapshot(
+    root: impl AsRef<Path>,
+) -> ModelResult<Option<VerifiedJwwPreservationSnapshot>> {
+    verified_jww_preservation_snapshot_with_hook(root.as_ref(), || {})
+}
+
+fn verified_jww_preservation_snapshot_with_hook(
+    root: &Path,
+    after_verified_reads: impl FnOnce(),
+) -> ModelResult<Option<VerifiedJwwPreservationSnapshot>> {
+    let source_manifest_before = source_manifest(root)?;
+    let Some(manifest) = load_jww_preservation_manifest(root)? else {
+        return Ok(None);
+    };
+    validate_jww_preservation_manifest(root, &manifest)?;
+    let original_bytes = read_canonical_source_bytes(root, &root.join(JWW_ORIGINAL_RELATIVE_PATH))?;
+    if !jww_bytes_match(
+        &original_bytes,
+        &manifest.original_blake3,
+        &manifest.original_sha256,
+    ) {
+        return Err(ModelError::JwwPreservation {
+            path: root.join(JWW_ORIGINAL_RELATIVE_PATH),
+            reason: "preserved JWW original hash does not match the manifest".to_owned(),
+        });
+    }
+    let record_provenance_bytes = read_jww_record_provenance_bytes(root, &manifest)?;
+    if let Some(records) = &record_provenance_bytes
+        && !jww_bytes_match(
+            records,
+            manifest.records_blake3.as_deref().expect("validated hash"),
+            manifest.records_sha256.as_deref().expect("validated hash"),
+        )
+    {
+        return Err(ModelError::JwwPreservation {
+            path: root.join(JWW_RECORDS_RELATIVE_PATH),
+            reason: "JWW record provenance hash does not match the manifest".to_owned(),
+        });
+    }
+    after_verified_reads();
+    let source_manifest_after = source_manifest(root)?;
+    if source_manifest_before != source_manifest_after {
+        return Err(ModelError::JwwPreservation {
+            path: root.to_path_buf(),
+            reason: "revision_conflict: canonical project sources changed while the JWW preservation snapshot was read".to_owned(),
+        });
+    }
+    Ok(Some(VerifiedJwwPreservationSnapshot {
+        manifest,
+        original_bytes,
+        record_provenance_bytes,
+        source_manifest: source_manifest_after,
+    }))
+}
+
+pub fn jww_project_compatibility(
+    root: impl AsRef<Path>,
+) -> ModelResult<Option<JwwProjectCompatibility>> {
+    let root = root.as_ref();
+    let Some(manifest) = load_jww_preservation_manifest(root)? else {
+        return Ok(None);
+    };
+    validate_jww_preservation_manifest(root, &manifest)?;
+    let original_path = root.join(JWW_ORIGINAL_RELATIVE_PATH);
+    let original = read_canonical_source_bytes(root, &original_path)?;
+    let original_verified = jww_bytes_match(
+        &original,
+        &manifest.original_blake3,
+        &manifest.original_sha256,
+    );
+    let records_verified = match manifest.edit_capability {
+        JwwEditCapability::ExactOnly => jww_record_metadata_is_canonical(&manifest),
+        JwwEditCapability::MappedV600 => {
+            let canonical_path = jww_record_metadata_is_canonical(&manifest);
+            let expected_blake3 = manifest.records_blake3.as_deref();
+            let expected_sha256 = manifest.records_sha256.as_deref();
+            if !canonical_path || expected_blake3.is_none() || expected_sha256.is_none() {
+                false
+            } else {
+                read_canonical_source_bytes(root, &root.join(JWW_RECORDS_RELATIVE_PATH))
+                    .map(|records| {
+                        jww_bytes_match(
+                            &records,
+                            expected_blake3.unwrap(),
+                            expected_sha256.unwrap(),
+                        )
+                    })
+                    .unwrap_or(false)
+            }
+        }
+    };
+    let current = jww_relevant_source_manifest(root)?;
+    let expected = manifest
+        .source_revisions
+        .iter()
+        .map(|file| (file.relative_path.as_str(), (&file.revision, file.exists)))
+        .collect::<BTreeMap<_, _>>();
+    let actual = current
+        .iter()
+        .map(|file| (file.relative_path.as_str(), (&file.revision, file.exists)))
+        .collect::<BTreeMap<_, _>>();
+    let changed_source_paths = expected
+        .keys()
+        .chain(actual.keys())
+        .filter(|path| expected.get(**path) != actual.get(**path))
+        .map(|path| (*path).to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let reason = if !original_verified {
+        Some("preserved JWW original hash does not match the manifest".to_owned())
+    } else if !records_verified {
+        Some("JWW record provenance is missing or failed hash verification".to_owned())
+    } else {
+        manifest.reason
+    };
+    Ok(Some(JwwProjectCompatibility {
+        state: if original_verified && records_verified {
+            manifest.state
+        } else {
+            JwwCompatibilityState::Malformed
+        },
+        reason,
+        original_verified,
+        changed_source_paths,
+        edit_capability: if original_verified && records_verified {
+            manifest.edit_capability
+        } else {
+            JwwEditCapability::ExactOnly
+        },
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -312,6 +626,8 @@ pub struct StyleRules {
 #[serde(deny_unknown_fields)]
 pub struct ColorDef {
     pub rgb: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub print_rgb: Option<String>,
     pub print_width: f64,
 }
 
@@ -634,6 +950,107 @@ impl Entity {
             Self::Solid { pen, .. } | Self::CurveSolid { pen, .. } => pen.as_deref(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedStroke {
+    pub color_rgb: String,
+    pub print_color_rgb: String,
+    pub line_width_mm: f64,
+    pub dash: Vec<f64>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StyleResolutionError {
+    #[error("entity {entity_id:?} references missing layer {layer:?}")]
+    MissingLayer { entity_id: String, layer: String },
+    #[error("entity {entity_id:?} references missing pen {pen:?}")]
+    MissingPen { entity_id: String, pen: String },
+    #[error("entity {entity_id:?} references missing color {color:?}")]
+    MissingColor { entity_id: String, color: String },
+    #[error("entity {entity_id:?} references missing line type {line_type:?}")]
+    MissingLineType {
+        entity_id: String,
+        line_type: String,
+    },
+}
+
+pub fn resolve_entity_stroke(
+    project: &ProjectSource,
+    entity: &Entity,
+) -> Result<ResolvedStroke, StyleResolutionError> {
+    let entity_id = entity.id().as_str();
+    let layer = project.layers.layers.get(entity.layer()).ok_or_else(|| {
+        StyleResolutionError::MissingLayer {
+            entity_id: entity_id.to_owned(),
+            layer: entity.layer().to_owned(),
+        }
+    })?;
+    let (color_id, line_type_id, line_width_mm) =
+        if let Some(pen_id) = entity.pen() {
+            let pen = project.styles.pens.get(pen_id).ok_or_else(|| {
+                StyleResolutionError::MissingPen {
+                    entity_id: entity_id.to_owned(),
+                    pen: pen_id.to_owned(),
+                }
+            })?;
+            (&pen.color, &pen.line_type, pen.line_width)
+        } else {
+            (&layer.color, &layer.line_type, layer.line_width)
+        };
+    let color =
+        project
+            .styles
+            .colors
+            .get(color_id)
+            .ok_or_else(|| StyleResolutionError::MissingColor {
+                entity_id: entity_id.to_owned(),
+                color: color_id.clone(),
+            })?;
+    let line_type = project.styles.line_types.get(line_type_id).ok_or_else(|| {
+        StyleResolutionError::MissingLineType {
+            entity_id: entity_id.to_owned(),
+            line_type: line_type_id.clone(),
+        }
+    })?;
+    Ok(ResolvedStroke {
+        color_rgb: color.rgb.clone(),
+        print_color_rgb: color.print_rgb.clone().unwrap_or_else(|| color.rgb.clone()),
+        line_width_mm,
+        dash: line_type.dash.clone(),
+    })
+}
+
+pub fn resolve_print_fill_color(
+    project: &ProjectSource,
+    entity: &Entity,
+    color_id: &str,
+) -> Result<String, StyleResolutionError> {
+    project
+        .styles
+        .colors
+        .get(color_id)
+        .map(|color| color.print_rgb.clone().unwrap_or_else(|| color.rgb.clone()))
+        .ok_or_else(|| StyleResolutionError::MissingColor {
+            entity_id: entity.id().as_str().to_owned(),
+            color: color_id.to_owned(),
+        })
+}
+
+pub fn resolve_fill_color(
+    project: &ProjectSource,
+    entity: &Entity,
+    color_id: &str,
+) -> Result<String, StyleResolutionError> {
+    project
+        .styles
+        .colors
+        .get(color_id)
+        .map(|color| color.rgb.clone())
+        .ok_or_else(|| StyleResolutionError::MissingColor {
+            entity_id: entity.id().as_str().to_owned(),
+            color: color_id.to_owned(),
+        })
 }
 
 fn default_entity_scale() -> f64 {
@@ -1072,6 +1489,14 @@ fn read_entities(root: &Path, path: &Path) -> ModelResult<Vec<EntityRecord>> {
 }
 
 fn read_canonical_source(root: &Path, path: &Path) -> ModelResult<String> {
+    let bytes = read_canonical_source_bytes(root, path)?;
+    String::from_utf8(bytes).map_err(|source| ModelError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
+}
+
+fn read_canonical_source_bytes(root: &Path, path: &Path) -> ModelResult<Vec<u8>> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| ModelError::UnsafeSourcePath {
@@ -1115,7 +1540,7 @@ fn read_canonical_source(root: &Path, path: &Path) -> ModelResult<String> {
         });
     }
 
-    fs::read_to_string(path).map_err(|source| ModelError::Read {
+    fs::read(path).map_err(|source| ModelError::Read {
         path: path.to_path_buf(),
         source,
     })
@@ -1150,6 +1575,22 @@ mod tests {
         assert_eq!(
             classify_project_source_path(Path::new("blocks/door/entities.ndjson")),
             Some(ProjectSourceKind::BlockEntities)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("interop/jww/original.jww")),
+            Some(ProjectSourceKind::JwwOriginal)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("interop/jww/preservation.toml")),
+            Some(ProjectSourceKind::JwwPreservation)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("interop/jww/records.ndjson")),
+            Some(ProjectSourceKind::JwwPreservation)
+        );
+        assert_eq!(
+            classify_project_source_path(Path::new("interop/jww/extra.bin")),
+            None
         );
         assert_eq!(
             classify_project_source_path(Path::new("drawings/plan/sheet.toml")),
@@ -1266,6 +1707,67 @@ mod tests {
             source_manifest(temp.path()),
             Err(ModelError::UnsafeSourcePath { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jww_preservation_reader_rejects_symlinked_interop_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside-jww");
+        create_dir_all(project.join("interop")).expect("interop directory");
+        create_dir_all(&outside).expect("outside directory");
+        write(
+            outside.join("preservation.toml"),
+            "schema_version = \"0.1\"\n",
+        )
+        .expect("outside manifest");
+        symlink(&outside, project.join("interop/jww")).expect("interop symlink");
+
+        assert!(matches!(
+            load_jww_preservation_manifest(&project),
+            Err(ModelError::UnsafeSourcePath { .. })
+        ));
+    }
+
+    #[test]
+    fn verified_jww_snapshot_supports_exact_only_and_detects_source_races() {
+        let temp = minimal_project();
+        create_dir_all(temp.path().join("interop/jww")).expect("interop directory");
+        let original = b"exact original bytes";
+        write(temp.path().join(JWW_ORIGINAL_RELATIVE_PATH), original).expect("original");
+        write(
+            temp.path().join(JWW_PRESERVATION_RELATIVE_PATH),
+            format!(
+                concat!(
+                    "schema_version = \"0.1\"\n",
+                    "state = \"preserved_read_only\"\n",
+                    "drawing_name = \"plan_1f\"\n",
+                    "original_relative_path = \"interop/jww/original.jww\"\n",
+                    "original_blake3 = \"{}\"\n",
+                    "original_sha256 = \"{}\"\n",
+                    "edit_capability = \"exact_only\"\n",
+                ),
+                blake3::hash(original).to_hex(),
+                format!("{:x}", Sha256::digest(original)),
+            ),
+        )
+        .expect("manifest");
+
+        let snapshot = verified_jww_preservation_snapshot(temp.path())
+            .expect("snapshot")
+            .expect("provenance");
+        assert_eq!(snapshot.original_bytes, original);
+        assert!(snapshot.record_provenance_bytes.is_none());
+
+        let entities = temp.path().join("drawings/plan_1f/entities.ndjson");
+        let error = verified_jww_preservation_snapshot_with_hook(temp.path(), || {
+            write(&entities, "").expect("mutate canonical source");
+        })
+        .expect_err("source mutation must invalidate the snapshot");
+        assert!(matches!(error, ModelError::JwwPreservation { .. }));
     }
     use std::fs::{create_dir_all, write};
 
@@ -1501,6 +2003,49 @@ mod tests {
 
         assert_eq!(d1, [-2.0, 0.0]);
         assert_eq!(d2, [-2.0, 10.0]);
+    }
+
+    #[test]
+    fn resolves_layer_and_entity_pen_styles_through_one_contract() {
+        let temp = minimal_project();
+        let mut project = load_project(temp.path()).expect("project should load");
+        project.styles.colors.insert(
+            "red".to_owned(),
+            ColorDef {
+                rgb: "#FF0000".to_owned(),
+                print_rgb: Some("#AA0000".to_owned()),
+                print_width: 0.35,
+            },
+        );
+        project.styles.line_types.insert(
+            "dash".to_owned(),
+            LineTypeDef {
+                dash: vec![12.0, 6.0],
+            },
+        );
+        project.styles.pens.insert(
+            "red_dash".to_owned(),
+            PenStyleDef {
+                color: "red".to_owned(),
+                line_type: "dash".to_owned(),
+                line_width: 0.5,
+            },
+        );
+        let mut entity = project.drawings[0].entities[0].entity.clone();
+        let Entity::Line { pen, .. } = &mut entity else {
+            panic!("fixture should be a line");
+        };
+        *pen = Some("red_dash".to_owned());
+
+        assert_eq!(
+            resolve_entity_stroke(&project, &entity).expect("style should resolve"),
+            ResolvedStroke {
+                color_rgb: "#FF0000".to_owned(),
+                print_color_rgb: "#AA0000".to_owned(),
+                line_width_mm: 0.5,
+                dash: vec![12.0, 6.0],
+            }
+        );
     }
 
     fn minimal_project() -> tempfile::TempDir {

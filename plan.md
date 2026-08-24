@@ -17,10 +17,29 @@
   recovery 保全を共通不変条件とする。source の分類とrevision manifestは
   `cad-model` のAPIだけを使用する。
 - JWW import の既定値は block preserve、`--flatten` は明示的な変換モードと
-  する。JWW export は strict/lossy report を生成し、Windows/Jw_cad 検証が
-  完了するまで Experimental 表示を維持する。
+  する。v600 import は入力bytesとhash/source provenanceを保存し、未知class・
+  未対応versionはread-onlyで保持する。未編集projectは元JWWをbyte-exactで
+  保存できる。manifest `0.2` の `mapped_v600` importはhash検証済みの
+  `interop/jww/records.ndjson`を使い、文字type/end、寸法SXF/補助record、block
+  metadataを編集後も保持する。strict preserveでは既存寸法の表示値だけを変更し、
+  通常のbest-effort exportでは形状・offset・style・鏡映変更を決定的なv600 recordへ
+  再生成してwarningを記録する。旧manifestまたはsidecar不整合は
+  `exact_only`へfail closedする。検証済みsnapshot取得後とpublish直前にcanonical
+  source manifestを照合し、編集後のpreserve exportはcheckerとblock参照整合性を
+  検査してfail closedする。互換範囲はhash固定fixture、record inventory、byte-exact
+  unchanged export、semantic re-importで判定する。
+- AIはcanonical TOML/NDJSONを直接編集し、`cadc check --target cad`を必須とする。
+  JWW出力前は`--target jww-v600`のwarningを確認し、通常exportはbest-effort、
+  `--strict`だけが近似をblockする。直接編集はDesktop履歴ではなくGitで追跡する。
 - PDF は Rust renderer が active layout を直接解釈し、printable layer のみを
-  atomic publish する。
+  atomic publish する。pen、色、線種、物理線幅、fill、文字style、寸法はSVGと
+  共通の正本style解決を使用する。
+- Desktop watcher は native filesystem watcher を優先する。開始できない場合
+  だけ canonical source manifest を1秒周期で比較し、native開始後のruntime
+  errorはeventとして通知する。
+- Git HEAD reviewはcanonical repository/project pathとcommit OIDをkeyにした
+  1-entry cacheを使う。同じOIDではworking treeが変化しても展開済みsourceを
+  再利用し、OIDまたはproject変更時に置換する。
 
 ## 実装フェーズ
 
@@ -53,9 +72,10 @@ JWW import/export、PDF へ接続する。simple hatch と有限な layout を�
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo check -p cad-desktop --no-default-features
 pnpm --dir apps/viewer typecheck
 pnpm --dir apps/viewer build
-pnpm --dir apps/viewer test
+pnpm --dir apps/viewer test:unit
 pnpm --dir apps/viewer test:e2e
 pnpm --dir apps/viewer desktop:smoke
 pnpm --dir apps/viewer desktop:e2e
@@ -63,13 +83,14 @@ pnpm --dir apps/viewer desktop:e2e
 
 CI は `rust-toolchain.toml` と viewer の lockfile を固定し、上記の Rust、型検査、
 unit、Playwright、macOS embedded-WebDriver gate を同じ順序で実行する。
-Windows/Jw_cad の preserve round-trip と macOS の PDF Preview 確認は
-release gate として別途記録する。
+JWWはfixture manifestとfile-level round-trip、PDFは外部parser/rasterizerを
+release gateとする。外部アプリケーション確認は任意の追加証拠として扱う。
 
 ## 次のリリースゲート
 
-- native watcher を優先し、poll fallback の対象拡張子と間隔を制限する。
-- PDF の pen、line type、line width、text style fidelity を SVG と共通化する。
 - checker の大規模 polyline/hatch self-intersection を空間 index で高速化する。
-- Windows/Jw_cad preserve import → export → re-import の fixture/hash/report を
-  再現可能な artifact として記録する。
+- PDFのOFL日本語font deterministic subset埋め込みと外部
+  parser/rasterizer CI gateは完了。
+- JWW fixture corpusへsolid、dimension、block、hatch、paletteを追加し、hash、
+  record inventory、byte-exact unchanged export、best-effort編集後のsemantic
+  re-importをCIで検証する。corpus外のclassやfieldを完全互換とは表明しない。
