@@ -4,6 +4,7 @@
 
 - JWW is an import/export boundary. After import, edit the canonical TOML and NDJSON project files directly.
 - Editable source paths are limited to `cad.project.toml`, `rules/*.toml`, `drawings/*/layouts.toml`, `drawings/*/entities.ndjson`, `blocks/*/definition.toml`, and `blocks/*/entities.ndjson`.
+- `comments/*.ndjson` is app-managed canonical project data, but is not part of the AI direct-edit surface.
 - Do not edit `interop/`, JWW provenance, `build/`, `.cad-history`, transaction journals, recovery data, or generated PDF/SVG/JWW files as source.
 - Keep an existing entity `id` when updating it. Assign a new unique valid entity ID only when creating an entity. Delete an entity by deleting its complete NDJSON line.
 - Keep NDJSON as exactly one JSON entity per non-empty line. Preserve valid layer, pen, style, layout, block, and fill references.

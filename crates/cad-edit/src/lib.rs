@@ -4228,6 +4228,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_transaction_rejects_jww_interop_files() {
+        let error = validate_source_relative_path(Path::new("interop/jww/original.jww"))
+            .expect_err("JWW provenance is not editable source");
+        assert!(matches!(error, EditError::InvalidEntity(_)));
+    }
+
+    #[test]
     fn source_transaction_publishes_and_cleans_its_journal() {
         let temp = test_project(false);
         let relative = Path::new("drawings/plan/entities.ndjson");

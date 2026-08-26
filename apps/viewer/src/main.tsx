@@ -1486,7 +1486,7 @@ function App() {
       if (report.status === "exported") {
         setImportMessage(report.mode === "preserved_exact"
           ? "JWW saved byte-for-byte from the preserved original."
-          : "JWW saved in compatibility mode; Windows Jw_cad validation remains required.");
+          : "JWW saved in compatibility mode; review the file-level compatibility report.");
       } else {
         setImportMessage(`Compatible JWW save blocked: ${report.blockers.map((issue) => issue.message).join("; ")}`);
       }

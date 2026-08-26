@@ -87,6 +87,8 @@ pub enum ExportError {
     },
     #[error("JWW preservation is unavailable: {0}")]
     Preservation(String),
+    #[error("revision_conflict: canonical project sources changed during JWW export")]
+    RevisionConflict,
 }
 
 pub type ExportResult<T> = Result<T, ExportError>;
@@ -97,8 +99,37 @@ pub fn export_jww_file(
     output_path: impl AsRef<Path>,
     options: ExportOptions,
 ) -> ExportResult<ExportReport> {
+    let project_path = project_path.as_ref();
+    let expected_manifest = cad_model::source_manifest(project_path)?;
+    export_jww_file_with_expected_manifest(
+        project_path,
+        drawing_name,
+        output_path.as_ref(),
+        options,
+        &expected_manifest,
+        || {},
+    )
+}
+
+fn export_jww_file_with_expected_manifest(
+    project_path: &Path,
+    drawing_name: &str,
+    output_path: &Path,
+    options: ExportOptions,
+    expected_manifest: &[cad_model::SourceFileRevision],
+    before_publish: impl FnOnce(),
+) -> ExportResult<ExportReport> {
+    ensure_preservation_snapshot_current(project_path, expected_manifest)?;
     let project = cad_model::load_project(project_path)?;
-    export_loaded_project(&project, drawing_name, output_path.as_ref(), options)
+    ensure_preservation_snapshot_current(project_path, expected_manifest)?;
+    let prepared = prepare_loaded_project(&project, drawing_name, output_path, options)?;
+    let Some(bytes) = prepared.bytes else {
+        return Ok(prepared.report);
+    };
+    before_publish();
+    ensure_preservation_snapshot_current(project_path, expected_manifest)?;
+    publish(output_path, &bytes, options.overwrite)?;
+    Ok(prepared.report)
 }
 
 pub fn export_jww_file_auto(
@@ -233,6 +264,7 @@ pub fn export_jww_file_preserving_with_options(
                 drawing_name,
                 output_path,
                 overwrite,
+                &snapshot.source_manifest,
                 format!(
                     "preserved JWW header cannot represent changes to {}; generated v600 output was used",
                     incompatible.join(", ")
@@ -257,7 +289,9 @@ pub fn export_jww_file_preserving_with_options(
             }],
         });
     }
+    ensure_preservation_snapshot_current(project_path, &snapshot.source_manifest)?;
     let project = cad_model::load_project(project_path)?;
+    ensure_preservation_snapshot_current(project_path, &snapshot.source_manifest)?;
     let invalid_project = cad_check::check_loaded_project(&project)
         .diagnostics
         .into_iter()
@@ -290,6 +324,7 @@ pub fn export_jww_file_preserving_with_options(
                 drawing_name,
                 output_path,
                 overwrite,
+                &snapshot.source_manifest,
                 "edited records could not be merged with provenance; generated v600 output was used"
                     .to_owned(),
             );
@@ -310,9 +345,30 @@ fn generated_preservation_fallback(
     drawing_name: &str,
     output_path: &Path,
     overwrite: bool,
+    expected_manifest: &[cad_model::SourceFileRevision],
     message: String,
 ) -> ExportResult<ExportReport> {
-    let mut report = export_jww_file(
+    generated_preservation_fallback_with_hook(
+        project_path,
+        drawing_name,
+        output_path,
+        overwrite,
+        expected_manifest,
+        message,
+        || {},
+    )
+}
+
+fn generated_preservation_fallback_with_hook(
+    project_path: &Path,
+    drawing_name: &str,
+    output_path: &Path,
+    overwrite: bool,
+    expected_manifest: &[cad_model::SourceFileRevision],
+    message: String,
+    before_publish: impl FnOnce(),
+) -> ExportResult<ExportReport> {
+    let mut report = export_jww_file_with_expected_manifest(
         project_path,
         drawing_name,
         output_path,
@@ -321,6 +377,8 @@ fn generated_preservation_fallback(
             overwrite,
             strict_approximations: false,
         },
+        expected_manifest,
+        before_publish,
     )?;
     report.warnings.insert(
         0,
@@ -347,10 +405,7 @@ fn changed_jww_source_paths(
         .filter(|file| {
             !matches!(
                 cad_model::classify_project_source_path(Path::new(&file.relative_path)),
-                Some(
-                    cad_model::ProjectSourceKind::Comment
-                        | cad_model::ProjectSourceKind::JwwPreservation
-                )
+                Some(cad_model::ProjectSourceKind::Comment)
             )
         })
         .map(|file| (file.relative_path.as_str(), (&file.revision, file.exists)))
@@ -370,9 +425,7 @@ fn ensure_preservation_snapshot_current(
     expected: &[cad_model::SourceFileRevision],
 ) -> ExportResult<()> {
     if cad_model::source_manifest(project_path)? != expected {
-        return Err(ExportError::Preservation(
-            "revision_conflict: canonical project sources changed before JWW publish".to_owned(),
-        ));
+        return Err(ExportError::RevisionConflict);
     }
     Ok(())
 }
@@ -935,6 +988,24 @@ pub fn export_loaded_project(
     output_path: &Path,
     options: ExportOptions,
 ) -> ExportResult<ExportReport> {
+    let prepared = prepare_loaded_project(project, drawing_name, output_path, options)?;
+    if let Some(bytes) = prepared.bytes {
+        publish(output_path, &bytes, options.overwrite)?;
+    }
+    Ok(prepared.report)
+}
+
+struct PreparedJwwExport {
+    report: ExportReport,
+    bytes: Option<Vec<u8>>,
+}
+
+fn prepare_loaded_project(
+    project: &ProjectSource,
+    drawing_name: &str,
+    output_path: &Path,
+    options: ExportOptions,
+) -> ExportResult<PreparedJwwExport> {
     let drawing = project
         .drawings
         .iter()
@@ -1017,18 +1088,20 @@ pub fn export_loaded_project(
     }
     let expanded = records.len();
     if !context.blockers.is_empty() {
-        return Ok(context.report(ExportStatus::Blocked, 0, expanded));
-    }
-    if output_path.exists() && !options.overwrite {
-        return Err(ExportError::OutputExists(output_path.to_path_buf()));
+        return Ok(PreparedJwwExport {
+            report: context.report(ExportStatus::Blocked, 0, expanded),
+            bytes: None,
+        });
     }
     let bytes = cad_jww_codec::write_document(&Document {
         header,
         records,
         blocks: block_definitions,
     })?;
-    publish(output_path, &bytes, options.overwrite)?;
-    Ok(context.report(ExportStatus::Exported, written, expanded))
+    Ok(PreparedJwwExport {
+        report: context.report(ExportStatus::Exported, written, expanded),
+        bytes: Some(bytes),
+    })
 }
 
 struct ExportContext<'a> {
@@ -2167,6 +2240,47 @@ mod tests {
             fs::read(output).expect("existing output"),
             b"existing output"
         );
+    }
+
+    #[test]
+    fn generated_fallback_rechecks_sources_before_publish() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let imported = temp.path().join("imported");
+        cad_import_jww::import_jww_file(&fixture, &imported).expect("import");
+        let expected = cad_model::source_manifest(&imported).expect("source manifest");
+        let output = temp.path().join("existing.jww");
+        fs::write(&output, b"existing output").expect("existing output");
+        let entities = imported.join("drawings/test1/entities.ndjson");
+
+        let error = generated_preservation_fallback_with_hook(
+            &imported,
+            "test1",
+            &output,
+            true,
+            &expected,
+            "test fallback".to_owned(),
+            || {
+                let mut source = fs::read_to_string(&entities).expect("entities");
+                source.push(' ');
+                fs::write(&entities, source).expect("concurrent source edit");
+            },
+        )
+        .expect_err("stale generated output must not publish");
+
+        assert!(matches!(error, ExportError::RevisionConflict));
+        assert_eq!(
+            fs::read(&output).expect("existing output"),
+            b"existing output"
+        );
+        assert!(fs::read_dir(temp.path()).expect("temp root").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cad-jww-export-")
+        }));
     }
 
     #[test]

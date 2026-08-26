@@ -30,7 +30,7 @@ Jw_cad風の2D建築作図体験を、AIが直接編集できるテキスト正�
 
 - 「Jw_cad準拠」は、作図文化、操作感、レイヤ/線色/線種思想の準拠を意味する。
 - JWWは境界形式として扱い、preserve import と Experimental export を提供する。
-- Windows/Jw_cadでの互換検証が完了するまで、exportはExperimentalと表示する。
+- hash付きfixture corpusが主要record classを網羅するまで、exportはExperimentalと表示する。
 - Jw_cad本体のコード、画面素材、文言、完全な画面配置は流用しない。
 
 ### Source Format
@@ -213,7 +213,7 @@ lucide-preact
 
 ### Platform And License
 
-- 開発・基準環境はmacOS Apple Silicon。Windows/Jw_cad互換はrelease gateで検証する。
+- 開発・基準環境はmacOS Apple Silicon。Windows/Jw_cad実機確認は任意の追加証拠とする。
 - 自前core、`cadc`、viewerはApache-2.0を推奨する。
 - QCAD連携は別plugin/別repo/明確な境界にする。
 
@@ -230,8 +230,8 @@ lucide-preact
 - 未知classと未対応versionはread-onlyで保持し、原本抽出だけを許可する。
 - 未編集projectのpreserve exportは原本をbyte-exactで返す。編集後は原headerを
   保持する。manifest 0.2のhash検証済みrecord sidecarで文字type/end、寸法
-  SXF/補助record、block metadataを保持し、sidecar欠損・改変、未model化field、
-  近似変換は出力せずfail closedする。
+  SXF/補助record、block metadataを保持する。sidecar欠損・改変はfail closedし、
+  表現可能な近似・展開・文字置換はreportへ記録する。
 - JWW再import時のstable entity IDと任意編集後の無劣化往復は保証しない。
-- exportはstrictを既定とし、lossy変換は明示指定とreportを必須にする。
-- Windows版Jw_cadとライセンス確認済みsolid fixtureで検証するまでExperimentalと表示する。
+- 通常exportはbest-effortとし、`--strict`指定時は近似・展開・文字置換を拒否する。
+- release gateはhash付きfixture inventory、golden bytes、再import後のsemantic comparisonとする。

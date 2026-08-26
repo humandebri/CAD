@@ -338,6 +338,9 @@ mod tests {
         fs::create_dir_all(temp.path().join("build")).expect("build should be created");
         fs::write(temp.path().join("build/report.json"), "{}\n")
             .expect("build report should be written");
+        fs::create_dir_all(temp.path().join("interop/jww")).expect("interop should be created");
+        fs::write(temp.path().join("interop/jww/original.jww"), b"not source")
+            .expect("interop original should be written");
         init_repo(temp.path());
         let cache = HeadSnapshotCache::default();
         let runner = CountingGitRunner::default();
@@ -366,7 +369,11 @@ mod tests {
                 .lock()
                 .expect("shown should lock")
                 .iter()
-                .all(|path| !path.contains("README.md") && !path.contains("build/report.json"))
+                .all(|path| {
+                    !path.contains("README.md")
+                        && !path.contains("build/report.json")
+                        && !path.contains("interop/jww/original.jww")
+                })
         );
     }
 

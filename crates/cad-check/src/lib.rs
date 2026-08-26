@@ -98,42 +98,85 @@ pub fn check_project_for_target(
     match cad_model::load_project(root) {
         Ok(project) => {
             let mut effective_target = target;
+            let mut effective_drawing = drawing_name.map(str::to_owned);
             let mut preservation_diagnostics = Vec::new();
             if target == CheckTarget::JwwV600 {
-                match cad_model::load_jww_preservation_manifest(root) {
-                    Ok(Some(manifest)) => match cad_model::jww_relevant_source_manifest(root) {
-                        Ok(current) if current == manifest.source_revisions => {
-                            effective_target = CheckTarget::Cad;
-                        }
-                        Ok(_)
-                            if manifest.edit_capability
-                                == cad_model::JwwEditCapability::ExactOnly =>
+                match cad_model::verified_jww_preservation_snapshot(root) {
+                    Ok(Some(snapshot)) => {
+                        effective_drawing
+                            .get_or_insert_with(|| snapshot.manifest.drawing_name.clone());
+                        if !project
+                            .drawings
+                            .iter()
+                            .any(|drawing| drawing.name == snapshot.manifest.drawing_name)
                         {
                             preservation_diagnostics.push(CheckDiagnostic {
                                 severity: Severity::Error,
-                                file: cad_model::JWW_PRESERVATION_RELATIVE_PATH.to_owned(),
+                                file: "drawings".to_owned(),
                                 line: None,
                                 entity_id: None,
                                 field: None,
-                                code: "jww.exact_only_source_changed".to_owned(),
-                                message: "this JWW import has no safe record mapping; edited source cannot be exported"
-                                    .to_owned(),
+                                code: "jww.drawing_not_found".to_owned(),
+                                message: format!(
+                                    "preserved drawing {:?} was not found",
+                                    snapshot.manifest.drawing_name
+                                ),
                             });
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            preservation_diagnostics.push(model_error_to_diagnostic(root, &error));
+                        if effective_drawing.as_deref()
+                            != Some(snapshot.manifest.drawing_name.as_str())
+                        {
+                            preservation_diagnostics.push(CheckDiagnostic {
+                                severity: Severity::Error,
+                                file: "drawings".to_owned(),
+                                line: None,
+                                entity_id: None,
+                                field: None,
+                                code: "jww.preservation_drawing_mismatch".to_owned(),
+                                message: format!(
+                                    "preserved JWW drawing is {:?}, not {:?}",
+                                    snapshot.manifest.drawing_name,
+                                    effective_drawing.as_deref().unwrap_or_default()
+                                ),
+                            });
                         }
-                    },
+                        match cad_model::jww_relevant_source_manifest(root) {
+                            Ok(current) if current == snapshot.manifest.source_revisions => {
+                                effective_target = CheckTarget::Cad;
+                            }
+                            Ok(_)
+                                if snapshot.manifest.edit_capability
+                                    == cad_model::JwwEditCapability::ExactOnly =>
+                            {
+                                preservation_diagnostics.push(CheckDiagnostic {
+                                    severity: Severity::Error,
+                                    file: cad_model::JWW_PRESERVATION_RELATIVE_PATH.to_owned(),
+                                    line: None,
+                                    entity_id: None,
+                                    field: None,
+                                    code: "jww.exact_only_source_changed".to_owned(),
+                                    message: "this JWW import has no safe record mapping; edited source cannot be exported"
+                                        .to_owned(),
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(error) => preservation_diagnostics
+                                .push(model_error_to_diagnostic(root, &error)),
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         preservation_diagnostics.push(model_error_to_diagnostic(root, &error));
+                        effective_target = CheckTarget::Cad;
                     }
                 }
             }
-            let mut diagnostics =
-                check_loaded_project_for_target(&project, effective_target, drawing_name)
-                    .diagnostics;
+            let mut diagnostics = check_loaded_project_for_target(
+                &project,
+                effective_target,
+                effective_drawing.as_deref(),
+            )
+            .diagnostics;
             diagnostics.extend(preservation_diagnostics);
             CheckReport::new(diagnostics)
         }
@@ -304,96 +347,111 @@ fn jww_v600_diagnostics(
         }
     }
     for record in &drawing.entities {
-        check_jww_entity_style(&mut diagnostics, project, &file, record);
-        match &record.entity {
-            Entity::Polyline { .. } => push_jww_entity_warning(
-                &mut diagnostics,
-                &file,
-                record,
-                "jww.polyline_expanded",
-                "polyline is exported as individual JWW line records",
-            ),
-            Entity::Hatch { .. } => push_jww_entity_warning(
-                &mut diagnostics,
-                &file,
-                record,
-                "jww.hatch_pattern_approximated",
-                "hatch pattern is exported as deterministic solid geometry",
-            ),
-            Entity::Dimension {
-                value,
-                style,
-                text_mirror_y,
-                ..
-            } => {
-                push_jww_entity_warning(
-                    &mut diagnostics,
-                    &file,
-                    record,
-                    "jww.dimension_style_approximated",
-                    "dimension style semantics are approximated by JWW v600 fields",
-                );
-                if *text_mirror_y {
-                    push_jww_entity_warning(
-                        &mut diagnostics,
-                        &file,
-                        record,
-                        "jww.mirrored_text_approximated",
-                        "mirrored dimension text is exported without mirroring",
-                    );
-                }
-                if let Some(value) = value {
-                    check_cp932(&mut diagnostics, &file, record, value);
-                }
-                if let Some(dimension_style) = project.styles.dimension_styles.get(style)
-                    && let Some(text_style) =
-                        project.styles.text_styles.get(&dimension_style.text_style)
-                    && text_style.font_family != "MS Gothic"
-                {
-                    push_jww_entity_warning(
-                        &mut diagnostics,
-                        &file,
-                        record,
-                        "jww.font_substituted",
-                        "font is substituted with MS Gothic in JWW v600",
-                    );
-                }
-            }
-            Entity::Text {
-                value,
-                style,
-                mirror_y,
-                ..
-            } => {
-                if *mirror_y {
-                    push_jww_entity_warning(
-                        &mut diagnostics,
-                        &file,
-                        record,
-                        "jww.mirrored_text_approximated",
-                        "mirrored text is exported without mirroring",
-                    );
-                }
-                check_cp932(&mut diagnostics, &file, record, value);
-                if project
-                    .styles
-                    .text_styles
-                    .get(style)
-                    .is_some_and(|style| style.font_family != "MS Gothic")
-                {
-                    push_jww_entity_warning(
-                        &mut diagnostics,
-                        &file,
-                        record,
-                        "jww.font_substituted",
-                        "font is substituted with MS Gothic in JWW v600",
-                    );
-                }
-            }
-            _ => {}
+        check_jww_entity(&mut diagnostics, project, &file, record);
+    }
+    for (block_id, block) in &project.blocks {
+        let file = format!("blocks/{block_id}/entities.ndjson");
+        for record in &block.entities {
+            check_jww_entity(&mut diagnostics, project, &file, record);
         }
     }
     diagnostics
+}
+
+fn check_jww_entity(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    project: &ProjectSource,
+    file: &str,
+    record: &EntityRecord,
+) {
+    check_jww_entity_style(diagnostics, project, file, record);
+    match &record.entity {
+        Entity::Polyline { .. } => push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.polyline_expanded",
+            "polyline is exported as individual JWW line records",
+        ),
+        Entity::Hatch { .. } => push_jww_entity_warning(
+            diagnostics,
+            file,
+            record,
+            "jww.hatch_pattern_approximated",
+            "hatch pattern is exported as deterministic solid geometry",
+        ),
+        Entity::Dimension {
+            value,
+            style,
+            text_mirror_y,
+            ..
+        } => {
+            push_jww_entity_warning(
+                diagnostics,
+                file,
+                record,
+                "jww.dimension_style_approximated",
+                "dimension style semantics are approximated by JWW v600 fields",
+            );
+            if *text_mirror_y {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.mirrored_text_approximated",
+                    "mirrored dimension text is exported without mirroring",
+                );
+            }
+            if let Some(value) = value {
+                check_cp932(diagnostics, file, record, value);
+            }
+            if let Some(dimension_style) = project.styles.dimension_styles.get(style)
+                && let Some(text_style) =
+                    project.styles.text_styles.get(&dimension_style.text_style)
+                && text_style.font_family != "MS Gothic"
+            {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.font_substituted",
+                    "font is substituted with MS Gothic in JWW v600",
+                );
+            }
+        }
+        Entity::Text {
+            value,
+            style,
+            mirror_y,
+            ..
+        } => {
+            if *mirror_y {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.mirrored_text_approximated",
+                    "mirrored text is exported without mirroring",
+                );
+            }
+            check_cp932(diagnostics, file, record, value);
+            if project
+                .styles
+                .text_styles
+                .get(style)
+                .is_some_and(|style| style.font_family != "MS Gothic")
+            {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.font_substituted",
+                    "font is substituted with MS Gothic in JWW v600",
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_jww_entity_style(
@@ -1626,6 +1684,7 @@ fn direction(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::fs::{create_dir_all, write};
     use std::path::PathBuf;
 
@@ -1843,30 +1902,7 @@ mod tests {
     #[test]
     fn unchanged_preserved_source_skips_approximation_lint_and_exact_only_edit_blocks() {
         let temp = fixture_project();
-        let source_revisions =
-            cad_model::jww_relevant_source_manifest(temp.path()).expect("source manifest");
-        let interop = temp.path().join("interop/jww");
-        create_dir_all(&interop).expect("interop directory");
-        let manifest = cad_model::JwwPreservationManifest {
-            schema_version: "0.1".to_owned(),
-            state: cad_model::JwwCompatibilityState::PreservedReadOnly,
-            jww_version: Some(600),
-            drawing_name: "plan_1f".to_owned(),
-            original_relative_path: cad_model::JWW_ORIGINAL_RELATIVE_PATH.to_owned(),
-            original_blake3: "unused".to_owned(),
-            original_sha256: "unused".to_owned(),
-            reason: Some("unknown class".to_owned()),
-            source_revisions,
-            edit_capability: cad_model::JwwEditCapability::ExactOnly,
-            records_relative_path: None,
-            records_blake3: None,
-            records_sha256: None,
-        };
-        write(
-            interop.join("preservation.toml"),
-            toml::to_string_pretty(&manifest).expect("manifest TOML"),
-        )
-        .expect("preservation manifest");
+        write_exact_preservation(temp.path(), "plan_1f");
 
         let unchanged =
             check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
@@ -1886,6 +1922,54 @@ mod tests {
         let edited = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
         assert_eq!(edited.status, CheckStatus::Error);
         assert_code(&edited, "jww.exact_only_source_changed");
+    }
+
+    #[test]
+    fn unchanged_preserved_source_validates_hashes_and_drawing() {
+        let temp = fixture_project();
+        write_exact_preservation(temp.path(), "plan_1f");
+
+        let mismatch = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("missing"));
+        assert_code(&mismatch, "jww.preservation_drawing_mismatch");
+
+        write(
+            temp.path().join(cad_model::JWW_ORIGINAL_RELATIVE_PATH),
+            b"tampered",
+        )
+        .expect("tampered original");
+        let tampered = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+        assert_code(&tampered, "format.invalid_jww_preservation");
+    }
+
+    #[test]
+    fn jww_target_reports_block_entity_approximations() {
+        let temp = fixture_project();
+        let block = temp.path().join("blocks/fixture");
+        create_dir_all(&block).expect("block directory");
+        write(
+            block.join("definition.toml"),
+            "schema_version = \"0.2\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
+        )
+        .expect("block definition");
+        write(
+            block.join("entities.ndjson"),
+            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000099","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
+        )
+        .expect("block entities");
+
+        let report = check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "jww.unencodable_text_replaced")
+            .expect("block text warning");
+        assert_eq!(diagnostic.file, "blocks/fixture/entities.ndjson");
+        assert_eq!(diagnostic.line, Some(1));
+        assert_eq!(
+            diagnostic.entity_id.as_deref(),
+            Some("ent_01JZ0000000000000000000099")
+        );
+        assert_code(&report, "jww.mirrored_text_approximated");
     }
 
     #[test]
@@ -1931,6 +2015,34 @@ mod tests {
             "missing diagnostic code {code}; diagnostics: {:#?}",
             report.diagnostics
         );
+    }
+
+    fn write_exact_preservation(root: &Path, drawing_name: &str) {
+        let original = b"verified original";
+        let interop = root.join("interop/jww");
+        create_dir_all(&interop).expect("interop directory");
+        write(interop.join("original.jww"), original).expect("original JWW");
+        let manifest = cad_model::JwwPreservationManifest {
+            schema_version: "0.1".to_owned(),
+            state: cad_model::JwwCompatibilityState::PreservedReadOnly,
+            jww_version: Some(600),
+            drawing_name: drawing_name.to_owned(),
+            original_relative_path: cad_model::JWW_ORIGINAL_RELATIVE_PATH.to_owned(),
+            original_blake3: blake3::hash(original).to_hex().to_string(),
+            original_sha256: format!("{:x}", Sha256::digest(original)),
+            reason: Some("unknown class".to_owned()),
+            source_revisions: cad_model::jww_relevant_source_manifest(root)
+                .expect("source manifest"),
+            edit_capability: cad_model::JwwEditCapability::ExactOnly,
+            records_relative_path: None,
+            records_blake3: None,
+            records_sha256: None,
+        };
+        write(
+            interop.join("preservation.toml"),
+            toml::to_string_pretty(&manifest).expect("manifest TOML"),
+        )
+        .expect("preservation manifest");
     }
 
     fn fixture_project() -> tempfile::TempDir {

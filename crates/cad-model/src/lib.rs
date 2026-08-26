@@ -77,8 +77,6 @@ pub enum ProjectSourceKind {
     Comment,
     BlockDefinition,
     BlockEntities,
-    JwwOriginal,
-    JwwPreservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,15 +159,6 @@ pub fn classify_project_source_path(relative: &Path) -> Option<ProjectSourceKind
     if relative == Path::new("cad.project.toml") {
         return Some(ProjectSourceKind::Project);
     }
-    if relative == Path::new(JWW_ORIGINAL_RELATIVE_PATH) {
-        return Some(ProjectSourceKind::JwwOriginal);
-    }
-    if relative == Path::new(JWW_PRESERVATION_RELATIVE_PATH) {
-        return Some(ProjectSourceKind::JwwPreservation);
-    }
-    if relative == Path::new(JWW_RECORDS_RELATIVE_PATH) {
-        return Some(ProjectSourceKind::JwwPreservation);
-    }
     let components = relative.components().collect::<Vec<_>>();
     let component = |index: usize| components.get(index)?.as_os_str().to_str();
     match (
@@ -219,14 +208,7 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
             if relative.components().count() == 1
                 && !matches!(
                     relative.file_name().and_then(|name| name.to_str()),
-                    Some(
-                        "rules"
-                            | "drawings"
-                            | "comments"
-                            | "blocks"
-                            | "interop"
-                            | "cad.project.toml"
-                    )
+                    Some("rules" | "drawings" | "comments" | "blocks" | "cad.project.toml")
                 )
             {
                 continue;
@@ -240,12 +222,12 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
                 let may_hide_source_directory = (parts.len() == 1
                     && matches!(
                         parts.first().and_then(|part| part.as_os_str().to_str()),
-                        Some("rules" | "drawings" | "comments" | "blocks" | "interop")
+                        Some("rules" | "drawings" | "comments" | "blocks")
                     ))
                     || (parts.len() == 2
                         && matches!(
                             parts.first().and_then(|part| part.as_os_str().to_str()),
-                            Some("drawings" | "blocks" | "interop")
+                            Some("drawings" | "blocks")
                         ));
                 if classify_project_source_path(relative).is_some() || may_hide_source_directory {
                     return Err(ModelError::UnsafeSourcePath {
@@ -259,7 +241,7 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
                 if relative.components().count() == 1
                     && !matches!(
                         relative.file_name().and_then(|name| name.to_str()),
-                        Some("rules" | "drawings" | "comments" | "blocks" | "interop")
+                        Some("rules" | "drawings" | "comments" | "blocks")
                     )
                 {
                     continue;
@@ -294,10 +276,8 @@ pub fn jww_relevant_source_manifest(
         files
             .into_iter()
             .filter(|file| {
-                !matches!(
-                    classify_project_source_path(Path::new(&file.relative_path)),
-                    Some(ProjectSourceKind::Comment | ProjectSourceKind::JwwPreservation)
-                )
+                classify_project_source_path(Path::new(&file.relative_path))
+                    != Some(ProjectSourceKind::Comment)
             })
             .collect()
     })
@@ -308,10 +288,16 @@ pub fn load_jww_preservation_manifest(
 ) -> ModelResult<Option<JwwPreservationManifest>> {
     let root = root.as_ref();
     let path = root.join(JWW_PRESERVATION_RELATIVE_PATH);
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ModelError::Read { path, source }),
     }
-    let text = read_canonical_source(root, &path)?;
+    let bytes = read_jww_interop_source_bytes(root, Path::new(JWW_PRESERVATION_RELATIVE_PATH))?;
+    let text = String::from_utf8(bytes).map_err(|source| ModelError::Read {
+        path: path.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })?;
     toml::from_str(&text)
         .map(Some)
         .map_err(|source| ModelError::Toml { path, source })
@@ -358,7 +344,7 @@ fn read_jww_record_provenance_bytes(
     match manifest.edit_capability {
         JwwEditCapability::ExactOnly => Ok(None),
         JwwEditCapability::MappedV600 => {
-            read_canonical_source_bytes(root, &root.join(JWW_RECORDS_RELATIVE_PATH)).map(Some)
+            read_jww_interop_source_bytes(root, Path::new(JWW_RECORDS_RELATIVE_PATH)).map(Some)
         }
     }
 }
@@ -395,7 +381,8 @@ fn verified_jww_preservation_snapshot_with_hook(
         return Ok(None);
     };
     validate_jww_preservation_manifest(root, &manifest)?;
-    let original_bytes = read_canonical_source_bytes(root, &root.join(JWW_ORIGINAL_RELATIVE_PATH))?;
+    let original_bytes =
+        read_jww_interop_source_bytes(root, Path::new(JWW_ORIGINAL_RELATIVE_PATH))?;
     if !jww_bytes_match(
         &original_bytes,
         &manifest.original_blake3,
@@ -443,8 +430,7 @@ pub fn jww_project_compatibility(
         return Ok(None);
     };
     validate_jww_preservation_manifest(root, &manifest)?;
-    let original_path = root.join(JWW_ORIGINAL_RELATIVE_PATH);
-    let original = read_canonical_source_bytes(root, &original_path)?;
+    let original = read_jww_interop_source_bytes(root, Path::new(JWW_ORIGINAL_RELATIVE_PATH))?;
     let original_verified = jww_bytes_match(
         &original,
         &manifest.original_blake3,
@@ -459,7 +445,7 @@ pub fn jww_project_compatibility(
             if !canonical_path || expected_blake3.is_none() || expected_sha256.is_none() {
                 false
             } else {
-                read_canonical_source_bytes(root, &root.join(JWW_RECORDS_RELATIVE_PATH))
+                read_jww_interop_source_bytes(root, Path::new(JWW_RECORDS_RELATIVE_PATH))
                     .map(|records| {
                         jww_bytes_match(
                             &records,
@@ -1510,6 +1496,32 @@ fn read_canonical_source_bytes(root: &Path, path: &Path) -> ModelResult<Vec<u8>>
         });
     }
 
+    read_project_contained_bytes(root, path)
+}
+
+fn read_jww_interop_source_bytes(root: &Path, relative: &Path) -> ModelResult<Vec<u8>> {
+    if !matches!(
+        relative.to_str(),
+        Some(
+            JWW_ORIGINAL_RELATIVE_PATH | JWW_PRESERVATION_RELATIVE_PATH | JWW_RECORDS_RELATIVE_PATH
+        )
+    ) {
+        return Err(ModelError::UnsafeSourcePath {
+            path: root.join(relative),
+            reason: "path is not an allowed JWW interoperability file".to_owned(),
+        });
+    }
+    read_project_contained_bytes(root, &root.join(relative))
+}
+
+fn read_project_contained_bytes(root: &Path, path: &Path) -> ModelResult<Vec<u8>> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ModelError::UnsafeSourcePath {
+            path: path.to_path_buf(),
+            reason: "path is outside the project root".to_owned(),
+        })?;
+
     let canonical_root = fs::canonicalize(root).map_err(|source| ModelError::Read {
         path: root.to_path_buf(),
         source,
@@ -1578,15 +1590,15 @@ mod tests {
         );
         assert_eq!(
             classify_project_source_path(Path::new("interop/jww/original.jww")),
-            Some(ProjectSourceKind::JwwOriginal)
+            None
         );
         assert_eq!(
             classify_project_source_path(Path::new("interop/jww/preservation.toml")),
-            Some(ProjectSourceKind::JwwPreservation)
+            None
         );
         assert_eq!(
             classify_project_source_path(Path::new("interop/jww/records.ndjson")),
-            Some(ProjectSourceKind::JwwPreservation)
+            None
         );
         assert_eq!(
             classify_project_source_path(Path::new("interop/jww/extra.bin")),
@@ -1624,6 +1636,13 @@ mod tests {
         .expect("obsolete fixture");
         create_dir_all(temp.path().join("build/.cad-history")).expect("history directory");
         write(temp.path().join("build/.cad-history/index.json"), "{}").expect("history fixture");
+        create_dir_all(temp.path().join("interop/jww")).expect("interop directory");
+        write(temp.path().join(JWW_ORIGINAL_RELATIVE_PATH), b"original").expect("original");
+        write(
+            temp.path().join(JWW_PRESERVATION_RELATIVE_PATH),
+            "schema_version = \"0.1\"\n",
+        )
+        .expect("preservation fixture");
 
         let manifest = source_manifest(temp.path()).expect("manifest should load");
         let paths = manifest
@@ -1633,6 +1652,7 @@ mod tests {
         assert!(paths.contains(&"cad.project.toml".to_owned()));
         assert!(paths.contains(&"drawings/plan_1f/layouts.toml".to_owned()));
         assert!(!paths.iter().any(|path| path.ends_with("sheet.toml")));
+        assert!(!paths.iter().any(|path| path.starts_with("interop/")));
         assert!(!paths.iter().any(|path| path.starts_with("build/")));
     }
 

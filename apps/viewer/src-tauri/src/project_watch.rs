@@ -418,10 +418,7 @@ fn source_or_ancestor_path(root: &Path, path: &Path) -> bool {
     let component = |index: usize| components.get(index)?.as_os_str().to_str();
     matches!(
         (component(0), components.len()),
-        (
-            Some("rules" | "drawings" | "comments" | "blocks" | "interop"),
-            1
-        ) | (Some("drawings" | "blocks" | "interop"), 2)
+        (Some("rules" | "drawings" | "comments" | "blocks"), 1) | (Some("drawings" | "blocks"), 2)
     )
 }
 
@@ -524,6 +521,10 @@ mod tests {
         assert!(!native_event_may_affect_sources(
             root,
             &Event::new(EventKind::Any).add_path(root.join("README.md"))
+        ));
+        assert!(!native_event_may_affect_sources(
+            root,
+            &Event::new(EventKind::Any).add_path(root.join("interop/jww/original.jww"))
         ));
     }
 
