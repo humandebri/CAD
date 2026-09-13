@@ -40,6 +40,7 @@ struct SnapCache {
     project_path: String,
     drawing: String,
     revision: String,
+    layers_revision: String,
     index: Arc<cad_edit::SnapIndex>,
 }
 
@@ -47,7 +48,10 @@ struct SnapCache {
 pub struct ProjectState {
     project_path: String,
     project_name: String,
+    drawings: Vec<String>,
     is_git_project: bool,
+    editable: bool,
+    read_only_reason: Option<String>,
     import_warning_count: Option<usize>,
     jww_compatibility_state: Option<cad_model::JwwCompatibilityState>,
     jww_compatibility_reason: Option<String>,
@@ -300,6 +304,28 @@ fn open_project(project_path: String) -> Result<ProjectState, String> {
 }
 
 #[tauri::command]
+fn create_project(request: cad_edit::ProjectTemplateRequest) -> Result<ProjectState, String> {
+    let result = cad_edit::create_project(&request)
+        .map_err(|error| format!("failed to create project: {error}"))?;
+    open_project_state(Path::new(&result.project_path))
+}
+
+#[tauri::command]
+fn add_drawing(
+    request: cad_edit::DrawingTemplateRequest,
+) -> Result<cad_edit::ProjectMutationResult, String> {
+    cad_edit::add_drawing(&request).map_err(|error| format!("failed to add drawing: {error}"))
+}
+
+#[tauri::command]
+fn duplicate_drawing(
+    request: cad_edit::DuplicateDrawingRequest,
+) -> Result<cad_edit::ProjectMutationResult, String> {
+    cad_edit::duplicate_drawing(&request)
+        .map_err(|error| format!("failed to duplicate drawing: {error}"))
+}
+
+#[tauri::command]
 fn run_review(
     head_cache: State<'_, HeadSnapshotCache>,
     project_path: String,
@@ -310,6 +336,166 @@ fn run_review(
         drawing_name.as_deref(),
         &head_cache,
     )
+}
+
+#[tauri::command]
+fn preview_drawing_edit(
+    project_path: String,
+    request: cad_edit::DrawingEditRequest,
+) -> Result<serde_json::Value, String> {
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    ensure_jww_drawing_edit_compatible(Path::new(&project_path), &request)?;
+    let preview = cad_edit::preview_edit(Path::new(&project_path), &request)
+        .map_err(|error| error.to_string())?;
+    let mut project = cad_model::load_project(&project_path).map_err(|error| error.to_string())?;
+    let drawing = project
+        .drawings
+        .iter_mut()
+        .find(|drawing| drawing.name == request.drawing)
+        .ok_or_else(|| "drawing not found".to_owned())?;
+    drawing.entities = preview
+        .entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| {
+            serde_json::from_value(entity.clone()).map(|entity| cad_model::EntityRecord {
+                line: index + 1,
+                entity,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut value = serde_json::to_value(&preview).map_err(|error| error.to_string())?;
+    match cad_render_svg::render_drawing_svg(&project, &request.drawing) {
+        Ok(svg) => value["svg"] = serde_json::Value::String(svg),
+        Err(error) => {
+            value["svg"] = serde_json::Value::String(String::new());
+            if let Some(warnings) = value["warnings"].as_array_mut() {
+                warnings.push(serde_json::Value::String(error.to_string()));
+            }
+        }
+    }
+    if cad_model::source_manifest(&project_path).map_err(|error| error.to_string())?
+        != preview.source_files
+    {
+        return Err("revision_conflict: project changed while rendering the preview".to_owned());
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn find_hatch_region(
+    project_path: String,
+    drawing: String,
+    point: [f64; 2],
+) -> Result<Vec<Vec<[f64; 2]>>, String> {
+    let project = cad_model::load_project(&project_path).map_err(|error| error.to_string())?;
+    cad_edit::region_hatch::hatch_region(&project, &drawing, point)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn load_block_contents(
+    project_path: String,
+    drawing: String,
+    block: String,
+    entities: Option<Vec<cad_model::Entity>>,
+    remove_entity_id: Option<String>,
+    dimension_resolutions: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<serde_json::Value, String> {
+    let revision = cad_edit::block_edit::block_content_revision(Path::new(&project_path), &block)
+        .map_err(|error| error.to_string())?;
+    let mut project = cad_model::load_project(&project_path).map_err(|error| error.to_string())?;
+    let definition = project
+        .blocks
+        .remove(&block)
+        .ok_or_else(|| "block not found".to_owned())?;
+    let source_entities: Vec<cad_model::Entity> = definition
+        .entities
+        .iter()
+        .map(|record| record.entity.clone())
+        .collect();
+    let mut content = entities.unwrap_or(source_entities);
+    let target = project
+        .drawings
+        .iter_mut()
+        .find(|candidate| candidate.name == drawing)
+        .ok_or_else(|| "drawing not found".to_owned())?;
+    target.entities = content
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(index, entity)| cad_model::EntityRecord {
+            line: index + 1,
+            entity,
+        })
+        .collect();
+    if let Some(resolutions) = dimension_resolutions {
+        for entity in &mut content {
+            if let Some(action) = resolutions.get(entity.id().as_str()) {
+                match action.as_str() {
+                    "detach" => cad_model::detach_dimension(&project, entity)?,
+                    "delete" => (),
+                    _ => return Err("unknown dimension resolution".to_owned()),
+                }
+            }
+        }
+        content.retain(|entity| {
+            resolutions
+                .get(entity.id().as_str())
+                .is_none_or(|action| action != "delete")
+        });
+    }
+    if let Some(id) = remove_entity_id {
+        content.retain(|entity| entity.id().as_str() != id);
+    }
+    project
+        .drawings
+        .iter_mut()
+        .find(|candidate| candidate.name == drawing)
+        .expect("drawing resolved above")
+        .entities = content
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, entity)| cad_model::EntityRecord {
+            line: index + 1,
+            entity,
+        })
+        .collect();
+    let svg = cad_render_svg::render_drawing_svg(&project, &drawing)
+        .map_err(|error| error.to_string())?;
+    if cad_edit::block_edit::block_content_revision(Path::new(&project_path), &block)
+        .map_err(|error| error.to_string())?
+        != revision
+    {
+        return Err("revision_conflict: block changed while loading".to_owned());
+    }
+    Ok(
+        serde_json::json!({ "block": block, "name": definition.config.name, "revision": revision, "entities": content, "svg": svg }),
+    )
+}
+
+#[tauri::command]
+fn apply_block_contents(
+    edit_manager: State<'_, DrawingEditManager>,
+    snap_manager: State<'_, SnapCacheManager>,
+    project_path: String,
+    request: cad_edit::block_edit::BlockEditRequest,
+) -> Result<cad_edit::DrawingEditResult, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    let _guard = edit_manager
+        .update
+        .lock()
+        .map_err(|_| "drawing edit lock is poisoned".to_owned())?;
+    let result = cad_edit::block_edit::apply_block_edit(Path::new(&project_path), &request)
+        .map_err(|error| error.to_string())?;
+    *snap_manager
+        .cache
+        .lock()
+        .map_err(|_| "snap cache lock is poisoned".to_owned())? = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -405,6 +591,7 @@ fn clear_drawing_history(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn query_snap(
     manager: State<'_, SnapCacheManager>,
     project_path: String,
@@ -413,9 +600,26 @@ fn query_snap(
     point: [f64; 2],
     tolerance_mm: f64,
     modes: Vec<cad_edit::SnapKind>,
+    reference_point: Option<[f64; 2]>,
 ) -> Result<Option<cad_edit::SnapCandidate>, String> {
-    let actual_revision =
-        validated_drawing_revision(Path::new(&project_path), &drawing, &revision)?;
+    Ok(
+        cached_snap_index(&manager, &project_path, &drawing, &revision)?.query_with_reference(
+            point,
+            tolerance_mm,
+            &modes,
+            reference_point,
+        ),
+    )
+}
+
+fn cached_snap_index(
+    manager: &SnapCacheManager,
+    project_path: &str,
+    drawing: &str,
+    revision: &str,
+) -> Result<Arc<cad_edit::SnapIndex>, String> {
+    let (actual_revision, layers_revision) =
+        validated_snap_revisions(Path::new(project_path), drawing, revision)?;
     let cached = manager
         .cache
         .lock()
@@ -425,13 +629,21 @@ fn query_snap(
             entry.project_path == project_path
                 && entry.drawing == drawing
                 && entry.revision == actual_revision
+                && entry.layers_revision == layers_revision
         })
         .map(|entry| Arc::clone(&entry.index));
     let index = if let Some(index) = cached {
         index
     } else {
         let built =
-            build_snap_index_for_revision(Path::new(&project_path), &drawing, &actual_revision)?;
+            build_snap_index_for_revision(Path::new(project_path), drawing, &actual_revision)?;
+        if validated_snap_revisions(Path::new(project_path), drawing, &actual_revision)?.1
+            != layers_revision
+        {
+            return Err(
+                "revision_conflict: layer rules changed while building snap index".to_owned(),
+            );
+        }
         let mut cache = manager
             .cache
             .lock()
@@ -440,19 +652,21 @@ fn query_snap(
             entry.project_path == project_path
                 && entry.drawing == drawing
                 && entry.revision == actual_revision
+                && entry.layers_revision == layers_revision
         }) {
             Arc::clone(&existing.index)
         } else {
             *cache = Some(SnapCache {
-                project_path: project_path.clone(),
-                drawing: drawing.clone(),
+                project_path: project_path.to_owned(),
+                drawing: drawing.to_owned(),
                 revision: actual_revision,
+                layers_revision,
                 index: Arc::clone(&built),
             });
             built
         }
     };
-    Ok(index.query(point, tolerance_mm, &modes))
+    Ok(index)
 }
 
 fn build_snap_index_for_revision(
@@ -469,7 +683,7 @@ fn build_snap_index_for_revision_with(
     expected_revision: &str,
     before_load: impl FnOnce(),
 ) -> Result<Arc<cad_edit::SnapIndex>, String> {
-    validated_drawing_revision(project_path, drawing, expected_revision)?;
+    let before = validated_snap_revisions(project_path, drawing, expected_revision)?;
     before_load();
     let project = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project for snapping: {error}"))?;
@@ -477,15 +691,26 @@ fn build_snap_index_for_revision_with(
         cad_edit::SnapIndex::build(&project, drawing)
             .map_err(|error| format!("failed to build snap index: {error}"))?,
     );
-    validated_drawing_revision(project_path, drawing, expected_revision)?;
+    if before != validated_snap_revisions(project_path, drawing, expected_revision)? {
+        return Err("revision_conflict: layer rules changed while building snap index".to_owned());
+    }
     Ok(index)
 }
 
+#[cfg(test)]
 fn validated_drawing_revision(
     project_path: &Path,
     drawing: &str,
     expected_revision: &str,
 ) -> Result<String, String> {
+    validated_snap_revisions(project_path, drawing, expected_revision).map(|(revision, _)| revision)
+}
+
+fn validated_snap_revisions(
+    project_path: &Path,
+    drawing: &str,
+    expected_revision: &str,
+) -> Result<(String, String), String> {
     recover_project_sources(project_path)?;
     let mut drawing_components = Path::new(drawing).components();
     if !matches!(
@@ -501,9 +726,16 @@ fn validated_drawing_revision(
     {
         return Err(format!("invalid drawing name {drawing:?}"));
     }
-    let manifest = cad_model::source_manifest(project_path)
-        .map_err(|error| format!("failed to read canonical source manifest: {error}"))?;
+    let manifest = cad_model::source_manifest_for(project_path, |path| {
+        path == relative_path || path == Path::new("rules/layers.toml")
+    })
+    .map_err(|error| format!("failed to read canonical source manifest: {error}"))?;
     let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+    let layers_revision = manifest
+        .iter()
+        .find(|file| file.relative_path == "rules/layers.toml")
+        .map(|file| file.revision.clone())
+        .ok_or_else(|| "layer source was not found".to_owned())?;
     let actual_revision = manifest
         .into_iter()
         .find(|file| file.relative_path == relative_path)
@@ -514,7 +746,7 @@ fn validated_drawing_revision(
             "revision_conflict: drawing changed before snap query (expected {expected_revision}, found {actual_revision})"
         ));
     }
-    Ok(actual_revision)
+    Ok((actual_revision, layers_revision))
 }
 
 #[tauri::command]
@@ -559,14 +791,16 @@ fn export_jww(
     overwrite: bool,
 ) -> Result<cad_export_jww::ExportReport, String> {
     recover_project_sources(Path::new(&project_path))?;
-    cad_export_jww::export_jww_file(
+    let report_path = PathBuf::from(format!("{output_path}.report.json"));
+    cad_export_jww::export_jww_file_with_report(
         project_path,
         &drawing,
-        output_path,
+        &output_path,
+        report_path,
         cad_export_jww::ExportOptions {
             allow_lossy,
             overwrite,
-            strict_approximations: false,
+            strict_approximations: !allow_lossy,
         },
     )
     .map_err(|error| format!("failed to export JWW: {error}"))
@@ -580,8 +814,15 @@ fn export_jww_preserving(
     overwrite: bool,
 ) -> Result<cad_export_jww::ExportReport, String> {
     recover_project_sources(Path::new(&project_path))?;
-    cad_export_jww::export_jww_file_preserving(project_path, &drawing, output_path, overwrite)
-        .map_err(|error| format!("failed to preserve JWW: {error}"))
+    let report_path = PathBuf::from(format!("{output_path}.report.json"));
+    cad_export_jww::export_jww_file_preserving_with_report(
+        project_path,
+        &drawing,
+        &output_path,
+        report_path,
+        overwrite,
+    )
+    .map_err(|error| format!("failed to preserve JWW: {error}"))
 }
 
 #[tauri::command]
@@ -972,8 +1213,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_project,
+            create_project,
+            add_drawing,
+            duplicate_drawing,
             run_review,
             apply_drawing_edit,
+            preview_drawing_edit,
+            find_hatch_region,
+            load_block_contents,
+            apply_block_contents,
             undo_drawing_edit,
             redo_drawing_edit,
             list_drawing_history,
@@ -1044,6 +1292,10 @@ fn ensure_jww_drawing_edit_compatible(
 
 fn jww_operation_changes_unpreserved_fields(operation: &cad_edit::EditOperation) -> bool {
     match operation {
+        cad_edit::EditOperation::SourceChecked { operation, .. }
+        | cad_edit::EditOperation::ResolveDimensions { operation, .. } => {
+            jww_operation_changes_unpreserved_fields(operation)
+        }
         cad_edit::EditOperation::Batch { operations } => operations
             .iter()
             .any(jww_operation_changes_unpreserved_fields),
@@ -1064,10 +1316,29 @@ fn open_project_state(project_path: &Path) -> Result<ProjectState, String> {
         .map_err(|error| format!("failed to load project: {error}"))?;
     let compatibility = cad_model::jww_project_compatibility(project_path)
         .map_err(|error| format!("failed to validate JWW compatibility: {error}"))?;
+    let read_only_reason = compatibility.as_ref().and_then(|state| {
+        if state.state == cad_model::JwwCompatibilityState::EditableLossless
+            && state.original_verified
+            && state.edit_capability == cad_model::JwwEditCapability::MappedV600
+        {
+            None
+        } else {
+            Some(state.reason.clone().unwrap_or_else(|| {
+                "the preserved JWW has no verified editable record mapping".to_owned()
+            }))
+        }
+    });
     Ok(ProjectState {
         project_path: project_path.to_string_lossy().into_owned(),
         project_name: source.project.name,
+        drawings: source
+            .drawings
+            .iter()
+            .map(|drawing| drawing.name.clone())
+            .collect(),
         is_git_project: head_snapshot::git_root(project_path).is_ok(),
+        editable: read_only_reason.is_none(),
+        read_only_reason,
         import_warning_count: None,
         jww_compatibility_state: compatibility.as_ref().map(|state| state.state),
         jww_compatibility_reason: compatibility
@@ -1137,16 +1408,9 @@ fn run_review_for_drawing_with_cache(
     check.diagnostics.extend(comment_diagnostics);
     let editor = cad_edit::editor_state(&head, &drawing_name)
         .map_err(|error| format!("failed to load editor state: {error}"))?;
-    let mut filtered_head = head.clone();
-    filtered_head
-        .drawings
-        .retain(|drawing| drawing.name == drawing_name);
-
     let diff_result = head_cache.load(project_path).map(|base| {
-        let mut base = (*base).clone();
-        base.drawings.retain(|drawing| drawing.name == drawing_name);
-        let diff = cad_diff::diff_projects(&base, &filtered_head);
-        let diff_svg = cad_diff::diff_projects_svg(&base, &filtered_head);
+        let diff = cad_diff::diff_selected_drawing(&base, &head, Some(&drawing_name));
+        let diff_svg = cad_diff::render_diff_svg(&base, &head, &diff);
         (diff, diff_svg)
     });
 
@@ -1492,7 +1756,7 @@ fn write_ai_context_for_path_with_cache(
             publish_ai_context_manifest(
                 &build_dir,
                 &serde_json::json!({
-                    "schema_version": "0.2",
+                    "schema_version": "0.3",
                     "status": "no_entity_selected",
                     "generation": null,
                     "json_path": null,
@@ -1519,107 +1783,15 @@ fn write_ai_context_for_path_with_cache(
     }
 
     match build_ai_context(project_path, view_mode, selected_entity_id, head_cache) {
-        Ok((context, markdown)) => {
-            let build_dir = match safe_generated_dir(project_path, Path::new("build")) {
-                Ok(path) => path,
-                Err(error) => {
-                    return ai_context_state(AiContextStatus::Error, None, None, Some(error));
-                }
-            };
-            let generations_dir =
-                match safe_generated_dir(project_path, Path::new("build/ai-context")) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        return ai_context_state(AiContextStatus::Error, None, None, Some(error));
-                    }
-                };
-            if let Err(error) = fs::create_dir_all(&generations_dir) {
-                return ai_context_state(
-                    AiContextStatus::Error,
-                    None,
-                    None,
-                    Some(format!("failed to create build dir: {error}")),
-                );
-            }
-            let json = match serde_json::to_string_pretty(&context) {
-                Ok(json) => json,
-                Err(error) => {
-                    return ai_context_state(
-                        AiContextStatus::Error,
-                        None,
-                        None,
-                        Some(format!("failed to serialize AI context: {error}")),
-                    );
-                }
-            };
-            let generation = ai_context_generation(&json, &markdown);
-            let staging = match tempfile::Builder::new()
-                .prefix(".context-")
-                .tempdir_in(&generations_dir)
-            {
-                Ok(staging) => staging,
-                Err(error) => {
-                    return ai_context_state(
-                        AiContextStatus::Error,
-                        None,
-                        None,
-                        Some(format!("failed to stage AI context: {error}")),
-                    );
-                }
-            };
-            let staged_json = staging.path().join("context.json");
-            let staged_markdown = staging.path().join("context.md");
-            if let Err(error) = fs::write(&staged_json, &json) {
-                return ai_context_state(
-                    AiContextStatus::Error,
-                    None,
-                    None,
-                    Some(format!("failed to write ai-context.json: {error}")),
-                );
-            }
-            if let Err(error) = fs::write(&staged_markdown, &markdown) {
-                return ai_context_state(
-                    AiContextStatus::Error,
-                    None,
-                    None,
-                    Some(format!("failed to write ai-context.md: {error}")),
-                );
-            }
-            let generation_dir = generations_dir.join(&generation);
-            if !generation_dir.exists()
-                && let Err(error) = fs::rename(staging.path(), &generation_dir)
-                && !generation_dir.exists()
-            {
-                return ai_context_state(
-                    AiContextStatus::Error,
-                    None,
-                    None,
-                    Some(format!("failed to publish AI context generation: {error}")),
-                );
-            }
-            let json_path = generation_dir.join("context.json");
-            let markdown_path = generation_dir.join("context.md");
-            let manifest = serde_json::json!({
-                "schema_version": "0.2",
-                "generation": generation,
-                "json_path": path_string(&json_path),
-                "markdown_path": path_string(&markdown_path),
-            });
-            if let Err(error) = publish_ai_context_manifest(&build_dir, &manifest) {
-                return ai_context_state(
-                    AiContextStatus::Error,
-                    None,
-                    None,
-                    Some(format!("failed to publish AI context manifest: {}", error)),
-                );
-            }
-            ai_context_state(
+        Ok(context) => match publish_ai_generation(project_path, context) {
+            Ok((json_path, markdown_path)) => ai_context_state(
                 AiContextStatus::Ready,
                 Some(path_string(&json_path)),
                 Some(path_string(&markdown_path)),
                 Some("AI context ready".to_owned()),
-            )
-        }
+            ),
+            Err(message) => ai_context_state(AiContextStatus::Error, None, None, Some(message)),
+        },
         Err(message) => ai_context_state(AiContextStatus::Error, None, None, Some(message)),
     }
 }
@@ -1684,12 +1856,81 @@ fn publish_ai_context_manifest(
         .map_err(|error| format!("failed to publish AI context manifest: {error}"))
 }
 
-fn ai_context_generation(json: &str, markdown: &str) -> String {
+fn ai_context_generation(context: &mut AiContext) -> String {
+    let timestamp = std::mem::take(&mut context.generated_at);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(json.as_bytes());
+    hasher.update(b"cad-ai-context-v2\0");
+    hasher.update(&serde_json::to_vec(context).expect("AI context is serializable"));
     hasher.update(&[0]);
-    hasher.update(markdown.as_bytes());
+    hasher.update(ai_context_markdown(context).as_bytes());
+    context.generated_at = timestamp;
     hasher.finalize().to_hex().to_string()
+}
+
+fn publish_ai_generation(
+    project_path: &Path,
+    mut context: AiContext,
+) -> Result<(PathBuf, PathBuf), String> {
+    let generation = ai_context_generation(&mut context);
+    let build = safe_generated_dir(project_path, Path::new("build"))?;
+    let generations = safe_generated_dir(project_path, Path::new("build/ai-context"))?;
+    fs::create_dir_all(&generations).map_err(|e| e.to_string())?;
+    let relative = Path::new("build/ai-context").join(&generation);
+    let directory = safe_generated_dir(project_path, &relative)?;
+    if !directory.exists() {
+        let staging = tempfile::Builder::new()
+            .prefix(".context-")
+            .tempdir_in(&generations)
+            .map_err(|e| e.to_string())?;
+        fs::write(
+            staging.path().join("context.json"),
+            serde_json::to_vec_pretty(&context).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        fs::write(
+            staging.path().join("context.md"),
+            ai_context_markdown(&context),
+        )
+        .map_err(|e| e.to_string())?;
+        if let Err(error) = fs::rename(staging.path(), &directory)
+            && !directory.exists()
+        {
+            return Err(format!("failed to publish AI context generation: {error}"));
+        }
+    }
+    // Reuse only a complete, matched pair. Existing generations are immutable.
+    let directory = safe_generated_dir(project_path, &relative)?;
+    let json_path = directory.join("context.json");
+    let markdown_path = directory.join("context.md");
+    for file in [&json_path, &markdown_path] {
+        let metadata = fs::symlink_metadata(file)
+            .map_err(|e| format!("incomplete AI context generation: {e}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("unsafe AI context generation file".to_owned());
+        }
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&json_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let timestamp = json["generated_at"]
+        .as_str()
+        .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        .ok_or_else(|| "invalid AI context generation timestamp".to_owned())?;
+    context.generated_at = timestamp.to_owned();
+    if json != serde_json::to_value(&context).map_err(|e| e.to_string())?
+        || fs::read_to_string(&markdown_path).map_err(|e| e.to_string())?
+            != ai_context_markdown(&context)
+    {
+        return Err("AI context generation content mismatch".to_owned());
+    }
+    publish_ai_context_manifest(
+        &build,
+        &serde_json::json!({
+            "schema_version": "0.3", "generation": generation,
+            "json_path": path_string(&json_path), "markdown_path": path_string(&markdown_path),
+        }),
+    )?;
+    Ok((json_path, markdown_path))
 }
 
 fn build_ai_context(
@@ -1697,7 +1938,7 @@ fn build_ai_context(
     view_mode: &str,
     selected_entity_id: &str,
     head_cache: &HeadSnapshotCache,
-) -> Result<(AiContext, String), String> {
+) -> Result<AiContext, String> {
     let initial_manifest = cad_model::source_manifest(project_path)
         .map_err(|error| format!("failed to load canonical source manifest: {error}"))?;
     let project = cad_model::load_project(project_path)
@@ -1710,14 +1951,19 @@ fn build_ai_context(
     let source = cad_edit::read_history_file(project_path, &source_relative_path)
         .map_err(|error| format!("failed to read selected entity source: {error}"))?;
     let raw = read_source_line(&source.bytes, record.line)?;
-    let check = cad_check::check_project(project_path);
+    let check = cad_check::check_loaded_project(&project);
     let (comments, comment_diagnostics) = load_comments_for_drawing(project_path, &drawing_name);
     let comments = comments
         .into_iter()
         .filter(|comment| comment.entity_ids.iter().any(|id| id == selected_entity_id))
         .collect::<Vec<_>>();
-    let (diff_changes, diff_warnings) =
-        selected_diff_context(project_path, &project, selected_entity_id, head_cache);
+    let (diff_changes, diff_warnings) = selected_diff_context(
+        project_path,
+        &project,
+        selected_entity_id,
+        head_cache,
+        &initial_manifest,
+    );
     let bbox = cad_model::entity_bbox(&record.entity).map(|bbox| AiContextBBox {
         min: bbox.min,
         max: bbox.max,
@@ -1739,7 +1985,7 @@ fn build_ai_context(
     }
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let context = AiContext {
-        schema_version: "0.2".to_owned(),
+        schema_version: "0.3".to_owned(),
         project_path: path_string(project_path),
         project_name: project.project.name.clone(),
         drawing: drawing_name.clone(),
@@ -1758,8 +2004,7 @@ fn build_ai_context(
         comments,
         generated_at,
     };
-    let markdown = ai_context_markdown(&context);
-    Ok((context, markdown))
+    Ok(context)
 }
 
 fn find_entity_record<'a>(
@@ -1789,20 +2034,22 @@ fn selected_diff_context(
     head: &cad_model::ProjectSource,
     selected_entity_id: &str,
     head_cache: &HeadSnapshotCache,
+    manifest: &[cad_model::SourceFileRevision],
 ) -> (Vec<cad_diff::DiffChange>, Vec<cad_diff::DiffWarning>) {
-    let Ok(base) = head_cache.load(project_path) else {
+    let Ok(diff) = head_cache.diff(project_path, head, manifest) else {
         return (Vec::new(), Vec::new());
     };
-    let diff = cad_diff::diff_projects(&base, head);
     let changes = diff
         .changes
-        .into_iter()
+        .iter()
         .filter(|change| change.entity_id == selected_entity_id)
+        .cloned()
         .collect::<Vec<_>>();
     let warnings = diff
         .warnings
-        .into_iter()
+        .iter()
         .filter(|warning| warning.entity_ids.iter().any(|id| id == selected_entity_id))
+        .cloned()
         .collect::<Vec<_>>();
     (changes, warnings)
 }
@@ -1939,11 +2186,56 @@ fn last_project_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_dimension_resolution_only_changes_the_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        write_project(temp.path(), false);
+        let block_path = temp.path().join("blocks/part");
+        fs::create_dir_all(&block_path).unwrap();
+        fs::write(
+            block_path.join("definition.toml"),
+            "schema_version = \"0.3\"\nname = \"Part\"\nbase_point = [0, 0]\n",
+        )
+        .unwrap();
+        let line_id = "ent_01JZ0000000000000000000000";
+        let dimension_id = "ent_01JZ0000000000000000000001";
+        let line = serde_json::json!({"schema_version":"0.3","id":line_id,"type":"line","layer":"0-1","p1":[0,0],"p2":[100,0]});
+        let dimension = serde_json::json!({"schema_version":"0.3","id":dimension_id,"type":"dimension","layer":"0-1","style":"dim_100","p1":[0,0],"p2":[100,0],"offset":20,"value":null,"measurement":{"kind":"aligned","first":{"kind":"entity","entity_id":line_id,"feature":"start"},"second":{"kind":"entity","entity_id":line_id,"feature":"end"}}});
+        let original = format!("{line}\n{dimension}\n");
+        fs::write(block_path.join("entities.ndjson"), &original).unwrap();
+        for action in ["detach", "delete"] {
+            let result = load_block_contents(
+                temp.path().display().to_string(),
+                "plan_1f".to_owned(),
+                "part".to_owned(),
+                None,
+                Some(line_id.to_owned()),
+                Some(std::collections::BTreeMap::from([(
+                    dimension_id.to_owned(),
+                    action.to_owned(),
+                )])),
+            )
+            .unwrap();
+            let entities = result["entities"].as_array().unwrap();
+            if action == "detach" {
+                assert_eq!(entities.len(), 1);
+                assert_eq!(
+                    entities[0]["measurement"]["second"],
+                    serde_json::json!({"kind":"fixed","point":[100.0,0.0]})
+                );
+            } else {
+                assert!(entities.is_empty());
+            }
+            assert_eq!(
+                fs::read_to_string(block_path.join("entities.ndjson")).unwrap(),
+                original
+            );
+        }
+    }
+
     use super::*;
     use std::io::Write;
     use std::process::Command;
-
-    static WATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn jww_preservation_rejects_unmodeled_drawing_edits() {
@@ -1988,38 +2280,6 @@ mod tests {
     }
 
     #[test]
-    fn git_tracked_project_can_be_loaded_from_head() {
-        let repo = fixture_repo();
-        let project = HeadSnapshotCache::default()
-            .load(&repo.project_path)
-            .expect("HEAD project should build");
-
-        assert_eq!(project.project.name, "desktop-fixture");
-        assert_eq!(project.drawings[0].entities.len(), 1);
-    }
-
-    #[test]
-    fn git_repo_root_project_can_be_loaded_from_head() {
-        let temp = tempfile::tempdir().expect("tempdir should be created");
-        write_project(temp.path(), false);
-        run_git(temp.path(), &["init"]);
-        run_git(
-            temp.path(),
-            &["config", "user.email", "cad@example.invalid"],
-        );
-        run_git(temp.path(), &["config", "user.name", "CAD Test"]);
-        run_git(temp.path(), &["add", "."]);
-        run_git(temp.path(), &["commit", "-m", "initial"]);
-
-        let project = HeadSnapshotCache::default()
-            .load(temp.path())
-            .expect("HEAD project should build");
-
-        assert_eq!(project.project.name, "desktop-fixture");
-        assert_eq!(project.drawings[0].entities.len(), 1);
-    }
-
-    #[test]
     fn non_ascii_git_project_path_can_be_loaded_from_head() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let project_path = temp.path().join("日本語 project");
@@ -2055,49 +2315,13 @@ mod tests {
     }
 
     #[test]
-    fn working_tree_change_is_modified_against_head() {
+    fn working_tree_diff_reports_modified_and_added_entities_despite_staged_non_source() {
         let repo = fixture_repo();
-        write_entities(
-            &repo.project_path,
-            &[
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
-            ],
-        );
-
-        let artifacts = run_review_for_path(&repo.project_path).expect("review should run");
-        let diff = artifacts.diff.expect("diff should be available");
-
-        assert!(diff.changes.iter().any(|change| {
-            change.entity_id == "ent_01JZ0000000000000000000000"
-                && change.kind == cad_diff::ChangeKind::Modified
-        }));
-    }
-
-    #[test]
-    fn working_tree_added_entity_is_added_against_head() {
-        let repo = fixture_repo();
-        write_entities(
-            &repo.project_path,
-            &[
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"new"}"#,
-            ],
-        );
-
-        let artifacts = run_review_for_path(&repo.project_path).expect("review should run");
-        let diff = artifacts.diff.expect("diff should be available");
-
-        assert!(diff.changes.iter().any(|change| {
-            change.entity_id == "ent_01JZ0000000000000000000001"
-                && change.kind == cad_diff::ChangeKind::Added
-        }));
-    }
-
-    #[test]
-    fn staged_new_project_file_does_not_break_head_diff() {
-        let repo = fixture_repo();
-        let staged_note = repo.project_path.join("drawings/plan_1f/staged-note.txt");
-        fs::write(&staged_note, "not in HEAD yet\n").expect("staged note should be written");
+        fs::write(
+            repo.project_path.join("drawings/plan_1f/staged-note.txt"),
+            "not source\n",
+        )
+        .unwrap();
         run_git(
             repo._temp.path(),
             &["add", "project/drawings/plan_1f/staged-note.txt"],
@@ -2105,15 +2329,24 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"new"}"#,
             ],
         );
 
         let artifacts = run_review_for_path(&repo.project_path).expect("review should run");
-
         assert!(artifacts.diff_unavailable.is_none());
-        assert!(artifacts.diff.is_some());
         assert!(artifacts.diff_svg.is_some());
+        let diff = artifacts.diff.expect("diff should be available");
+
+        assert!(diff.changes.iter().any(|change| {
+            change.entity_id == "ent_01JZ0000000000000000000000"
+                && change.kind == cad_diff::ChangeKind::Modified
+        }));
+        assert!(diff.changes.iter().any(|change| {
+            change.entity_id == "ent_01JZ0000000000000000000001"
+                && change.kind == cad_diff::ChangeKind::Added
+        }));
     }
 
     #[test]
@@ -2129,7 +2362,7 @@ mod tests {
         .expect("layouts should be copied");
         fs::write(
             other.join("entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
         )
         .expect("other entities should be written");
 
@@ -2222,11 +2455,38 @@ mod tests {
     }
 
     #[test]
-    fn ai_context_generation_is_content_addressed() {
-        let first = ai_context_generation("{\"value\":1}", "first");
-        assert_eq!(first, ai_context_generation("{\"value\":1}", "first"));
-        assert_ne!(first, ai_context_generation("{\"value\":2}", "first"));
-        assert_ne!(first, ai_context_generation("{\"value\":1}", "second"));
+    fn ai_context_reuses_complete_content_and_rejects_incomplete_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        write_project(temp.path(), false);
+        let cache = HeadSnapshotCache::default();
+        let make = || {
+            build_ai_context(
+                temp.path(),
+                "sheet",
+                "ent_01JZ0000000000000000000000",
+                &cache,
+            )
+            .unwrap()
+        };
+        let mut first = make();
+        first.generated_at = "2026-01-01T00:00:00Z".into();
+        let paths = publish_ai_generation(temp.path(), first).unwrap();
+        let bytes = fs::read(&paths.0).unwrap();
+        let mut later = make();
+        later.generated_at = "2026-02-01T00:00:00Z".into();
+        assert_eq!(publish_ai_generation(temp.path(), later).unwrap(), paths);
+        assert_eq!(fs::read(&paths.0).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(temp.path().join("build/ai-context"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let manifest_path = temp.path().join("build/ai-context-current.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        fs::remove_file(&paths.1).unwrap();
+        assert!(publish_ai_generation(temp.path(), make()).is_err());
+        assert_eq!(fs::read(manifest_path).unwrap(), manifest);
     }
 
     #[test]
@@ -2240,7 +2500,7 @@ mod tests {
         write_entities(
             &repo.project_path,
             &[
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
             ],
         );
         let second = write_ai_context_for_path(
@@ -2270,7 +2530,7 @@ mod tests {
         .expect("layouts should be copied");
         fs::write(
             other.join("entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[10.0,0.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[10.0,0.0]}"#,
         )
         .expect("other entities should be written");
         fs::write(
@@ -2332,7 +2592,7 @@ mod tests {
 
     #[test]
     fn comment_create_and_status_update_preserve_revision_contract() {
-        let repo = fixture_repo();
+        let repo = fixture_project();
         let path = repo.project_path.join("comments/plan_1f.ndjson");
         let revision =
             comment_revision(&repo.project_path, "plan_1f").expect("revision should load");
@@ -2462,7 +2722,7 @@ mod tests {
 
     #[test]
     fn ai_context_reports_no_entity_selected_in_current_manifest() {
-        let repo = fixture_repo();
+        let repo = fixture_project();
         fs::create_dir_all(repo.project_path.join("build")).expect("build dir should be created");
 
         let state = write_ai_context_for_path(&repo.project_path, "sheet", "");
@@ -2484,7 +2744,7 @@ mod tests {
     fn ai_context_rejects_symlinked_build_directory() {
         use std::os::unix::fs::symlink;
 
-        let repo = fixture_repo();
+        let repo = fixture_project();
         let outside = tempfile::tempdir().expect("outside dir should be created");
         symlink(outside.path(), repo.project_path.join("build"))
             .expect("build symlink should be created");
@@ -2497,7 +2757,7 @@ mod tests {
 
     #[test]
     fn drawing_revision_validation_rejects_stale_and_arbitrary_revisions() {
-        let repo = fixture_repo();
+        let repo = fixture_project();
         let entities = repo.project_path.join("drawings/plan_1f/entities.ndjson");
         let original = fs::read(&entities).expect("entities should be readable");
         let revision = blake3::hash(&original).to_hex().to_string();
@@ -2525,7 +2785,7 @@ mod tests {
 
     #[test]
     fn drawing_revision_validation_rejects_path_traversal() {
-        let repo = fixture_repo();
+        let repo = fixture_project();
         let error = validated_drawing_revision(
             &repo.project_path,
             "../..",
@@ -2541,7 +2801,7 @@ mod tests {
     fn drawing_revision_validation_rejects_a_symlinked_source() {
         use std::os::unix::fs::symlink;
 
-        let repo = fixture_repo();
+        let repo = fixture_project();
         let entities = repo.project_path.join("drawings/plan_1f/entities.ndjson");
         let original = fs::read(&entities).expect("entities");
         let revision = blake3::hash(&original).to_hex().to_string();
@@ -2559,7 +2819,7 @@ mod tests {
 
     #[test]
     fn desktop_source_readers_fail_closed_on_an_incomplete_transaction() {
-        let review_repo = fixture_repo();
+        let review_repo = fixture_project();
         write_incomplete_transaction(&review_repo.project_path);
         assert!(
             run_review_for_path(&review_repo.project_path)
@@ -2567,7 +2827,7 @@ mod tests {
                 .contains("failed to recover source transaction")
         );
 
-        let snap_repo = fixture_repo();
+        let snap_repo = fixture_project();
         let entities = snap_repo
             .project_path
             .join("drawings/plan_1f/entities.ndjson");
@@ -2582,7 +2842,7 @@ mod tests {
                 .contains("failed to recover source transaction")
         );
 
-        let pdf_repo = fixture_repo();
+        let pdf_repo = fixture_project();
         let output = pdf_repo
             .project_path
             .parent()
@@ -2603,7 +2863,7 @@ mod tests {
         );
         assert!(!output.exists());
 
-        let ai_repo = fixture_repo();
+        let ai_repo = fixture_project();
         write_incomplete_transaction(&ai_repo.project_path);
         let state = write_ai_context_for_path(
             &ai_repo.project_path,
@@ -2617,6 +2877,41 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("failed to recover source transaction"))
         );
+    }
+
+    #[test]
+    fn snap_cache_invalidates_when_only_layer_visibility_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        write_project(temp.path(), false);
+        let path = path_string(temp.path());
+        let entities = temp.path().join("drawings/plan_1f/entities.ndjson");
+        let layers = temp.path().join("rules/layers.toml");
+        let revision = blake3::hash(&fs::read(entities).unwrap())
+            .to_hex()
+            .to_string();
+        let manager = SnapCacheManager::default();
+        let visible = cached_snap_index(&manager, &path, "plan_1f", &revision).unwrap();
+        assert!(
+            visible
+                .query([0., 0.], 1., &[cad_edit::SnapKind::Endpoint])
+                .is_some()
+        );
+        let original = fs::read_to_string(&layers).unwrap();
+        fs::write(
+            &layers,
+            original.replace("visible = true", "visible = false"),
+        )
+        .unwrap();
+        let hidden = cached_snap_index(&manager, &path, "plan_1f", &revision).unwrap();
+        assert!(
+            hidden
+                .query([0., 0.], 1., &[cad_edit::SnapKind::Endpoint])
+                .is_none()
+        );
+        let result = build_snap_index_for_revision_with(temp.path(), "plan_1f", &revision, || {
+            fs::write(&layers, original).unwrap();
+        });
+        assert!(result.err().unwrap().contains("revision_conflict"));
     }
 
     #[test]
@@ -2689,34 +2984,37 @@ mod tests {
     }
 
     #[test]
-    fn replacing_project_watcher_stops_old_project_events() {
-        let _watch_guard = WATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::Builder::new()
-            .prefix("cad-watch-replace-")
-            .tempdir_in("/private/tmp")
-            .expect("tempdir should be created");
+    fn replacing_project_watcher_delivers_only_current_project_events() {
+        let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
         write_project(&first, false);
         write_project(&second, false);
-        let first_watcher = create_project_watcher(&first, path_string(&first), |_| {})
-            .expect("first watcher should start");
-        let second_watcher = create_project_watcher(&second, path_string(&second), |_| {})
-            .expect("second watcher should start");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let old_sender = sender.clone();
+        let old = create_project_watcher(&first, "first".into(), move |event| {
+            old_sender.send(event).unwrap();
+        })
+        .unwrap();
+        let current = create_project_watcher(&second, "second".into(), move |event| {
+            sender.send(event).unwrap();
+        })
+        .unwrap();
         let manager = ProjectWatchManager::default();
-        *manager.current.lock().expect("manager should lock") = Some(first_watcher);
-        *manager.current.lock().expect("manager should lock") = Some(second_watcher);
-        assert_eq!(
-            manager
-                .current
-                .lock()
-                .expect("manager should lock")
-                .as_ref()
-                .expect("watcher should exist")
-                ._project_path,
-            path_string(&second)
+        *manager.current.lock().unwrap() = Some(old);
+        *manager.current.lock().unwrap() = Some(current);
+        for root in [&first, &second] {
+            fs::write(root.join("drawings/plan_1f/entities.ndjson"), "changed").unwrap();
+        }
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(event.project_path, "second");
+        drop(manager);
+        assert!(
+            receiver
+                .try_iter()
+                .all(|event| event.project_path == "second")
         );
     }
 
@@ -2837,12 +3135,13 @@ mod tests {
             path_string(&project),
             "plan_1f".to_owned(),
             path_string(&output),
-            false,
+            true,
             false,
         )
         .expect("JWW export should succeed");
         assert_eq!(report.status, cad_export_jww::ExportStatus::Exported);
         assert!(output.exists());
+        assert!(temp.path().join("plan.jww.report.json").exists());
         assert_eq!(
             &fs::read(output).expect("JWW should be readable")[..8],
             b"JwwData."
@@ -3130,17 +3429,20 @@ mod tests {
     }
 
     fn fixture_repo() -> FixtureRepo {
+        let fixture = fixture_project();
+        let root = fixture._temp.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "cad@example.invalid"]);
+        run_git(root, &["config", "user.name", "CAD Test"]);
+        run_git(root, &["add", "project"]);
+        run_git(root, &["commit", "-m", "initial"]);
+        fixture
+    }
+
+    fn fixture_project() -> FixtureRepo {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let project_path = temp.path().join("project");
         write_project(&project_path, true);
-        run_git(temp.path(), &["init"]);
-        run_git(
-            temp.path(),
-            &["config", "user.email", "cad@example.invalid"],
-        );
-        run_git(temp.path(), &["config", "user.name", "CAD Test"]);
-        run_git(temp.path(), &["add", "project"]);
-        run_git(temp.path(), &["commit", "-m", "initial"]);
         FixtureRepo {
             _temp: temp,
             project_path,
@@ -3159,7 +3461,7 @@ mod tests {
         fs::create_dir_all(project_path.join("comments")).expect("comments dir should be created");
         fs::write(
             project_path.join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"desktop-fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"desktop-fixture\"\n",
         )
         .expect("project TOML should be written");
         fs::write(
@@ -3174,13 +3476,13 @@ mod tests {
         .expect("styles TOML should be written");
         fs::write(
             project_path.join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be written");
         write_entities(
             project_path,
             &[
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
             ],
         );
         if include_comment {

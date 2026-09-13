@@ -3,21 +3,17 @@
  * The test keeps desktop IPC behavior covered without launching a Tauri window.
  */
 import { expect, test } from "@playwright/test";
-import {
-  type DesktopReviewArtifacts,
-  type DiffReport,
-  type CheckReport,
-} from "../../src/artifacts";
+import { type DesktopReviewArtifacts, type DiffReport, type CheckReport } from "../../src/artifacts";
 import { type InvokeReview, loadReviewSnapshotFromDesktop } from "../../src/desktop-loader";
 
 const checkReport: CheckReport = {
-  schema_version: "0.2",
+  schema_version: "0.3",
   status: "ok",
   diagnostics: [],
 };
 
 const diffReport: DiffReport = {
-  schema_version: "0.2",
+  schema_version: "0.3",
   status: "ok",
   changes: [
     {
@@ -53,7 +49,7 @@ test("loads desktop artifacts through run_review invoke", async () => {
     comments_revision: "comments-revision",
     diff_unavailable: null,
     layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
-    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [] },
+    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [], fills: [] },
   };
   const invoke: InvokeReview = async (command, args) => {
     calls.push({ command, args });
@@ -87,7 +83,7 @@ test("marks diff unavailable when desktop command has no diff report", async () 
     comments_revision: "comments-revision",
     diff_unavailable: "project has no tracked files in Git",
     layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
-    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [] },
+    editor: { drawing: "plan_1f", revision: "rev", entities: [], text_styles: [], dimension_styles: [], pens: [], fills: [] },
   };
   const invoke: InvokeReview = async () => review;
 

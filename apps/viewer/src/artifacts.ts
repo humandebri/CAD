@@ -105,9 +105,18 @@ export type EditorDrawingState = {
   text_styles: string[];
   dimension_styles: string[];
   pens: string[];
+  fills: string[];
 };
 
 export type EditOperation =
+  | { kind: "source_checked"; operation: EditOperation; expected_files: HistoryFileRevision[] }
+  | { kind: "resolve_dimensions"; operation: EditOperation; resolutions: Array<{ entity_id: string; action: "delete" | "detach" }> }
+  | { kind: "endpoint"; entity_id: string; vertex_index: number; to: [number, number] }
+  | { kind: "stretch"; entity_ids: string[]; min: [number, number]; max: [number, number]; delta: [number, number] }
+  | { kind: "rectangle"; layer: string; p1: [number, number]; p2: [number, number] }
+  | { kind: "rectangular_array"; entity_ids: string[]; rows: number; columns: number; row_spacing: number; column_spacing: number }
+  | { kind: "fillet"; first_entity_id: string; second_entity_id: string; first_pick: [number, number]; second_pick: [number, number]; radius: number }
+  | { kind: "chamfer"; first_entity_id: string; second_entity_id: string; first_pick: [number, number]; second_pick: [number, number]; first_distance: number; second_distance: number }
   | { kind: "batch"; operations: EditOperation[] }
   | { kind: "create"; entity: Record<string, unknown> }
   | { kind: "replace"; entity_id: string; entity: EditorEntity }
@@ -127,6 +136,8 @@ export type EditOperation =
       at: [number, number];
       rotation_deg: number;
       scale: number;
+      mirror_x?: boolean;
+      mirror_y?: boolean;
       entity_id?: string;
     }
   | {
@@ -145,6 +156,17 @@ export type DrawingEditRequest = {
   drawing: string;
   expected_revision: string;
   operation: EditOperation;
+};
+
+export type DrawingEditPreview = {
+  drawing: string;
+  expected_revision: string;
+  entities: EditorEntity[];
+  entity_ids: string[];
+  warnings: string[];
+  dimension_impacts: string[];
+  source_files: HistoryFileRevision[];
+  svg: string;
 };
 
 export type DrawingEditResult = {
@@ -205,7 +227,7 @@ export type DrawingHistoryState = {
   context_blocked?: string | null;
 };
 
-export type SnapKind = "endpoint" | "midpoint" | "intersection";
+export type SnapKind = "endpoint" | "midpoint" | "intersection" | "center" | "quadrant" | "nearest" | "perpendicular";
 
 export type SnapCandidate = {
   kind: SnapKind;
@@ -295,7 +317,10 @@ export type PdfExportRequest = {
 export type ProjectState = {
   project_path: string;
   project_name: string;
+  drawings: string[];
   is_git_project: boolean;
+  editable: boolean;
+  read_only_reason?: string | null;
   import_warning_count?: number | null;
   jww_compatibility_state?: "editable_lossless" | "preserved_read_only" | "unsupported_version" | "malformed" | null;
   jww_compatibility_reason?: string | null;
@@ -358,7 +383,7 @@ export const emptyLayerWorkspace: LayerWorkspaceState = {
 
 export function emptyDiffReport(message: string): DiffReport {
   return {
-    schema_version: "0.2",
+    schema_version: "0.3",
     status: message.length > 0 ? "warning" : "ok",
     changes: [],
     warnings: [],

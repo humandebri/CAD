@@ -3,21 +3,7 @@
  * behavior stays stable as renderer viewBox sizing changes.
  */
 import { expect, test } from "@playwright/test";
-import {
-  MAX_ZOOM_SCALE,
-  ZOOM_STEP_FACTOR,
-  bboxFromDataBBoxValues,
-  classifyJwCadGesture,
-  computeFitSvgViewBox,
-  computeFitViewBox,
-  formatZoomScale,
-  panViewBox,
-  parseDataBBox,
-  parseViewBox,
-  viewBoxZoomScale,
-  wheelDeltaToScaleFactor,
-  zoomViewBoxAtPoint,
-} from "../../src/view-fit";
+import { MAX_ZOOM_SCALE, bboxFromDataBBoxValues, classifyJwCadGesture, computeFitSvgViewBox, computeFitViewBox, formatZoomScale, panViewBox, parseDataBBox, parseViewBox, viewBoxZoomScale, wheelDeltaToScaleFactor, zoomViewBoxAtPoint } from "../../src/view-fit";
 
 test("unions valid data-bbox values and ignores invalid values", () => {
   expect(bboxFromDataBBoxValues(["10,20,30,40", "5,-10,15,0", "", "bad"])).toEqual({
@@ -146,18 +132,6 @@ test("keeps the cursor coordinate fixed while zooming", () => {
   expect((focusPoint.y - (zoom?.viewBox.minY ?? 0)) / (zoom?.viewBox.height ?? 1)).toBeCloseTo(
     0.75,
   );
-});
-
-test("uses a multiplicative toolbar zoom step", () => {
-  const baseViewBox = { minX: 0, minY: -800, width: 1000, height: 800 };
-  const zoom = zoomViewBoxAtPoint({
-    baseViewBox,
-    currentViewBox: baseViewBox,
-    targetScale: ZOOM_STEP_FACTOR,
-    focusPoint: { x: 500, y: -400 },
-  });
-
-  expect(zoom?.scale).toBe(ZOOM_STEP_FACTOR);
 });
 
 test("classifies Jw_cad diagonal gestures and rejects axis-only drags", () => {

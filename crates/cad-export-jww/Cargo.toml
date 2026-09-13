@@ -17,4 +17,3 @@ thiserror.workspace = true
 
 [dev-dependencies]
 cad-import-jww.workspace = true
-tempfile.workspace = true

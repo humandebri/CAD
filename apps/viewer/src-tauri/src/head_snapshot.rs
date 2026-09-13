@@ -1,20 +1,40 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct HeadSnapshotCache {
     load: Mutex<()>,
     entry: Mutex<Option<CacheEntry>>,
+    diff: Mutex<Option<DiffCacheEntry>>,
+}
+
+struct DiffCacheEntry {
+    base: Arc<HeadSnapshot>,
+    manifest: Vec<cad_model::SourceFileRevision>,
+    report: Arc<cad_diff::DiffReport>,
 }
 
 struct CacheEntry {
     key: CacheKey,
-    project: Arc<cad_model::ProjectSource>,
+    project: Arc<HeadSnapshot>,
+}
+
+pub(crate) struct HeadSnapshot {
+    source: cad_model::ProjectSource,
     _root: tempfile::TempDir,
+}
+
+impl std::ops::Deref for HeadSnapshot {
+    type Target = cad_model::ProjectSource;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +46,30 @@ struct CacheKey {
 
 trait GitRunner: Send + Sync {
     fn output(&self, directory: &Path, args: &[&OsStr]) -> Result<Vec<u8>, String>;
+    fn blobs(&self, directory: &Path, input: &[u8]) -> Result<Vec<u8>, String> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().ok_or("missing Git stdin")?;
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(input));
+            let output = child.wait_with_output().map_err(|e| e.to_string())?;
+            writer
+                .join()
+                .map_err(|_| "Git input writer panicked".to_owned())?
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(command_stderr("git cat-file --batch", &output.stderr));
+            }
+            Ok(output.stdout)
+        })
+    }
 }
 
 struct ProcessGitRunner;
@@ -51,10 +95,37 @@ impl GitRunner for ProcessGitRunner {
 }
 
 impl HeadSnapshotCache {
-    pub(crate) fn load(
+    pub(crate) fn diff(
         &self,
         project_path: &Path,
-    ) -> Result<Arc<cad_model::ProjectSource>, String> {
+        head: &cad_model::ProjectSource,
+        manifest: &[cad_model::SourceFileRevision],
+    ) -> Result<Arc<cad_diff::DiffReport>, String> {
+        let base = self.load(project_path)?;
+        let mut cached = self
+            .diff
+            .lock()
+            .map_err(|_| "diff cache lock is poisoned")?;
+        if let Some(entry) = cached
+            .as_ref()
+            .filter(|entry| Arc::ptr_eq(&entry.base, &base) && entry.manifest == manifest)
+        {
+            return Ok(Arc::clone(&entry.report));
+        }
+        let report = Arc::new(cad_diff::diff_projects(&base, head));
+        if cad_model::source_manifest(project_path).map_err(|error| error.to_string())? != manifest
+        {
+            return Err("revision_conflict: source changed during diff calculation".to_owned());
+        }
+        *cached = Some(DiffCacheEntry {
+            base,
+            manifest: manifest.to_vec(),
+            report: Arc::clone(&report),
+        });
+        Ok(report)
+    }
+
+    pub(crate) fn load(&self, project_path: &Path) -> Result<Arc<HeadSnapshot>, String> {
         self.load_with(project_path, &ProcessGitRunner)
     }
 
@@ -62,7 +133,7 @@ impl HeadSnapshotCache {
         &self,
         project_path: &Path,
         runner: &R,
-    ) -> Result<Arc<cad_model::ProjectSource>, String> {
+    ) -> Result<Arc<HeadSnapshot>, String> {
         let _load = self
             .load
             .lock()
@@ -115,14 +186,16 @@ impl HeadSnapshotCache {
         }
 
         let (temp, source) = build_head_snapshot(runner, &key, relative_project)?;
-        let source = Arc::new(source);
+        let source = Arc::new(HeadSnapshot {
+            source,
+            _root: temp,
+        });
         *self
             .entry
             .lock()
             .map_err(|_| "HEAD snapshot cache is poisoned".to_owned())? = Some(CacheEntry {
             key,
             project: Arc::clone(&source),
-            _root: temp,
         });
         Ok(source)
     }
@@ -169,39 +242,72 @@ fn build_head_snapshot<R: GitRunner>(
             OsStr::new("ls-tree"),
             OsStr::new("-r"),
             OsStr::new("-z"),
-            OsStr::new("--name-only"),
             OsStr::new(&key.oid),
             OsStr::new("--"),
             OsStr::new(&relative_project_arg),
         ],
     )?;
-    let canonical_files = head_files
+    let mut canonical_files = Vec::new();
+    for entry in head_files
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
-        .filter_map(|git_path| {
-            let relative = git_path.strip_prefix(relative_project).ok()?.to_path_buf();
-            cad_model::classify_project_source_path(&relative)?;
-            Some((git_path, relative))
-        })
-        .collect::<Vec<_>>();
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|&byte| byte == b'\t')
+            .ok_or("invalid Git tree entry")?;
+        let git_path = PathBuf::from(OsString::from_vec(entry[tab + 1..].to_vec()));
+        let Ok(relative) = git_path.strip_prefix(relative_project) else {
+            continue;
+        };
+        if cad_model::classify_project_source_path(relative).is_none() {
+            continue;
+        }
+        let fields = std::str::from_utf8(&entry[..tab])
+            .map_err(|e| e.to_string())?
+            .split(' ')
+            .collect::<Vec<_>>();
+        if fields.len() != 3 || fields[1] != "blob" || !matches!(fields[0], "100644" | "100755") {
+            return Err("canonical HEAD source must be a regular blob".to_owned());
+        }
+        canonical_files.push((fields[2].to_owned(), relative.to_path_buf()));
+    }
     if canonical_files.is_empty() {
         return Err("project has no canonical source files in Git".to_owned());
     }
-
+    let input = canonical_files
+        .iter()
+        .map(|(oid, _)| format!("{oid}\n"))
+        .collect::<String>();
+    let batch = runner.blobs(&key.repo, input.as_bytes())?;
+    let mut remaining = batch.as_slice();
     let temp = tempfile::tempdir().map_err(|error| format!("failed to create tempdir: {error}"))?;
-    for (git_path, relative_file) in canonical_files {
-        let mut object_path = OsString::from(&key.oid);
-        object_path.push(":");
-        object_path.push(git_path.as_os_str());
-        let content = runner.output(&key.repo, &[OsStr::new("show"), object_path.as_os_str()])?;
+    for (oid, relative_file) in canonical_files {
+        let newline = remaining
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or("truncated Git blob header")?;
+        let header = std::str::from_utf8(&remaining[..newline])
+            .map_err(|e| e.to_string())?
+            .split(' ')
+            .collect::<Vec<_>>();
+        if header.len() != 3 || header[0] != oid || header[1] != "blob" {
+            return Err("unexpected Git blob response".to_owned());
+        }
+        let length: usize = header[2].parse().map_err(|_| "invalid Git blob size")?;
+        remaining = &remaining[newline + 1..];
+        if remaining.get(length) != Some(&b'\n') {
+            return Err("truncated Git blob".to_owned());
+        }
         let destination = temp.path().join(relative_file);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create temp parent: {error}"))?;
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        fs::write(&destination, content)
-            .map_err(|error| format!("failed to write HEAD file: {error}"))?;
+        fs::write(destination, &remaining[..length]).map_err(|e| e.to_string())?;
+        remaining = &remaining[length + 1..];
+    }
+    if !remaining.is_empty() {
+        return Err("unexpected trailing Git blob data".to_owned());
     }
     let source = cad_model::load_project(temp.path())
         .map_err(|error| format!("failed to load HEAD project: {error}"))?;
@@ -242,11 +348,14 @@ mod tests {
     #[derive(Default)]
     struct CountingGitRunner {
         calls: Mutex<Vec<String>>,
-        shown: Mutex<Vec<String>>,
         fail_next_ls_tree: AtomicBool,
     }
 
     impl GitRunner for CountingGitRunner {
+        fn blobs(&self, directory: &Path, input: &[u8]) -> Result<Vec<u8>, String> {
+            self.calls.lock().unwrap().push("cat-file".to_owned());
+            ProcessGitRunner.blobs(directory, input)
+        }
         fn output(&self, directory: &Path, args: &[&OsStr]) -> Result<Vec<u8>, String> {
             let command = args
                 .first()
@@ -256,13 +365,6 @@ mod tests {
                 .lock()
                 .expect("calls should lock")
                 .push(command.clone());
-            if command == "show" {
-                self.shown.lock().expect("shown should lock").push(
-                    args.get(1)
-                        .map(|value| value.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                );
-            }
             if command == "ls-tree" && self.fail_next_ls_tree.swap(false, Ordering::SeqCst) {
                 return Err("injected ls-tree failure".to_owned());
             }
@@ -275,7 +377,7 @@ mod tests {
         fs::create_dir_all(root.join("drawings/plan")).expect("drawing should be created");
         fs::write(
             root.join("cad.project.toml"),
-            format!("schema_version = \"0.2\"\nname = \"{name}\"\n"),
+            format!("schema_version = \"0.3\"\nname = \"{name}\"\n"),
         )
         .expect("project should be written");
         fs::write(
@@ -290,12 +392,12 @@ mod tests {
         .expect("styles should be written");
         fs::write(
             root.join("drawings/plan/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n[layouts.default]\nname = \"Default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0, 0]\nmargins = [0, 0, 0, 0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n[layouts.default]\nname = \"Default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0, 0]\nmargins = [0, 0, 0, 0]\n",
         )
         .expect("layouts should be written");
         fs::write(
             root.join("drawings/plan/entities.ndjson"),
-            "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0\",\"p1\":[0,0],\"p2\":[10,0]}\n",
+            "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0\",\"p1\":[0,0],\"p2\":[10,0]}\n",
         )
         .expect("entities should be written");
     }
@@ -345,13 +447,13 @@ mod tests {
         let cache = HeadSnapshotCache::default();
         let runner = CountingGitRunner::default();
 
-        let first = cache
+        cache
             .load_with(temp.path(), &runner)
             .expect("first snapshot should load");
         let first_counts = call_counts(&runner);
         fs::write(
             temp.path().join("drawings/plan/entities.ndjson"),
-            "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0\",\"p1\":[0,0],\"p2\":[20,0]}\n",
+            "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0\",\"p1\":[0,0],\"p2\":[20,0]}\n",
         )
         .expect("working tree should change");
         let second = cache
@@ -359,22 +461,18 @@ mod tests {
             .expect("cached snapshot should load");
         let second_counts = call_counts(&runner);
 
-        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(second_counts["ls-tree"], first_counts["ls-tree"]);
-        assert_eq!(second_counts["show"], first_counts["show"]);
-        assert_eq!(second_counts["rev-parse"], first_counts["rev-parse"] + 1);
-        assert!(
-            runner
-                .shown
-                .lock()
-                .expect("shown should lock")
-                .iter()
-                .all(|path| {
-                    !path.contains("README.md")
-                        && !path.contains("build/report.json")
-                        && !path.contains("interop/jww/original.jww")
-                })
+        assert_eq!(second_counts["cat-file"], first_counts["cat-file"]);
+        assert_eq!(second.project.name, "first");
+        assert_eq!(
+            cad_model::entity_bbox(&second.drawings[0].entities[0].entity)
+                .unwrap()
+                .max[0],
+            10.0
         );
+        for ignored in ["README.md", "build/report.json", "interop/jww/original.jww"] {
+            assert!(!second.root.join(ignored).exists());
+        }
     }
 
     #[test]
@@ -384,16 +482,50 @@ mod tests {
         init_repo(temp.path());
         let cache = HeadSnapshotCache::default();
         let first = cache.load(temp.path()).expect("first snapshot should load");
+        let initial = cad_model::load_project(temp.path()).unwrap();
+        assert!(
+            cache
+                .diff(
+                    temp.path(),
+                    &initial,
+                    &cad_model::source_manifest(temp.path()).unwrap()
+                )
+                .unwrap()
+                .configuration_changes
+                .is_empty()
+        );
         fs::write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"second\"\n",
+            "schema_version = \"0.3\"\nname = \"second\"\n",
         )
         .expect("project should change");
+        let changed = cad_model::load_project(temp.path()).unwrap();
+        let manifest = cad_model::source_manifest(temp.path()).unwrap();
+        assert!(
+            !cache
+                .diff(temp.path(), &changed, &manifest)
+                .unwrap()
+                .configuration_changes
+                .is_empty()
+        );
         run_git(temp.path(), &["add", "."]);
         run_git(temp.path(), &["commit", "-m", "second"]);
         let second = cache.load(temp.path()).expect("new snapshot should load");
-        assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.project.name, "second");
+        assert!(
+            cache
+                .diff(temp.path(), &changed, &manifest)
+                .unwrap()
+                .configuration_changes
+                .is_empty()
+        );
+        assert_eq!(
+            cad_model::load_project(&first.root).unwrap().project.name,
+            "first"
+        );
+        let old_root = first.root.clone();
+        drop(first);
+        assert!(!old_root.exists());
     }
 
     #[test]
@@ -414,7 +546,7 @@ mod tests {
             .expect("first project should reload");
         assert_eq!(first.project.name, "first");
         assert_eq!(second.project.name, "second");
-        assert!(!Arc::ptr_eq(&first, &first_again));
+        assert_eq!(first_again.project.name, "first");
     }
 
     #[test]

@@ -1,2 +1,2 @@
-{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}
-{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-2","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"updated note"}
+{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}
+{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-2","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"updated note"}

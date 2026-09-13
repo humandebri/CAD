@@ -7,14 +7,11 @@ license.workspace = true
 [dependencies]
 cad-model.workspace = true
 encoding_rs.workspace = true
-thiserror.workspace = true
-miette.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
-insta.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true

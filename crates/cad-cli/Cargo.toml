@@ -22,5 +22,6 @@ cad-render-pdf.workspace = true
 clap.workspace = true
 miette.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
 tempfile.workspace = true
-thiserror.workspace = true

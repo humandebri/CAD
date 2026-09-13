@@ -1,24 +1,7 @@
 /** apps/viewer: verifies desktop live review coordination without Tauri. */
 import { expect, test } from "@playwright/test";
-import {
-  type Artifacts,
-  type DesktopReviewSnapshot,
-  type ProjectState,
-  type ProjectWatchEvent,
-} from "../../src/artifacts";
-import {
-  DrawingLoadGuard,
-  LatestProjectPersistenceQueue,
-  LatestReviewQueue,
-  ProjectOpenGuard,
-  mergeProjectStateFromReview,
-  sheetSvgContainsEntity,
-  shouldPreserveView,
-  startProjectWatch,
-  startProjectWatchWithCatchUp,
-  stopProjectWatch,
-  subscribeProjectWatch,
-} from "../../src/desktop-live-review";
+import { type Artifacts, type DesktopReviewSnapshot, type ProjectState } from "../../src/artifacts";
+import { DrawingLoadGuard, LatestProjectPersistenceQueue, LatestReviewQueue, ProjectOpenGuard, mergeProjectStateFromReview, shouldPreserveView, startProjectWatchWithCatchUp } from "../../src/desktop-live-review";
 
 test("ignores startup open failures after a newer project open begins", () => {
   const guard = new ProjectOpenGuard();
@@ -147,84 +130,40 @@ test("updates reviewed project name while preserving session metadata", () => {
   const state: ProjectState = {
     project_path: "/tmp/project",
     project_name: "old-name",
+    drawings: ["plan"],
     is_git_project: true,
+    editable: true,
     import_warning_count: 3,
   };
 
   expect(mergeProjectStateFromReview(state, snapshot("latest"))).toEqual({
     project_path: "/tmp/project",
     project_name: "reviewed-latest",
+    drawings: ["plan"],
     is_git_project: true,
+    editable: true,
     import_warning_count: 3,
   });
 });
 
-test("watch transport uses the desktop command and event contracts", async () => {
-  const calls: { command: string; args?: Record<string, unknown> }[] = [];
-  const invoke = async (command: string, args?: Record<string, unknown>) => {
-    calls.push({ command, args });
-    return { project_path: "/tmp/project", status: "watching", debounce_ms: 250 };
-  };
-  const events: ProjectWatchEvent[] = [];
-  const listener: { current?: (event: ProjectWatchEvent) => void } = {};
-  const unlisten = () => undefined;
-
-  await startProjectWatch("/tmp/project", invoke);
-  await subscribeProjectWatch((event) => events.push(event), async (handler) => {
-    listener.current = handler;
-    return unlisten;
-  });
-  listener.current?.({
-    kind: "changed",
-    project_path: "/tmp/project",
-    paths: ["drawings/plan/entities.ndjson"],
-  });
-  await stopProjectWatch(invoke);
-
-  expect(calls).toEqual([
-    { command: "start_project_watch", args: { projectPath: "/tmp/project" } },
-    { command: "stop_project_watch", args: undefined },
-  ]);
-  expect(events).toHaveLength(1);
-});
-
-test("forwards Rust-filtered watch events without a second frontend allowlist", async () => {
-  const events: ProjectWatchEvent[] = [];
-  const payload: ProjectWatchEvent = {
-    kind: "changed",
-    project_path: "/tmp/project",
-    paths: ["rules/custom.toml", "blocks/door/definition.toml"],
-  };
-
-  await subscribeProjectWatch((event) => events.push(event), async (handler) => {
-    handler(payload);
-    return () => undefined;
-  });
-
-  expect(events).toEqual([payload]);
-});
-
 test("preserves view only in the same context and checks retained selection", () => {
-  const svg = '<svg><g data-entity-id="ent_A"><line /></g></svg>';
   expect(shouldPreserveView("/project:sheet", "/project:sheet")).toBe(true);
   expect(shouldPreserveView("/project:sheet", "/project:diff")).toBe(false);
   expect(shouldPreserveView("/project:sheet", "/other:sheet")).toBe(false);
-  expect(sheetSvgContainsEntity(svg, "ent_A")).toBe(true);
-  expect(sheetSvgContainsEntity(svg, "ent_B")).toBe(false);
 });
 
 function artifacts(id: string): Artifacts {
   return {
     sheetSvg: `<svg data-review="${id}" />`,
     diffSvg: "<svg />",
-    check: { schema_version: "0.2", status: "ok", diagnostics: [] },
-    diff: { schema_version: "0.2", status: "ok", changes: [], warnings: [], configuration_changes: [] },
+    check: { schema_version: "0.3", status: "ok", diagnostics: [] },
+    diff: { schema_version: "0.3", status: "ok", changes: [], warnings: [], configuration_changes: [] },
     comments: [],
     commentsRevision: "comments-revision",
     layers: { revision: "revision", active_layer: null, groups: [], layers: [] },
     drawingNames: ["plan_1f"],
     currentDrawing: "plan_1f",
-    editor: { drawing: "plan_1f", revision: id, entities: [], text_styles: [], dimension_styles: [], pens: [] },
+    editor: { drawing: "plan_1f", revision: id, entities: [], text_styles: [], dimension_styles: [], pens: [], fills: [] },
   };
 }
 

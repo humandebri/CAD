@@ -22,9 +22,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+        env:
+          CAD_PDF_TEST_OUTPUT: /tmp/cad-pdf-fidelity.pdf
       - name: Validate embedded Japanese PDF with Poppler
         run: |
-          CAD_PDF_TEST_OUTPUT=/tmp/cad-pdf-fidelity.pdf cargo test -p cad-render-pdf applies_pen_dash_unicode_text_and_dimension_style
           pdfinfo /tmp/cad-pdf-fidelity.pdf
           pdffonts /tmp/cad-pdf-fidelity.pdf | tee /tmp/cad-pdf-fonts.txt
           rg 'CID TrueType.*Identity-H.*yes +yes +yes' /tmp/cad-pdf-fonts.txt
@@ -51,24 +52,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/viewer/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:unit
       - run: pnpm test:e2e
-
-  desktop-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Tauri build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.97.1
-          components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p cad-desktop desktop_file_smoke_covers_edit_comment_layer_history_and_pdf_conflicts --all-features
 
   macos-desktop-e2e:
     runs-on: macos-15

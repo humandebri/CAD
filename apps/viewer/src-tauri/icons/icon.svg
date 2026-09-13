@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#102f3e"/>
+      <stop offset="1" stop-color="#071923"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#67d7d0" stroke-opacity=".14" stroke-width="2"/>
+    </pattern>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="url(#bg)"/>
+  <rect x="32" y="32" width="448" height="448" rx="88" fill="url(#grid)"/>
+  <path d="M112 374V138H350L400 188V374Z" fill="#f7fbfa" stroke="#7fe3dc" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M350 138V188H400" fill="none" stroke="#7fe3dc" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M158 318 231 205 291 287 346 214" fill="none" stroke="#0c6170" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="158" cy="318" r="13" fill="#22b8ae"/>
+  <circle cx="231" cy="205" r="13" fill="#22b8ae"/>
+  <circle cx="291" cy="287" r="13" fill="#22b8ae"/>
+  <circle cx="346" cy="214" r="13" fill="#22b8ae"/>
+  <path d="M151 350H361" stroke="#9cafaa" stroke-width="8"/>
+  <path d="M174 338V362M218 338V362M262 338V362M306 338V362M350 338V362" stroke="#0c6170" stroke-width="7"/>
+</svg>

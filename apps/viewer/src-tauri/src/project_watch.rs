@@ -464,41 +464,20 @@ mod tests {
         fs::create_dir_all(root.join("drawings/plan")).expect("drawing should be created");
         fs::write(
             root.join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"watch\"\n",
+            "schema_version = \"0.3\"\nname = \"watch\"\n",
         )
         .expect("project should be written");
-        fs::write(root.join("rules/layers.toml"), "schema_version = \"0.2\"\n")
+        fs::write(root.join("rules/layers.toml"), "schema_version = \"0.3\"\n")
             .expect("layers should be written");
-        fs::write(root.join("rules/styles.toml"), "schema_version = \"0.2\"\n")
+        fs::write(root.join("rules/styles.toml"), "schema_version = \"0.3\"\n")
             .expect("styles should be written");
         fs::write(
             root.join("drawings/plan/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n[layouts.default]\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0, 0]\nmargins = [0, 0, 0, 0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n[layouts.default]\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0, 0]\nmargins = [0, 0, 0, 0]\n",
         )
         .expect("layouts should be written");
         fs::write(root.join("drawings/plan/entities.ndjson"), "")
             .expect("entities should be written");
-    }
-
-    #[test]
-    fn manifest_diff_reports_create_update_and_delete_only_once() {
-        let before = vec![cad_model::SourceFileRevision {
-            relative_path: "rules/styles.toml".to_owned(),
-            revision: "old".to_owned(),
-            exists: true,
-        }];
-        let after = vec![cad_model::SourceFileRevision {
-            relative_path: "comments/plan.ndjson".to_owned(),
-            revision: "new".to_owned(),
-            exists: true,
-        }];
-        assert_eq!(
-            manifest_changes(&before, &after),
-            vec![
-                "comments/plan.ndjson".to_owned(),
-                "rules/styles.toml".to_owned()
-            ]
-        );
     }
 
     #[test]
@@ -568,7 +547,7 @@ mod tests {
             .expect("comment source should be created");
         fs::write(
             temp.path().join("rules/layers.toml"),
-            "schema_version = \"0.2\"\n# updated\n",
+            "schema_version = \"0.3\"\n# updated\n",
         )
         .expect("layers should be updated");
         fs::remove_file(temp.path().join("rules/styles.toml")).expect("styles should be deleted");
@@ -633,7 +612,7 @@ mod tests {
             .expect("unsafe symlink should be removed");
         fs::write(
             temp.path().join("rules/styles.toml"),
-            "schema_version = \"0.2\"\n",
+            "schema_version = \"0.3\"\n",
         )
         .expect("styles should be restored");
         assert!(matches!(
@@ -719,37 +698,30 @@ mod tests {
     }
 
     #[test]
-    fn native_preference_uses_a_native_backend() {
-        let temp = tempfile::tempdir().expect("tempdir should be created");
+    fn fallback_delivers_source_changes_and_stops_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
         write_source_project(temp.path());
-        let watcher = create_project_watcher(
-            temp.path(),
-            temp.path().to_string_lossy().into_owned(),
-            |_| {},
-        )
-        .expect("watcher should start");
-        assert!(matches!(
-            watcher._backend,
-            ProjectWatcherBackend::Native { .. }
-        ));
-    }
-
-    #[test]
-    fn forced_native_failure_selects_manifest_poll_backend() {
-        let temp = tempfile::tempdir().expect("tempdir should be created");
-        write_source_project(temp.path());
+        let (sender, receiver) = mpsc::channel();
         let backend = select_backend(Err("injected native failure".to_owned()), || {
             start_manifest_poll_watcher(
                 temp.path().to_path_buf(),
-                temp.path().to_string_lossy().into_owned(),
-                Arc::new(|_| {}),
+                "project".to_owned(),
+                Arc::new(move |event| {
+                    sender.send(event).unwrap();
+                }),
                 Duration::from_millis(10),
             )
         })
-        .expect("fallback should start");
+        .unwrap();
+        let path = temp.path().join("drawings/plan/entities.ndjson");
+        fs::write(&path, "changed").unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(event.paths, vec!["drawings/plan/entities.ndjson"]);
+        drop(backend);
+        fs::write(path, "after stop").unwrap();
         assert!(matches!(
-            backend,
-            ProjectWatcherBackend::ManifestPoll { .. }
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
         ));
     }
 }

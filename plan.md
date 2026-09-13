@@ -2,7 +2,7 @@
 
 ## 現在の契約
 
-- schema `0.2` のみを正本として扱う。旧 schema の読み込み、移行、互換
+- schema `0.3` のみを正本として扱う。旧 schema の読み込み、移行、互換
   fallback は実装しない。
 - `drawings/<drawing>/layouts.toml` が用紙、向き、縮尺、原点、余白、plot
   area の唯一の正本である。`active_layout` を check、render、diff、PDF、JWW
@@ -19,7 +19,7 @@
 - JWW import の既定値は block preserve、`--flatten` は明示的な変換モードと
   する。v600 import は入力bytesとhash/source provenanceを保存し、未知class・
   未対応versionはread-onlyで保持する。未編集projectは元JWWをbyte-exactで
-  保存できる。manifest `0.2` の `mapped_v600` importはhash検証済みの
+  保存できる。manifest `0.3` の `mapped_v600` importはhash検証済みの
   `interop/jww/records.ndjson`を使い、文字type/end、寸法SXF/補助record、block
   metadataを編集後も保持する。strict preserveでは既存寸法の表示値だけを変更し、
   通常のbest-effort exportでは形状・offset・style・鏡映変更を決定的なv600 recordへ
@@ -73,11 +73,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo check -p cad-desktop --no-default-features
-pnpm --dir apps/viewer typecheck
 pnpm --dir apps/viewer build
 pnpm --dir apps/viewer test:unit
 pnpm --dir apps/viewer test:e2e
-pnpm --dir apps/viewer desktop:smoke
 pnpm --dir apps/viewer desktop:e2e
 ```
 

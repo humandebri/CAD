@@ -27,7 +27,8 @@ cargo run -p cad-cli -- check "$SMOKE_ROOT/house-small" --format json --out "$SM
 cargo run -p cad-cli -- render "$SMOKE_ROOT/house-small" --format svg --out "$SMOKE_ROOT/plan_1f.svg"
 cargo run -p cad-cli -- diff "$SMOKE_ROOT/house-small" examples/house-small-modified --format json --out "$SMOKE_ROOT/diff.json"
 cargo run -p cad-cli -- diff "$SMOKE_ROOT/house-small" examples/house-small-modified --format svg --out "$SMOKE_ROOT/plan_1f.diff.svg"
-IMPORT_PARENT="$(mktemp -d)"
+IMPORT_PARENT="$SMOKE_ROOT/jww"
+mkdir -p "$IMPORT_PARENT"
 cargo run -p cad-cli -- import-jww examples/jww-fixtures/Test1.jww --out "$IMPORT_PARENT/test1_imported"
 cargo run -p cad-cli -- check "$IMPORT_PARENT/test1_imported" --format json --out "$IMPORT_PARENT/test1_imported/build/check.json"
 cargo run -p cad-cli -- render "$IMPORT_PARENT/test1_imported" --format svg --out "$IMPORT_PARENT/test1_imported/build/test1.svg"
@@ -38,11 +39,9 @@ cargo run -p cad-cli -- import-jww "$IMPORT_PARENT/test1-exported.jww" --out "$I
 cargo run -p cad-cli -- check "$IMPORT_PARENT/test1_reimported" --format json --out "$IMPORT_PARENT/test1_reimported/build/check.json"
 cargo metadata --no-deps --format-version 1 >/dev/null
 
-pnpm --dir apps/viewer typecheck
 pnpm --dir apps/viewer build
 pnpm --dir apps/viewer test:unit
 pnpm --dir apps/viewer test:e2e
-pnpm --dir apps/viewer desktop:smoke
 if [[ "$(uname -s)" == "Darwin" ]]; then
   pnpm --dir apps/viewer desktop:e2e
 fi

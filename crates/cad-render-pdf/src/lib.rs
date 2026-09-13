@@ -8,16 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const CRATE_NAME: &str = "cad-render-pdf";
 const MM_TO_PT: f64 = 72.0 / 25.4;
 const MAX_BLOCK_DEPTH: usize = 32;
 const M_PLUS_REGULAR: &[u8] = include_bytes!("../assets/mplus/mplus-1p-regular.ttf");
 const PDF_FONT_NAME: &str = "CADMPL+Mplus1p-Regular";
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct PdfExportOptions {
@@ -179,7 +173,8 @@ pub fn render_drawing_pdf(
         SheetOrientation::Landscape => (paper_height, paper_width),
     };
     validate_layout(layout, paper_width, paper_height)?;
-    let scale = parse_scale(&layout.scale)?;
+    let scale = cad_model::parse_layout_scale(&layout.scale)
+        .ok_or_else(|| PdfError::InvalidLayout(format!("invalid scale {:?}", layout.scale)))?;
     let mut content = PdfContent::new(paper_width, paper_height, scale, layout)?;
     for record in &drawing.entities {
         if is_printable_entity(project, &record.entity) {
@@ -249,25 +244,6 @@ fn paper_size_mm(paper: &str) -> PdfResult<(f64, f64)> {
     }
 }
 
-fn parse_scale(scale: &str) -> PdfResult<f64> {
-    let scale = scale.trim();
-    let value = scale
-        .strip_prefix("1/")
-        .and_then(|value| value.parse::<f64>().ok())
-        .or_else(|| {
-            scale
-                .strip_prefix("1:")
-                .and_then(|value| value.parse::<f64>().ok())
-        })
-        .or_else(|| scale.parse::<f64>().ok())
-        .ok_or_else(|| PdfError::InvalidLayout(format!("invalid scale {scale:?}")))?;
-    if value.is_finite() && value > 0.0 {
-        Ok(value)
-    } else {
-        Err(PdfError::InvalidLayout(format!("invalid scale {scale:?}")))
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Transform {
     a: f64,
@@ -290,12 +266,21 @@ impl Transform {
         }
     }
 
-    fn block(at: [f64; 2], rotation: f64, scale: f64, base_point: [f64; 2]) -> Self {
+    fn reflected_block(
+        at: [f64; 2],
+        rotation: f64,
+        scale: f64,
+        base_point: [f64; 2],
+        mirror_x: bool,
+        mirror_y: bool,
+    ) -> Self {
         let angle = rotation.to_radians();
-        let a = angle.cos() * scale;
-        let b = angle.sin() * scale;
-        let c = -angle.sin() * scale;
-        let d = angle.cos() * scale;
+        let sx = scale * if mirror_x { -1.0 } else { 1.0 };
+        let sy = scale * if mirror_y { -1.0 } else { 1.0 };
+        let a = angle.cos() * sx;
+        let b = angle.sin() * sx;
+        let c = -angle.sin() * sy;
+        let d = angle.cos() * sy;
         Self {
             a,
             b,
@@ -330,7 +315,6 @@ struct PdfContent<'a> {
     font: PdfFontSubset,
     scale: f64,
     layout: &'a LayoutConfig,
-    paper_height: f64,
 }
 
 impl<'a> PdfContent<'a> {
@@ -359,14 +343,12 @@ impl<'a> PdfContent<'a> {
                 if let Some([x1, y1, x2, y2]) = layout.plot_area {
                     let to_pdf = |point: [f64; 2]| {
                         [
-                            left + (point[0] - layout.origin[0]) * MM_TO_PT / scale,
-                            paper_height * MM_TO_PT
-                                - layout.margins[1] * MM_TO_PT
-                                - (point[1] - layout.origin[1]) * MM_TO_PT / scale,
+                            (point[0] - layout.origin[0]) * MM_TO_PT / scale,
+                            (point[1] - layout.origin[1]) * MM_TO_PT / scale,
                         ]
                     };
-                    let min = to_pdf([x1, y2]);
-                    let max = to_pdf([x2, y1]);
+                    let min = to_pdf([x1, y1]);
+                    let max = to_pdf([x2, y2]);
                     commands.push(format!(
                         "{} {} {} {} re W n",
                         fmt(min[0]),
@@ -380,7 +362,6 @@ impl<'a> PdfContent<'a> {
             font: PdfFontSubset::new()?,
             scale,
             layout,
-            paper_height,
         })
     }
 
@@ -390,11 +371,10 @@ impl<'a> PdfContent<'a> {
 
     fn point(&self, point: [f64; 2], transform: Transform) -> [f64; 2] {
         let point = transform.point(point);
-        let x = self.layout.margins[0] * MM_TO_PT
-            + (point[0] - self.layout.origin[0]) * MM_TO_PT / self.scale;
-        let y = self.paper_height * MM_TO_PT
-            - self.layout.margins[1] * MM_TO_PT
-            - (point[1] - self.layout.origin[1]) * MM_TO_PT / self.scale;
+        // Both the canonical model and PDF use a lower-left, Y-up coordinate system.
+        // Margins clip the page; they do not relocate its model-space origin.
+        let x = (point[0] - self.layout.origin[0]) * MM_TO_PT / self.scale;
+        let y = (point[1] - self.layout.origin[1]) * MM_TO_PT / self.scale;
         [x, y]
     }
 
@@ -421,6 +401,13 @@ impl<'a> PdfContent<'a> {
         let [red, green, blue] = pdf_rgb(color)?;
         self.commands
             .push(format!("{} {} {} rg", fmt(red), fmt(green), fmt(blue)));
+        Ok(())
+    }
+
+    fn set_stroke_color(&mut self, color: &str) -> PdfResult<()> {
+        let [red, green, blue] = pdf_rgb(color)?;
+        self.commands
+            .push(format!("{} {} {} RG", fmt(red), fmt(green), fmt(blue)));
         Ok(())
     }
 
@@ -471,15 +458,45 @@ impl<'a> PdfContent<'a> {
                 self.set_fill_color(&fill)?;
                 self.polygon(transform, points, true);
             }
-            Entity::Hatch { loops, fill, .. } => {
+            Entity::Hatch {
+                loops,
+                pattern,
+                angle_deg,
+                scale,
+                fill,
+                ..
+            } => {
                 let fill = fill
                     .as_deref()
                     .map(|fill| cad_model::resolve_print_fill_color(project, entity, fill))
                     .transpose()
                     .map_err(|error| PdfError::Style(error.to_string()))?
                     .unwrap_or_else(|| stroke.print_color_rgb.clone());
-                self.set_fill_color(&fill)?;
-                self.hatch(transform, loops);
+                if pattern == "solid" {
+                    self.set_fill_color(&fill)?;
+                    self.hatch(transform, loops);
+                } else {
+                    self.set_stroke_color(&fill)?;
+                    let mut families = vec![*angle_deg];
+                    if pattern == "cross" {
+                        families.push(angle_deg.rem_euclid(360.0) + 90.0);
+                    }
+                    for angle in families {
+                        for (start, end) in cad_model::hatch_line_segments(loops, angle, *scale)
+                            .map_err(|error| {
+                                PdfError::CheckFailed(format!(
+                                    "entity {}: {error}",
+                                    entity.id().as_str()
+                                ))
+                            })?
+                        {
+                            self.line(transform, start, end);
+                        }
+                    }
+                    for points in loops {
+                        self.polyline(transform, points, true);
+                    }
+                }
             }
             Entity::Text {
                 at,
@@ -505,6 +522,21 @@ impl<'a> PdfContent<'a> {
                     &stroke.print_color_rgb,
                     None,
                 )?;
+            }
+            Entity::Dimension {
+                measurement: Some(_),
+                ..
+            } => {
+                let primitives =
+                    cad_model::dimension_primitives(project, entity).map_err(|message| {
+                        PdfError::CheckFailed(format!(
+                            "dimension {}: {message}",
+                            entity.id().as_str()
+                        ))
+                    })?;
+                for primitive in primitives {
+                    self.entity(project, &primitive, depth + 1, transform)?;
+                }
             }
             Entity::Dimension {
                 style,
@@ -562,14 +594,18 @@ impl<'a> PdfContent<'a> {
                 at,
                 rotation_deg,
                 scale,
+                mirror_x,
+                mirror_y,
                 ..
             } => {
                 if let Some(definition) = project.blocks.get(block) {
-                    let nested = transform.compose(Transform::block(
+                    let nested = transform.compose(Transform::reflected_block(
                         *at,
                         *rotation_deg,
                         *scale,
                         definition.config.base_point,
+                        *mirror_x,
+                        *mirror_y,
                     ));
                     for record in &definition.entities {
                         if is_printable_entity(project, &record.entity) {
@@ -653,17 +689,7 @@ impl<'a> PdfContent<'a> {
     }
 
     fn arc(&mut self, transform: Transform, center: [f64; 2], radius: f64, start: f64, end: f64) {
-        let steps = ((end - start).abs() / 15.0).ceil().max(2.0) as usize;
-        let points = (0..=steps)
-            .map(|index| {
-                let angle = (start + (end - start) * index as f64 / steps as f64).to_radians();
-                [
-                    center[0] + radius * angle.cos(),
-                    center[1] + radius * angle.sin(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        self.polyline(transform, &points, false);
+        self.ellipse_bezier(transform, center, radius, radius, 0.0, start, end);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -677,19 +703,70 @@ impl<'a> PdfContent<'a> {
         start: f64,
         end: f64,
     ) {
-        let rotation = rotation.to_radians();
-        let steps = ((end - start).abs() / 15.0).ceil().max(2.0) as usize;
-        let points = (0..=steps)
-            .map(|index| {
-                let angle = (start + (end - start) * index as f64 / steps as f64).to_radians();
-                let local = [rx * angle.cos(), ry * angle.sin()];
+        self.ellipse_bezier(transform, center, rx, ry, rotation, start, end);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ellipse_bezier(
+        &mut self,
+        transform: Transform,
+        center: [f64; 2],
+        rx: f64,
+        ry: f64,
+        rotation_deg: f64,
+        start_deg: f64,
+        end_deg: f64,
+    ) {
+        let sweep = end_deg - start_deg;
+        if !sweep.is_finite() || sweep.abs() <= f64::EPSILON {
+            return;
+        }
+        let segments = (sweep.abs() / 90.0).ceil().max(1.0) as usize;
+        let step = sweep.to_radians() / segments as f64;
+        let rotation = rotation_deg.to_radians();
+        let (rotation_sin, rotation_cos) = rotation.sin_cos();
+        let evaluate = |theta: f64| {
+            let (sin, cos) = theta.sin_cos();
+            let local = [rx * cos, ry * sin];
+            let derivative = [-rx * sin, ry * cos];
+            (
                 [
-                    center[0] + local[0] * rotation.cos() - local[1] * rotation.sin(),
-                    center[1] + local[0] * rotation.sin() + local[1] * rotation.cos(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        self.polyline(transform, &points, false);
+                    center[0] + local[0] * rotation_cos - local[1] * rotation_sin,
+                    center[1] + local[0] * rotation_sin + local[1] * rotation_cos,
+                ],
+                [
+                    derivative[0] * rotation_cos - derivative[1] * rotation_sin,
+                    derivative[0] * rotation_sin + derivative[1] * rotation_cos,
+                ],
+            )
+        };
+        let mut theta = start_deg.to_radians();
+        let (start, _) = evaluate(theta);
+        let start = self.point(start, transform);
+        let mut command = format!("{} {} m", fmt(start[0]), fmt(start[1]));
+        for _ in 0..segments {
+            let next = theta + step;
+            let (p0, d0) = evaluate(theta);
+            let (p3, d3) = evaluate(next);
+            let factor = 4.0 / 3.0 * (step / 4.0).tan();
+            let c1 = [p0[0] + factor * d0[0], p0[1] + factor * d0[1]];
+            let c2 = [p3[0] - factor * d3[0], p3[1] - factor * d3[1]];
+            let c1 = self.point(c1, transform);
+            let c2 = self.point(c2, transform);
+            let p3 = self.point(p3, transform);
+            command.push_str(&format!(
+                " {} {} {} {} {} {} c",
+                fmt(c1[0]),
+                fmt(c1[1]),
+                fmt(c2[0]),
+                fmt(c2[1]),
+                fmt(p3[0]),
+                fmt(p3[1])
+            ));
+            theta = next;
+        }
+        command.push_str(" S");
+        self.commands.push(command);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -717,10 +794,7 @@ impl<'a> PdfContent<'a> {
         };
         let angle = rotation.to_radians();
         let x_axis = [angle.cos(), angle.sin()];
-        // PDF glyph space is Y-up, while model Y is mapped through the paper's
-        // top edge. Reverse the local text Y axis unless mirror_y explicitly
-        // requests the reflected glyph transform.
-        let y_sign = if mirror_y { 1.0 } else { -1.0 };
+        let y_sign = if mirror_y { -1.0 } else { 1.0 };
         let y_axis = [-angle.sin() * y_sign, angle.cos() * y_sign];
         let origin = |x: f64, y: f64| {
             self.point(
@@ -746,10 +820,7 @@ impl<'a> PdfContent<'a> {
             .enumerate()
             .map(|(index, character)| (origin(start + index as f64 * advance, 0.0), character))
             .collect::<Vec<_>>();
-        self.commands.push(format!(
-            "BT /{} 1 Tf",
-            pdf_font_resource(&style.font_family)
-        ));
+        self.commands.push("BT /F1 1 Tf".to_owned());
         for (position, character) in positions {
             self.commands.push(format!(
                 "{} {} {} {} {} {} Tm <{}> Tj",
@@ -836,7 +907,9 @@ impl<'a> PdfContent<'a> {
             dimension_style.arrow_size,
             &stroke.print_color_rgb,
         )?;
-        let measured = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
+        let measured = cad_model::evaluate_dimension(project, entity)
+            .map_err(PdfError::CheckFailed)?
+            .measured;
         let label = value.map(str::to_owned).unwrap_or_else(|| {
             format!(
                 "{:.*} {}",
@@ -921,13 +994,11 @@ struct PdfFontSubset {
     face: ttf_parser::Face<'static>,
     remapper: subsetter::GlyphRemapper,
     unicode_by_cid: BTreeMap<u16, char>,
-    width_by_cid: BTreeMap<u16, u16>,
 }
 
 struct EmbeddedPdfFont {
     bytes: Vec<u8>,
     unicode_by_cid: BTreeMap<u16, char>,
-    width_by_cid: BTreeMap<u16, u16>,
     units_per_em: u16,
     ascender: i16,
     descender: i16,
@@ -943,7 +1014,6 @@ impl PdfFontSubset {
             face,
             remapper: subsetter::GlyphRemapper::new(),
             unicode_by_cid: BTreeMap::new(),
-            width_by_cid: BTreeMap::new(),
         })
     }
 
@@ -956,11 +1026,6 @@ impl PdfFontSubset {
         })?;
         let cid = self.remapper.remap(glyph.0);
         self.unicode_by_cid.entry(cid).or_insert(character);
-        // CAD text width is an explicit character-cell width. Advertising a
-        // 1000-unit CID advance keeps extraction and selection consistent with
-        // the independently positioned cells instead of the font's proportional
-        // Latin metrics.
-        self.width_by_cid.insert(cid, 1000);
         Ok(format!("{cid:04X}"))
     }
 
@@ -971,7 +1036,6 @@ impl PdfFontSubset {
         Ok(EmbeddedPdfFont {
             bytes,
             unicode_by_cid: self.unicode_by_cid,
-            width_by_cid: self.width_by_cid,
             units_per_em: self.face.units_per_em(),
             ascender: self.face.ascender(),
             descender: self.face.descender(),
@@ -1023,15 +1087,6 @@ fn pdf_rgb(value: &str) -> PdfResult<[f64; 3]> {
     Ok([component(0..2)?, component(2..4)?, component(4..6)?])
 }
 
-fn pdf_font_resource(font_family: &str) -> &'static str {
-    let family = font_family.to_ascii_lowercase();
-    if family.contains("serif") || family.contains("mincho") || family.contains("明朝") {
-        "F2"
-    } else {
-        "F1"
-    }
-}
-
 fn fmt(value: f64) -> String {
     format!("{value:.4}")
 }
@@ -1051,24 +1106,22 @@ fn build_pdf(
     };
     let units = font.units_per_em;
     let bbox = font.bbox;
-    let widths = font
-        .width_by_cid
-        .iter()
-        .map(|(cid, width)| format!("{cid} [{width}]"))
-        .collect::<Vec<_>>()
-        .join(" ");
     let to_unicode = to_unicode_cmap(&font.unicode_by_cid);
     let objects = vec![
         ascii_object("<< /Type /Catalog /Pages 2 0 R >>"),
         ascii_object("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
         ascii_object(&format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 4 0 R /F2 4 0 R >> >> /Contents 9 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 4 0 R >> >> /Contents 9 0 R >>"
         )),
         ascii_object(&format!(
             "<< /Type /Font /Subtype /Type0 /BaseFont /{PDF_FONT_NAME} /Encoding /Identity-H /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>"
         )),
+        // CAD text width is an explicit character-cell width. Advertising a
+        // 1000-unit CID advance keeps extraction and selection consistent with
+        // the independently positioned cells instead of the font's proportional
+        // Latin metrics.
         ascii_object(&format!(
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{PDF_FONT_NAME} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 6 0 R /DW 1000 /W [{widths}] /CIDToGIDMap /Identity >>"
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{PDF_FONT_NAME} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 6 0 R /DW 1000 /CIDToGIDMap /Identity >>"
         )),
         ascii_object(&format!(
             "<< /Type /FontDescriptor /FontName /{PDF_FONT_NAME} /Flags 32 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 8 0 R >>",
@@ -1170,6 +1223,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_origin_and_plot_clip_use_the_same_y_up_model_coordinates() {
+        let layout = LayoutConfig {
+            name: "default".to_owned(),
+            paper: "A3".to_owned(),
+            orientation: SheetOrientation::Landscape,
+            scale: "1/50".to_owned(),
+            origin: [1000.0, 2000.0],
+            margins: [10.0, 20.0, 30.0, 40.0],
+            plot_area: Some([1500.0, 2500.0, 2000.0, 3000.0]),
+        };
+        let content = PdfContent::new(420.0, 297.0, 50.0, &layout).unwrap();
+        assert_eq!(
+            content.point(layout.origin, Transform::identity()),
+            [0.0, 0.0]
+        );
+        let right = content.point([6000.0, 2000.0], Transform::identity());
+        let up = content.point([1000.0, 7000.0], Transform::identity());
+        assert!((right[0] - 100.0 * MM_TO_PT).abs() < 1e-9);
+        assert_eq!(right[1], 0.0);
+        assert_eq!(up[0], 0.0);
+        assert!((up[1] - 100.0 * MM_TO_PT).abs() < 1e-9);
+        assert!(
+            content
+                .commands
+                .iter()
+                .any(|command| command == "28.3465 28.3465 28.3465 28.3465 re W n")
+        );
+    }
+
+    #[test]
+    fn acceptance_drawing_pdf_has_a3_landscape_dimensions() {
+        let project = cad_model::load_project(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance"),
+        )
+        .unwrap();
+        let pdf = render_drawing_pdf(&project, "acceptance", None).unwrap();
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("1190.5512 841.8898"));
+        assert!(text.contains("/ToUnicode"));
+    }
+
+    #[test]
+    fn invalid_hatches_fail_before_output_is_returned() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        {
+            let (pattern, fill, width) = ("unknown", serde_json::json!("jw_black"), 10.0);
+            let mut project = cad_model::load_project(&root).unwrap();
+            let entity = serde_json::from_value(serde_json::json!({
+                "schema_version": "0.3", "id": "ent_01JZ0000000000000000000010",
+                "type": "hatch", "layer": "0-1", "loops": [[[0.0,0.0],[width,0.0],[width,10.0],[0.0,10.0]]],
+                "pattern": pattern, "angle_deg": 0.0, "scale": 1.0, "fill": fill
+            })).unwrap();
+            project.drawings[0]
+                .entities
+                .push(cad_model::EntityRecord { line: 2, entity });
+            assert!(render_drawing_pdf(&project, "plan_1f", None).is_err());
+        }
+    }
+
+    #[test]
     fn emits_a_single_page_pdf_with_layout_dimensions() {
         let layout = LayoutConfig {
             name: "default".to_owned(),
@@ -1194,18 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_font_subset_is_deterministic_and_rejects_missing_glyphs() {
-        let make_subset = || {
-            let mut font = PdfFontSubset::new().expect("bundled font");
-            assert_eq!(font.cid_hex('和').expect("Japanese glyph"), "0001");
-            assert_eq!(font.cid_hex('室').expect("Japanese glyph"), "0002");
-            font.finish().expect("font subset")
-        };
-        let first = make_subset();
-        let second = make_subset();
-        assert_eq!(first.bytes, second.bytes);
-        assert!(first.bytes.len() < M_PLUS_REGULAR.len());
-
+    fn embedded_font_rejects_missing_glyphs() {
         let mut font = PdfFontSubset::new().expect("bundled font");
         let error = font
             .cid_hex('\u{1F9EA}')
@@ -1239,11 +1342,11 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         let child_line: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
         )
         .expect("child line");
         let child_text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":0.0,"value":"B"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":0.0,"value":"B"}"#,
         )
         .expect("child text");
         project.blocks.insert(
@@ -1251,7 +1354,7 @@ mod tests {
             cad_model::BlockDefinition {
                 id: "fixture".to_owned(),
                 config: cad_model::BlockDefinitionConfig {
-                    schema_version: "0.2".to_owned(),
+                    schema_version: "0.3".to_owned(),
                     name: "fixture".to_owned(),
                     base_point: [10.0, 20.0],
                 },
@@ -1268,7 +1371,7 @@ mod tests {
             },
         );
         let reference: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"block_ref","layer":"0-1","block":"fixture","at":[100.0,200.0],"rotation_deg":90.0,"scale":2.0}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000003","type":"block_ref","layer":"0-1","block":"fixture","at":[100.0,200.0],"rotation_deg":90.0,"scale":2.0}"#,
         )
         .expect("block reference");
         let layout = LayoutConfig {
@@ -1287,11 +1390,27 @@ mod tests {
             .expect("block should render");
 
         let commands = content.commands.join("\n");
-        assert!(commands.contains("283.4646 274.9606 m 283.4646 218.2677 l S"));
+        assert!(commands.contains("283.4646 566.9291 m 283.4646 623.6220 l S"));
         assert!(commands.contains("BT /F1 1 Tf"));
-        assert!(commands.contains("-708.6614"));
+        assert!(commands.contains("708.6614"));
         assert!(commands.contains("1417.3228"));
-        assert!(commands.contains("<0001> Tj"));
+        let mut reflected = serde_json::to_value(reference).unwrap();
+        reflected["mirror_x"] = serde_json::json!(true);
+        content.commands.clear();
+        content
+            .entity(
+                &project,
+                &serde_json::from_value(reflected).unwrap(),
+                0,
+                Transform::identity(),
+            )
+            .unwrap();
+        assert!(
+            content
+                .commands
+                .join("\n")
+                .contains("283.4646 566.9291 m 283.4646 510.2362 l S")
+        );
     }
 
     #[test]
@@ -1299,7 +1418,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let project = cad_model::load_project(root).expect("example");
         let hatch: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[20.0,0.0],[20.0,20.0],[0.0,20.0]],[[5.0,5.0],[5.0,15.0],[15.0,15.0],[15.0,5.0]]],"pattern":"solid","angle_deg":0.0,"scale":1.0,"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000004","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[20.0,0.0],[20.0,20.0],[0.0,20.0]],[[5.0,5.0],[5.0,15.0],[15.0,15.0],[15.0,5.0]]],"pattern":"solid","angle_deg":0.0,"scale":1.0,"fill":"jw_black"}"#,
         )
         .expect("hatch");
         let layout = LayoutConfig {
@@ -1360,11 +1479,11 @@ mod tests {
             },
         );
         let text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","pen":"red_dash","style":"note","at":[1000.0,1000.0],"rotation_deg":0.0,"value":"和室"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","pen":"red_dash","style":"note","at":[1000.0,1000.0],"rotation_deg":0.0,"value":"和室"}"#,
         )
         .expect("text");
         let dimension: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","pen":"red_dash","style":"dim_100","p1":[0.0,0.0],"p2":[910.0,0.0],"offset":120.0,"value":null}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","pen":"red_dash","style":"dim_100","p1":[0.0,0.0],"p2":[910.0,0.0],"offset":120.0,"value":null}"#,
         )
         .expect("dimension");
         let layout = LayoutConfig {

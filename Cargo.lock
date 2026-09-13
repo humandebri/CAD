@@ -387,13 +387,10 @@ dependencies = [
  "blake3",
  "cad-model",
  "encoding_rs",
- "insta",
- "miette",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
 ]
 
@@ -415,7 +412,6 @@ dependencies = [
  "miette",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -451,8 +447,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cad-model",
- "cad-render-svg",
  "insta",
+ "rstar 0.13.0",
  "serde",
  "serde_json",
  "svg",

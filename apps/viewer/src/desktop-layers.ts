@@ -49,7 +49,7 @@ export class LatestLayerRulesQueue {
     private readonly update: (
       projectPath: string,
       patch: LayerRulesPatch,
-    ) => Promise<LayerMutationResult | LayerWorkspaceState> = updateLayerRulesFromDesktop,
+    ) => Promise<LayerMutationResult> = updateLayerRulesFromDesktop,
   ) {}
 
   enqueue(projectPath: string, patch: LayerRulesPatch): Promise<LayerRulesUpdateResult> {
@@ -65,14 +65,12 @@ export class LatestLayerRulesQueue {
           throw new Error("layer rules revision is required");
         }
         const mutation = await this.update(projectPath, { ...patch, expectedRevision });
-        const state = "state" in mutation ? mutation.state : mutation;
+        const state = mutation.state;
         const isLatest = generation === this.generation && revision === this.revision;
         if (generation === this.generation) {
           this.persistedRevision = state.revision;
         }
-        return "state" in mutation
-          ? { state, history_id: mutation.history_id, changed_files: mutation.changed_files, isLatest }
-          : { state, isLatest };
+        return { state, history_id: mutation.history_id, changed_files: mutation.changed_files, isLatest };
       } catch (error: unknown) {
         return {
           error,
@@ -165,16 +163,4 @@ export function exportDrawingPdfFromDesktop(
     overwrite: request.overwrite,
     expectedFiles: request.expectedFiles ?? [],
   });
-}
-
-export function withLayerVisibility(
-  state: LayerWorkspaceState,
-  updates: ReadonlyMap<string, boolean>,
-): LayerWorkspaceState {
-  return {
-    ...state,
-    layers: state.layers.map((layer) =>
-      updates.has(layer.id) ? { ...layer, visible: updates.get(layer.id) ?? layer.visible } : layer,
-    ),
-  };
 }

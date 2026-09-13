@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Parser)]
 #[command(name = "cadc", version, about = "Git-native CAD source tooling")]
 struct Cli {
-    #[arg(long, help = "Print scaffold diagnostics and exit")]
-    smoke: bool,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -186,10 +183,6 @@ enum DiffFormat {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.smoke {
-        println!("cadc scaffold ok");
-        return Ok(());
-    }
 
     if let Some(command) = cli.command.as_ref() {
         for project in command.source_projects() {
@@ -271,32 +264,31 @@ fn main() -> Result<()> {
             preserve,
             report,
         }) => {
-            if report
-                .as_ref()
-                .is_some_and(|report_path| paths_refer_to_same_file(&out, report_path))
-            {
-                return Err(miette!("--out and --report must refer to different files"));
+            if let Some(report_path) = &report {
+                cad_export_jww::validate_export_targets(&out, report_path).into_diagnostic()?;
             }
             if (strict || preserve) && allow_lossy {
                 return Err(miette!(
                     "--strict/--preserve and --allow-lossy cannot be combined"
                 ));
             }
-            let export = cad_export_jww::export_jww_file_auto(
-                &project,
-                &drawing,
-                &out,
-                cad_export_jww::AutoExportOptions {
-                    strict: strict || preserve,
-                    overwrite: force,
-                    require_preservation: preserve,
-                },
-            )
-            .into_diagnostic()?;
-            if let Some(report_path) = report {
-                let json = serde_json::to_string_pretty(&export).into_diagnostic()?;
-                write_text_file(&report_path, &format!("{json}\n"))?;
+            let options = cad_export_jww::AutoExportOptions {
+                strict: strict || preserve,
+                overwrite: force,
+                require_preservation: preserve,
+            };
+            let export = if let Some(report_path) = report {
+                cad_export_jww::export_jww_file_auto_with_report(
+                    &project,
+                    &drawing,
+                    &out,
+                    report_path,
+                    options,
+                )
+            } else {
+                cad_export_jww::export_jww_file_auto(&project, &drawing, &out, options)
             }
+            .into_diagnostic()?;
             println!(
                 "JWW export {:?}: {} record(s), {} warning(s), {} blocker(s)",
                 export.status,
@@ -380,25 +372,6 @@ fn recover_project(project: &Path) -> Result<()> {
             project.display()
         )
     })
-}
-
-fn paths_refer_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => {
-            let absolute = |path: &std::path::Path| {
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(path)
-                }
-            };
-            absolute(left) == absolute(right)
-        }
-    }
 }
 
 fn write_json_report(path: &Path, report: &cad_check::CheckReport) -> Result<()> {
@@ -523,24 +496,27 @@ fn normalize_numbers(value: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CheckTargetArg, Cli, Command, format_ndjson_file, normalize_numbers,
-        paths_refer_to_same_file,
-    };
+    use super::{CheckTargetArg, Cli, Command, format_ndjson_file, normalize_numbers};
     use clap::Parser;
     use std::fs;
     use std::path::Path;
 
     #[test]
     fn rejects_identical_export_and_report_paths() {
-        assert!(paths_refer_to_same_file(
-            Path::new("result.jww"),
-            Path::new("result.jww")
-        ));
-        assert!(!paths_refer_to_same_file(
-            Path::new("result.jww"),
-            Path::new("result.json")
-        ));
+        assert!(
+            cad_export_jww::validate_export_targets(
+                Path::new("result.jww"),
+                Path::new("result.jww")
+            )
+            .is_err()
+        );
+        assert!(
+            cad_export_jww::validate_export_targets(
+                Path::new("result.jww"),
+                Path::new("result.json")
+            )
+            .is_ok()
+        );
     }
 
     #[test]

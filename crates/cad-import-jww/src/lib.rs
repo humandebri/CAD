@@ -26,18 +26,12 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const CRATE_NAME: &str = "cad-import-jww";
-const CAD_SCHEMA_VERSION: &str = "0.2";
+const CAD_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 const IMPORT_EPSILON_MM: f64 = 0.001;
 const BLOCK_SCALE_EPSILON: f64 = 1.0e-12;
 const IMPORT_ANGLE_EPSILON_RAD: f64 = 1e-9;
 const MAX_OUTPUT_ENTITIES: usize = 250_000;
 const MAX_EXPANSION_STEPS: usize = 1_000_000;
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -413,7 +407,7 @@ fn write_read_only_project(
             .join("drawings")
             .join(&drawing_name)
             .join("layouts.toml"),
-        "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A4\"\norientation = \"portrait\"\nscale = \"1/1\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+        "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A4\"\norientation = \"portrait\"\nscale = \"1/1\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
     )?;
     write_text(
         &write_dir
@@ -501,7 +495,12 @@ fn write_jww_preservation(
         })?;
     }
     let manifest = cad_model::JwwPreservationManifest {
-        schema_version: if records.is_some() { "0.2" } else { "0.1" }.to_owned(),
+        schema_version: if records.is_some() {
+            CAD_SCHEMA_VERSION
+        } else {
+            "0.1"
+        }
+        .to_owned(),
         state,
         jww_version,
         drawing_name: drawing_name.to_owned(),
@@ -877,6 +876,50 @@ fn convert_entities_with_mode(
         context.layer_names.insert(layer_id(base), "0-0".to_owned());
         context.layer_bases.insert(layer_id(base), base);
     }
+    let blocks = if block_mode == BlockMode::Preserve {
+        document
+            .block_defs
+            .iter()
+            .map(|definition| {
+                let definition_document = JwwDocument {
+                    header: document.header.clone(),
+                    entities: definition.entities.clone(),
+                    block_defs: document.block_defs.clone(),
+                };
+                let converted =
+                    convert_entities_with_mode(&definition_document, limits, BlockMode::Flatten)?;
+                let entities = converted
+                    .entities
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&line).expect("generated entity JSON");
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "id".to_owned(),
+                                serde_json::Value::String(format!(
+                                    "ent_{}",
+                                    Ulid::from_parts(
+                                        u64::from(definition.number) + 1,
+                                        (index as u128) + 1,
+                                    )
+                                )),
+                            );
+                        }
+                        serde_json::to_string(&value).expect("generated entity JSON")
+                    })
+                    .collect();
+                Ok(PreservedBlock {
+                    id: format!("jww_{}", definition.number),
+                    name: definition.name.clone(),
+                    entities,
+                })
+            })
+            .collect::<ImportResult<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     Ok(ConvertedProject {
         entities: context.entities,
         layer_bases: context.layer_bases,
@@ -887,56 +930,7 @@ fn convert_entities_with_mode(
         text_styles: context.text_styles,
         dimension_styles: context.dimension_styles,
         warnings: context.warnings,
-        blocks: if block_mode == BlockMode::Preserve {
-            document
-                .block_defs
-                .iter()
-                .map(|definition| {
-                    let definition_document = JwwDocument {
-                        header: document.header.clone(),
-                        entities: definition.entities.clone(),
-                        block_defs: document.block_defs.clone(),
-                    };
-                    let entities = convert_entities_with_mode(
-                        &definition_document,
-                        limits,
-                        BlockMode::Flatten,
-                    )
-                    .map(|converted| {
-                        converted
-                            .entities
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, line)| {
-                                let mut value: serde_json::Value =
-                                    serde_json::from_str(&line).expect("generated entity JSON");
-                                if let Some(object) = value.as_object_mut() {
-                                    object.insert(
-                                        "id".to_owned(),
-                                        serde_json::Value::String(format!(
-                                            "ent_{}",
-                                            Ulid::from_parts(
-                                                u64::from(definition.number) + 1,
-                                                (index as u128) + 1,
-                                            )
-                                        )),
-                                    );
-                                }
-                                serde_json::to_string(&value).expect("generated entity JSON")
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                    PreservedBlock {
-                        id: format!("jww_{}", definition.number),
-                        name: definition.name.clone(),
-                        entities,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
+        blocks,
         screen_pen_colors: document.header.screen_pen_colors,
         print_pen_colors: document.header.print_pen_colors,
         print_pen_widths: document.header.print_pen_widths,
@@ -1076,7 +1070,7 @@ fn convert_entity(
                         "block_transform_flattened",
                         "CDataBlock",
                         block.base,
-                        "non-uniform, reflected, or zero block transform was flattened",
+                        "non-uniform or zero block transform was flattened",
                     ));
                     expand_block(context, block, transform, block_stack)?;
                 }
@@ -1738,6 +1732,7 @@ fn entity_dimension_json(id: String, layer: &str, style: &str, dimension: &Dimen
         "offset": dimension_offset(&dimension.line, dimension.text.start),
         "text_rotation_deg": dimension.text.angle,
         "text_mirror_y": dimension.text.mirror_y,
+        "measurement": null,
         "value": non_empty_string(&dimension.text.content),
     })
     .to_string()
@@ -1797,11 +1792,10 @@ fn preserved_block_transform(block: &Block) -> Option<(f64, f64)> {
     if block.scale_x.abs() <= BLOCK_SCALE_EPSILON
         || block.scale_y.abs() <= BLOCK_SCALE_EPSILON
         || (block.scale_x.abs() - block.scale_y.abs()).abs() > 1e-9 * magnitude
-        || block.scale_x.is_sign_positive() != block.scale_y.is_sign_positive()
     {
         return None;
     }
-    let rotation = if block.scale_x.is_sign_negative() {
+    let rotation = if block.scale_x.is_sign_negative() && block.scale_y.is_sign_negative() {
         block.rotation + std::f64::consts::PI
     } else {
         block.rotation
@@ -1826,6 +1820,8 @@ fn entity_block_ref_json(
         "at": [block.ref_x, block.ref_y],
         "rotation_deg": rotation_deg,
         "scale": scale,
+        "mirror_x": block.scale_x < 0.0 && block.scale_y > 0.0,
+        "mirror_y": block.scale_y < 0.0 && block.scale_x > 0.0,
         "pen": pen_id(block.base),
     })
     .to_string()
@@ -2696,7 +2692,11 @@ mod tests {
         assert_eq!(values[0]["p2"], json!([16.0, 20.0]));
         assert_eq!(values[1]["type"], "text");
         assert_eq!(values[1]["at"], json!([12.0, 22.0]));
-        assert_eq!(values[1]["style"], "jww_text_h5_w5_s0");
+        let styles: cad_model::StyleRules = toml::from_str(&styles_toml(&converted)).unwrap();
+        assert_eq!(
+            styles.text_styles[values[1]["style"].as_str().unwrap()].height,
+            5.
+        );
         assert!(
             converted
                 .warnings
@@ -2706,75 +2706,49 @@ mod tests {
     }
 
     #[test]
-    fn creates_text_styles_from_jww_text_height() {
+    fn imported_text_and_dimension_styles_resolve_to_the_original_metrics() {
+        let mut narrow = test_text("narrow", [10., 0.], 2.5);
+        narrow.size_x = 1.25;
+        let mut spaced = narrow.clone();
+        spaced.spacing = 0.5;
         let document = test_document(
             vec![
-                JwwEntity::Text(test_text("small", [0.0, 0.0], 2.5)),
-                JwwEntity::Text(test_text("large", [10.0, 0.0], 5.0)),
+                JwwEntity::Text(test_text("small", [0., 0.], 2.5)),
+                JwwEntity::Text(test_text("large", [20., 0.], 5.)),
+                JwwEntity::Text(narrow),
+                JwwEntity::Text(spaced),
+                JwwEntity::Dimension(Dimension {
+                    base: EntityBase::default(),
+                    line: Line {
+                        base: EntityBase::default(),
+                        start: [0., 0.],
+                        end: [100., 0.],
+                    },
+                    text: test_text("100", [50., 10.], 3.5),
+                    ..Default::default()
+                }),
             ],
             Vec::new(),
         );
-
         let converted = convert_ok(&document);
         let values = entity_values(&converted.entities);
-        let styles = styles_toml(&converted);
-
-        assert_eq!(values[0]["style"], "jww_text_h2_5_w2_5_s0");
-        assert_eq!(values[1]["style"], "jww_text_h5_w5_s0");
-        assert!(styles.contains("[text_styles.jww_text_h2_5_w2_5_s0]\n"));
-        assert!(styles.contains("height = 2.5\n"));
-        assert!(styles.contains("width = 2.5\n"));
-        assert!(styles.contains("spacing = 0\n"));
-        assert!(styles.contains("[text_styles.jww_text_h5_w5_s0]\n"));
-        assert!(styles.contains("height = 5\n"));
-    }
-
-    #[test]
-    fn separates_text_styles_by_width_and_spacing() {
-        let mut narrow = test_text("same", [0.0, 0.0], 2.5);
-        narrow.size_x = 1.25;
-        narrow.spacing = 0.0;
-        let mut spaced = test_text("same", [10.0, 0.0], 2.5);
-        spaced.size_x = 1.25;
-        spaced.spacing = 0.5;
-
-        let converted = convert_ok(&test_document(
-            vec![JwwEntity::Text(narrow), JwwEntity::Text(spaced)],
-            Vec::new(),
-        ));
-        let values = entity_values(&converted.entities);
-        let styles = styles_toml(&converted);
-
-        assert_eq!(values[0]["style"], "jww_text_h2_5_w1_25_s0");
-        assert_eq!(values[1]["style"], "jww_text_h2_5_w1_25_s0_5");
-        assert!(styles.contains("width = 1.25\n"));
-        assert!(styles.contains("spacing = 0.5\n"));
-    }
-
-    #[test]
-    fn creates_dimension_style_from_dimension_text_height() {
-        let document = test_document(
-            vec![JwwEntity::Dimension(Dimension {
-                base: EntityBase::default(),
-                line: Line {
-                    base: EntityBase::default(),
-                    start: [0.0, 0.0],
-                    end: [100.0, 0.0],
-                },
-                text: test_text("100", [50.0, 10.0], 3.5),
-                ..Default::default()
-            })],
-            Vec::new(),
-        );
-
-        let converted = convert_ok(&document);
-        let values = entity_values(&converted.entities);
-        let styles = styles_toml(&converted);
-
-        assert_eq!(values[0]["style"], "jww_dimension_h3_5_w3_5_s0");
-        assert!(styles.contains("[text_styles.jww_text_h3_5_w3_5_s0]\n"));
-        assert!(styles.contains("[dimension_styles.jww_dimension_h3_5_w3_5_s0]\n"));
-        assert!(styles.contains("text_style = \"jww_text_h3_5_w3_5_s0\"\n"));
+        let styles: cad_model::StyleRules = toml::from_str(&styles_toml(&converted)).unwrap();
+        for (index, expected) in [
+            (0, (2.5, 2.5, 0.)),
+            (1, (5., 5., 0.)),
+            (2, (2.5, 1.25, 0.)),
+            (3, (2.5, 1.25, 0.)),
+        ] {
+            let style = &styles.text_styles[values[index]["style"].as_str().unwrap()];
+            let spacing = if index == 3 { 0.5 } else { expected.2 };
+            assert_eq!(
+                (style.height, style.width, style.spacing),
+                (expected.0, expected.1, spacing)
+            );
+        }
+        let dimension = &styles.dimension_styles[values[4]["style"].as_str().unwrap()];
+        let text = &styles.text_styles[&dimension.text_style];
+        assert_eq!((text.height, text.width), (3.5, 3.5));
     }
 
     #[test]
@@ -3100,6 +3074,8 @@ mod tests {
             (2.0, 2.0, 2.0, 0.0),
             (-2.0, -2.0, 2.0, 180.0),
             (0.0001, 0.0001, 0.0001, 0.0),
+            (-2.0, 2.0, 2.0, 0.0),
+            (2.0, -2.0, 2.0, 0.0),
         ] {
             let document = test_document(
                 vec![JwwEntity::Block(test_block(
@@ -3117,13 +3093,15 @@ mod tests {
             assert_eq!(values[0]["type"], "block_ref");
             assert_eq!(values[0]["scale"], expected_scale);
             assert_eq!(values[0]["rotation_deg"], expected_rotation);
+            assert_eq!(values[0]["mirror_x"], scale_x < 0.0 && scale_y > 0.0);
+            assert_eq!(values[0]["mirror_y"], scale_y < 0.0 && scale_x > 0.0);
             assert!(converted.warnings.is_empty());
         }
     }
 
     #[test]
-    fn preserve_mode_flattens_non_uniform_and_reflected_block_transforms() {
-        for (scale_x, scale_y) in [(2.0, 1.0), (-1.0, 1.0), (0.0, 1.0)] {
+    fn preserve_mode_flattens_non_uniform_and_zero_block_transforms() {
+        for (scale_x, scale_y) in [(2.0, 1.0), (0.0, 1.0)] {
             let document = test_document(
                 vec![JwwEntity::Block(test_block(
                     10.0, 20.0, scale_x, scale_y, 0.0, 1,
@@ -3324,9 +3302,9 @@ dimension=0
 
     #[test]
     fn tampered_record_provenance_fails_closed() {
-        let input =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
         let out = tempfile::tempdir().expect("tempdir should exist");
+        let input = out.path().join("Test1.jww");
+        fs::write(&input, minimal_jww_with_line(10.0)).expect("minimal input");
         let project = out.path().join("imported");
         import_jww_file(&input, &project).expect("sample should import");
         let records = project.join(cad_model::JWW_RECORDS_RELATIVE_PATH);
@@ -3442,13 +3420,13 @@ dimension=0
     #[test]
     fn typed_entity_extents_include_curve_geometry() {
         let circle = vec![
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":5000.0}"#.to_owned(),
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":5000.0}"#.to_owned(),
         ];
         let ellipse = vec![
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":360.0}"#.to_owned(),
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":360.0}"#.to_owned(),
         ];
         let ellipse_arc = vec![
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":90.0}"#.to_owned(),
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":10.0,"radius_y":100.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":90.0}"#.to_owned(),
         ];
 
         let circle_bbox = entity_extents(&circle)

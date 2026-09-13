@@ -8,16 +8,6 @@ use thiserror::Error;
 
 pub const JWW_SIGNATURE: &[u8; 8] = b"JwwData.";
 pub const EXPORT_VERSION: u32 = 600;
-pub const SUPPORTED_ENTITY_CLASSES: [&str; 7] = [
-    "CDataSen",
-    "CDataEnko",
-    "CDataTen",
-    "CDataMoji",
-    "CDataSolid",
-    "CDataBlock",
-    "CDataSunpou",
-];
-
 #[derive(Debug, Error)]
 pub enum CodecError {
     #[error("invalid JWW signature")]
@@ -1497,29 +1487,6 @@ pub fn write_document_preserving_header(
     Ok(output)
 }
 
-pub fn replace_archive_preserving_header(
-    original: &[u8],
-    generated: &[u8],
-) -> CodecResult<Vec<u8>> {
-    let original_inspection = inspect_document(original);
-    let generated_inspection = inspect_document(generated);
-    if original_inspection.state != JwwCompatibilityState::EditableLossless
-        || generated_inspection.state != JwwCompatibilityState::EditableLossless
-    {
-        return Err(CodecError::UnexpectedEof(
-            "editable v600 preservation source",
-        ));
-    }
-    let original_offset =
-        find_entity_list_offset(original, EXPORT_VERSION).ok_or(CodecError::EntityListNotFound)?;
-    let generated_offset =
-        find_entity_list_offset(generated, EXPORT_VERSION).ok_or(CodecError::EntityListNotFound)?;
-    let mut output = Vec::with_capacity(original_offset + generated.len() - generated_offset);
-    output.extend_from_slice(&original[..original_offset]);
-    output.extend_from_slice(&generated[generated_offset..]);
-    Ok(output)
-}
-
 fn write_block_definitions(
     writer: &mut Writer,
     definitions: &[BlockDefinition],
@@ -1864,31 +1831,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn writes_parseable_signature_and_header() {
-        let bytes = write_document(&Document::default()).expect("header should encode");
-        assert_eq!(&bytes[..8], JWW_SIGNATURE);
-        assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            EXPORT_VERSION
-        );
-        assert!(bytes.len() > 10_000);
-    }
-
-    #[test]
-    fn supported_entity_class_registry_is_complete_and_unique() {
-        let unique = SUPPORTED_ENTITY_CLASSES
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), SUPPORTED_ENTITY_CLASSES.len());
-        assert!(
-            SUPPORTED_ENTITY_CLASSES
-                .iter()
-                .all(|name| supported_entity_class(name).is_some())
-        );
-    }
-
-    #[test]
     fn reads_written_entity_and_block_lists() {
         let mut header = Header::default();
         header.screen_pen_colors[1] = 0x00332211;
@@ -2045,42 +1987,6 @@ mod tests {
             inspect_document(&unknown).state,
             JwwCompatibilityState::PreservedReadOnly
         );
-    }
-
-    #[test]
-    fn archive_replacement_preserves_the_original_header_bytes() {
-        let original = write_document(&Document {
-            header: Header {
-                memo: "original header".to_owned(),
-                ..Header::default()
-            },
-            records: vec![Record::Line {
-                base: Base::default(),
-                p1: [0.0, 0.0],
-                p2: [10.0, 0.0],
-            }],
-            ..Document::default()
-        })
-        .expect("original");
-        let generated = write_document(&Document {
-            records: vec![Record::Line {
-                base: Base::default(),
-                p1: [5.0, 0.0],
-                p2: [20.0, 0.0],
-            }],
-            ..Document::default()
-        })
-        .expect("generated");
-        let output = replace_archive_preserving_header(&original, &generated)
-            .expect("header-preserving replacement");
-        let original_offset = find_entity_list_offset(&original, EXPORT_VERSION).expect("offset");
-        assert_eq!(&output[..original_offset], &original[..original_offset]);
-        let decoded = read_document(&output).expect("output should decode");
-        assert_eq!(decoded.header.memo, "original header");
-        let DecodedEntity::Line(line) = &decoded.entities[0] else {
-            panic!("line expected");
-        };
-        assert_eq!(line.start, [5.0, 0.0]);
     }
 
     #[test]

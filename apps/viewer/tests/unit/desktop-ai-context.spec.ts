@@ -4,96 +4,33 @@
  */
 import { expect, test } from "@playwright/test";
 import { type AiContextState } from "../../src/artifacts";
-import {
-  LatestAiContextWriteQueue,
-  type InvokeAiContext,
-  writeAiContextFromDesktop,
-} from "../../src/desktop-ai-context";
+import { LatestAiContextWriteQueue } from "../../src/desktop-ai-context";
 
-test("writes AI context through desktop invoke", async () => {
-  const calls: { command: string; args: Record<string, unknown> }[] = [];
-  const ready: AiContextState = {
-    status: "ready",
-    json_path: "/tmp/project/build/ai-context.json",
-    markdown_path: "/tmp/project/build/ai-context.md",
-    message: "AI context ready",
-  };
-  const invoke: InvokeAiContext = async (command, args) => {
-    calls.push({ command, args });
-    return ready;
-  };
-
-  const state = await writeAiContextFromDesktop(
-    "/tmp/project",
-    "diff",
-    "ent_01JZ0000000000000000000000",
-    invoke,
-  );
-
-  expect(calls).toEqual([
-    {
-      command: "write_ai_context",
-      args: {
-        projectPath: "/tmp/project",
-        viewMode: "diff",
-        selectedEntityId: "ent_01JZ0000000000000000000000",
-      },
-    },
-  ]);
-  expect(state).toEqual(ready);
-});
-
-test("serializes writes and keeps only the latest pending selection", async () => {
+test("serializes writes, drops superseded work, and publishes selection clearing", async () => {
   const calls: string[] = [];
   const first = deferred<AiContextState>();
-  const latest = deferred<AiContextState>();
-  const invoke: InvokeAiContext = async (_command, args) => {
-    const selectedEntityId = args.selectedEntityId;
-    if (typeof selectedEntityId !== "string") {
-      throw new Error("selectedEntityId must be a string");
-    }
-    calls.push(selectedEntityId);
-    return selectedEntityId === "A" ? first.promise : latest.promise;
-  };
-  const queue = new LatestAiContextWriteQueue(invoke);
-  const completed: string[] = [];
-  const failed: unknown[] = [];
-
-  queue.enqueue(request("A"), () => completed.push("A"), (error) => failed.push(error));
-  queue.enqueue(request("B"), () => completed.push("B"), (error) => failed.push(error));
-  queue.enqueue(request("C"), () => completed.push("C"), (error) => failed.push(error));
-
+  const cleared = deferred<AiContextState>();
+  const started = deferred<void>();
+  const completed = deferred<AiContextState>();
+  const applied: string[] = [];
+  const queue = new LatestAiContextWriteQueue(async (_command, args) => {
+    const id = String(args.selectedEntityId);
+    calls.push(id);
+    if (id === "A") return first.promise;
+    started.resolve();
+    return cleared.promise;
+  });
+  queue.enqueue(request("A"), () => applied.push("A"), error => { throw error; });
+  queue.enqueue(request("B"), () => applied.push("B"), error => { throw error; });
+  queue.enqueue(request(""), state => { applied.push("cleared"); completed.resolve(state); }, error => { throw error; });
   expect(calls).toEqual(["A"]);
   first.resolve(readyState("A"));
-  await expect.poll(() => calls).toEqual(["A", "C"]);
-  latest.resolve(readyState("C"));
-  await expect.poll(() => completed).toEqual(["C"]);
-  expect(failed).toEqual([]);
-});
-
-test("publishes selection clearing after an older write finishes", async () => {
-  const calls: string[] = [];
-  const selected = deferred<AiContextState>();
-  const cleared = deferred<AiContextState>();
-  const invoke: InvokeAiContext = async (_command, args) => {
-    const selectedEntityId = args.selectedEntityId;
-    if (typeof selectedEntityId !== "string") {
-      throw new Error("selectedEntityId must be a string");
-    }
-    calls.push(selectedEntityId);
-    return selectedEntityId === "A" ? selected.promise : cleared.promise;
-  };
-  const queue = new LatestAiContextWriteQueue(invoke);
-  const completed: string[] = [];
-
-  queue.enqueue(request("A"), () => completed.push("A"), () => undefined);
-  queue.enqueue(request(""), () => completed.push("cleared"), () => undefined);
-
-  expect(calls).toEqual(["A"]);
-  selected.resolve(readyState("A"));
-  await expect.poll(() => calls).toEqual(["A", ""]);
+  await started.promise;
+  expect(calls).toEqual(["A", ""]);
+  expect(applied).toEqual([]);
   cleared.resolve({ status: "no_entity_selected", message: "no entity selected" });
-  await expect.poll(() => completed).toEqual(["cleared"]);
+  await completed.promise;
+  expect(applied).toEqual(["cleared"]);
 });
 
 function request(selectedEntityId: string) {

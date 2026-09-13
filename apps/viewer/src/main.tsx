@@ -15,9 +15,11 @@ import {
   Eye,
   EyeOff,
   FileInput,
+  FilePlus2,
   FileJson2,
   FileOutput,
   FolderOpen,
+  Copy,
   Minus,
   Layers3,
   Lock,
@@ -50,6 +52,7 @@ import {
   type LiveReviewState,
   type ExportReport,
   type EditOperation,
+  type DrawingEditPreview,
   type DrawingHistoryState,
   type EditorEntity,
   type LayerRulesPatch,
@@ -60,10 +63,12 @@ import {
   emptyLayerWorkspace,
 } from "./artifacts";
 import { formatError } from "./app-errors";
-import { commandForKeyboardEvent, commandLabel, type CadCommand } from "./command-registry";
+import { commandForKeyboardEvent, commandFromText, commandLabel, parseCoordinateInput, type CadCommand } from "./command-registry";
 import { closestEntityId } from "./svg-selection";
+import { DraftingPanel, initialDraftingOptions, finiteDraftNumber, repeatableCommand, retuneDraftOperation } from "./drafting-panel";
 import {
   applyDrawingEdit,
+  previewDrawingEdit,
   expectedRevisionForOperation,
   listDrawingHistory,
   queryDrawingSnap,
@@ -128,8 +133,9 @@ import {
 
 type ViewMode = "sheet" | "diff";
 type LoadState = "idle" | "loading" | "ready" | "error";
-type DragMode = "pan" | "jw-gesture" | "zoom-area" | "right-wait" | "edit-move";
+type DragMode = "pan" | "jw-gesture" | "zoom-area" | "selection-area" | "right-wait" | "edit-move" | "edit-endpoint";
 type EditorMode =
+  | "endpoint" | "stretch" | "rectangle" | "fillet" | "chamfer" | "rectangular_array" | "create_block"
   | "select"
   | "move"
   | "copy"
@@ -167,6 +173,8 @@ type SelectionRect = {
   height: number;
 };
 
+type ProjectSetupMode = "new" | "add" | "duplicate";
+
 const PAN_DRAG_THRESHOLD_PX = 3;
 const WHEEL_HISTORY_DELAY_MS = 150;
 
@@ -185,6 +193,8 @@ function App() {
   const [projectState, setProjectState] = useState<ProjectState | null>(null);
   const [importMessage, setImportMessage] = useState("");
   const [exportOpen, setExportOpen] = useState(false);
+  const [projectSetupMode, setProjectSetupMode] = useState<ProjectSetupMode | null>(null);
+  const [projectSetupBusy, setProjectSetupBusy] = useState(false);
   const [exportReport, setExportReport] = useState<ExportReport | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
@@ -200,8 +210,33 @@ function App() {
   const [selectedEntityIds, setSelectedEntityIds] = useState<Set<string>>(new Set());
   const [editorMode, setEditorMode] = useState<EditorMode>("select");
   const [cadCommand, setCadCommand] = useState<CadCommand>("select");
+  const [commandInput, setCommandInput] = useState("");
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [orthoEnabled, setOrthoEnabled] = useState(false);
   const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
   const [pendingOperation, setPendingOperation] = useState<EditOperation | null>(null);
+  const [draftingOptions, setDraftingOptions] = useState(initialDraftingOptions);
+  const [editPreview, setEditPreview] = useState<DrawingEditPreview | null>(null);
+  const [dimensionResolutions, setDimensionResolutions] = useState<Record<string, "delete" | "detach">>({});
+  const [blockEditing, setBlockEditing] = useState<{ block: string; name: string; revision: string; drawingRevision: string; entities: EditorEntity[]; svg: string } | null>(null);
+  const [blockEntityIndex, setBlockEntityIndex] = useState(0);
+  const [blockEditMessage, setBlockEditMessage] = useState("");
+  const [blockDeletion, setBlockDeletion] = useState<{ id: string; dimensions: string[]; resolutions: Record<string, "delete" | "detach"> } | null>(null);
+  const [blockThumbnail, setBlockThumbnail] = useState("");
+  const previewSequence = useRef(0);
+  const pendingRevision = useRef<string | null>(null);
+  const lastSuccessfulCommand = useRef<EditorMode | null>(null);
+  const editorModeRef = useRef(editorMode);
+  editorModeRef.current = editorMode;
+  const draftActivityRef = useRef({ points: draftPoints, operation: pendingOperation });
+  draftActivityRef.current = { points: draftPoints, operation: pendingOperation };
+  const currentEditorRevisionRef = useRef(artifacts?.editor.revision);
+  currentEditorRevisionRef.current = artifacts?.editor.revision;
+  const insertionRevision = useRef<string | null>(null);
+  const asyncDraftSequence = useRef(0);
+  const blockLoadSequence = useRef(0);
+  const [draftParameterError, setDraftParameterError] = useState(false);
+  const endpointDrag = useRef<{ entityId: string; vertexIndex: number; origin: [number, number]; to: [number, number] } | null>(null);
   const [historyState, setHistoryState] = useState<DrawingHistoryState | null>(null);
   const [historyMessage, setHistoryMessage] = useState("");
   const [isHistoryBusy, setIsHistoryBusy] = useState(false);
@@ -359,8 +394,9 @@ function App() {
     loadWebArtifacts();
   }, [isDesktop]);
 
-  const activeSvg = viewMode === "sheet" ? artifacts?.sheetSvg : artifacts?.diffSvg;
-  const activeBaseViewBox = useMemo(() => parseSvgViewBox(activeSvg), [activeSvg]);
+  const sourceSvg = viewMode === "sheet" ? artifacts?.sheetSvg : artifacts?.diffSvg;
+  const activeSvg = viewMode === "sheet" && editPreview?.svg ? editPreview.svg : sourceSvg;
+  const activeBaseViewBox = useMemo(() => parseSvgViewBox(sourceSvg), [sourceSvg]);
   const viewContext = `${projectState?.project_path ?? (isDesktop ? "desktop" : "web")}:${artifacts?.currentDrawing ?? "drawing"}:${viewMode}`;
   const zoomScale = useMemo(() => {
     if (baseViewBox === null || currentViewBox === null) {
@@ -389,6 +425,7 @@ function App() {
 
   useEffect(() => {
     const preserveView = shouldPreserveView(viewContextRef.current, viewContext);
+    ++asyncDraftSequence.current;
     viewContextRef.current = viewContext;
     setBaseViewBox(activeBaseViewBox);
     if (!preserveView || currentViewBoxRef.current === null) {
@@ -405,7 +442,21 @@ function App() {
 
   useEffect(() => {
     function cancelActiveOperation(event: KeyboardEvent) {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
+      const inputFocused = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement;
+      if (inputFocused && event.key !== "Escape") {
+        if (event.key === "Enter" && event.target instanceof Element && event.target.closest(".drafting-panel") !== null && !(event.target instanceof HTMLTextAreaElement)) {
+          event.preventDefault(); applyDraftingParameters();
+        }
+        return;
+      }
+      if (event.key === "F3") {
+        event.preventDefault();
+        setSnapEnabled((enabled) => !enabled);
+        return;
+      }
+      if (event.key === "F8") {
+        event.preventDefault();
+        setOrthoEnabled((enabled) => !enabled);
         return;
       }
       const command = commandForKeyboardEvent(event);
@@ -420,11 +471,12 @@ function App() {
           void runHistoryAction(command === "undo");
           return;
         }
-        if (["line", "polyline", "circle", "arc", "text", "dimension", "point", "move", "copy", "rotate", "mirror", "offset", "trim", "extend", "insert_block", "hatch"].includes(command)) {
-          setEditorMode(command as EditorMode);
-          setViewMode("sheet");
-          setDraftPoints([]);
-          setPendingOperation(null);
+        if (command === "edit_block") {
+          editSelectedBlock();
+          return;
+        }
+        if (repeatableCommand(command)) {
+          selectEditorMode(command as EditorMode);
           return;
         }
         if (command === "layout" || command === "print_preview") {
@@ -435,6 +487,10 @@ function App() {
         }
       }
       if (event.key === "Escape") {
+        ++asyncDraftSequence.current;
+        insertionRevision.current = null;
+        setBlockEditing(null);
+        event.preventDefault();
         setIsZoomAreaActive(false);
         setSelectionRect(null);
         dragInteraction.current = null;
@@ -443,19 +499,62 @@ function App() {
         setDraftPoints([]);
         setPendingOperation(null);
         setSnapCandidate(null);
+        setEditPreview(null);
+        endpointDrag.current = null;
+      }
+      if (event.key === "Backspace" && draftPoints.length > 0) {
+        event.preventDefault();
+        setDraftPoints(points => points.slice(0, -1));
+        setPendingOperation(null);
+        return;
+      }
+      if ((event.key === "Enter" || event.code === "Space") && editorMode === "select" && lastSuccessfulCommand.current !== null) {
+        event.preventDefault();
+        selectEditorMode(lastSuccessfulCommand.current);
+        return;
       }
       if (event.key === "Enter" && pendingOperation !== null) {
         event.preventDefault();
-        void commitDrawingEdit(pendingOperation);
+        applyDraftingParameters();
       }
       if (event.key === "Enter" && editorMode === "polyline") {
         event.preventDefault();
         completePolyline();
       }
+      if (event.key === "Enter" && pendingOperation === null && editorMode !== "polyline" && editorMode !== "select") {
+        event.preventDefault();
+        applyDraftingParameters();
+      }
     }
     window.addEventListener("keydown", cancelActiveOperation);
     return () => window.removeEventListener("keydown", cancelActiveOperation);
-  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState]);
+  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState, draftingOptions, draftParameterError]);
+
+  useEffect(() => {
+    const sequence = ++previewSequence.current;
+    setEditPreview(null);
+    setDimensionResolutions({});
+    if (pendingOperation === null || projectState === null || artifacts === null || !isDesktop) {
+      pendingRevision.current = null;
+      return;
+    }
+    const expectedRevision = expectedRevisionForOperation(pendingOperation, artifacts.editor.revision, artifacts.blocks, artifacts.layouts);
+    if (expectedRevision === null) return;
+    if (pendingRevision.current !== null && pendingRevision.current !== expectedRevision) {
+      setPendingOperation(null);
+      setEditMessage("Source changed during preview. Restart the operation on the refreshed drawing.");
+      return;
+    }
+    pendingRevision.current = expectedRevision;
+    const timer = window.setTimeout(() => void previewDrawingEdit(projectState.project_path, { drawing: artifacts.currentDrawing, expected_revision: expectedRevision, operation: pendingOperation }).then(preview => {
+      if (sequence !== previewSequence.current) return;
+      setEditPreview({ ...preview, svg: sanitizeSvg(preview.svg) });
+      setEditMessage([...preview.warnings, "Preview ready; Enter or Apply to save"].join(" · "));
+    }).catch(error => {
+      if (sequence === previewSequence.current) setEditMessage(formatError(error, "preview failed"));
+    }), 60);
+    return () => { window.clearTimeout(timer); ++previewSequence.current; };
+  }, [pendingOperation, artifacts?.editor.revision, projectState?.project_path]);
 
   useEffect(() => () => clearPendingWheelHistory(), []);
 
@@ -494,6 +593,10 @@ function App() {
   useEffect(() => {
     if (artifacts !== null) {
       applyLayerWorkspaceToSvg(artifacts.layers);
+      document.querySelectorAll<SVGElement>(".drawing-stage [data-screen-stroke-width]").forEach(element => {
+        const width = Number(element.getAttribute("data-screen-stroke-width"));
+        if (Number.isFinite(width) && width > 0) element.style.setProperty("--screen-stroke-width", `${width}px`);
+      });
     }
   }, [activeSvg, artifacts?.layers]);
 
@@ -803,6 +906,8 @@ function App() {
     const mode: DragMode =
       event.buttons === 3
         ? "jw-gesture"
+        : editorMode === "select" && event.shiftKey && event.button === 0
+          ? "selection-area"
         : isZoomAreaActive && event.button === 0
           ? "zoom-area"
           : event.button === 0
@@ -819,6 +924,16 @@ function App() {
     if (mode === "zoom-area" || mode === "jw-gesture") {
       stage.setPointerCapture(event.pointerId);
     }
+  }
+
+  function beginEndpoint(event: PointerEvent, entity: EditorEntity, vertexIndex: number, origin: [number, number]) {
+    if (event.button !== 0 || currentViewBoxRef.current === null || drawingStageRef.current === null) return;
+    event.preventDefault(); event.stopPropagation();
+    endpointDrag.current = { entityId: entity.id, vertexIndex, origin, to: origin };
+    setEditorMode("endpoint"); setCadCommand("endpoint");
+    setDraftPoints([origin]); setPendingOperation(null);
+    dragInteraction.current = { pointerId: event.pointerId, mode: "edit-endpoint", startClient: { x: event.clientX, y: event.clientY }, endClient: { x: event.clientX, y: event.clientY }, startViewBox: currentViewBoxRef.current, moved: false };
+    drawingStageRef.current.setPointerCapture(event.pointerId);
   }
 
   /** Mouse down observes the second physical button, which pointerdown omits. */
@@ -848,12 +963,59 @@ function App() {
     setSelectionRect(null);
   }
 
+  function selectEntitiesInDrag(startClient: Point, endClient: Point) {
+    const start = clientPointToSvg(startClient);
+    const end = clientPointToSvg(endClient);
+    const svg = currentSvgElement();
+    if (start === null || end === null || svg === null) return;
+    const area = {
+      minX: Math.min(start.x, end.x),
+      minY: Math.min(-start.y, -end.y),
+      maxX: Math.max(start.x, end.x),
+      maxY: Math.max(-start.y, -end.y),
+    };
+    const crossing = endClient.x < startClient.x;
+    const ids = new Set<string>();
+    svg.querySelectorAll("[data-entity-id][data-bbox]").forEach((element) => {
+      if (element.closest('[data-layer-visible="false"]') !== null) return;
+      for (let ancestor: Element | null = element; ancestor !== null; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return;
+        if (ancestor === svg) break;
+      }
+      const values = element.getAttribute("data-bbox")?.split(",").map(Number);
+      const id = element.getAttribute("data-entity-id");
+      if (id === null || values === undefined || values.length !== 4 || values.some((value) => !Number.isFinite(value))) return;
+      const [minX, minY, maxX, maxY] = values;
+      const matches = crossing
+        ? maxX >= area.minX && minX <= area.maxX && maxY >= area.minY && minY <= area.maxY
+        : minX >= area.minX && maxX <= area.maxX && minY >= area.minY && maxY <= area.maxY;
+      if (matches) ids.add(id);
+    });
+    setSelectedEntityIds(ids);
+    setSelectedEntityId(ids.values().next().value ?? "");
+    setEditMessage(`${crossing ? "Crossing" : "Window"} selection: ${ids.size}`);
+  }
+
   function handlePointerMove(event: PointerEvent) {
     if (editorMode !== "select" && viewMode === "sheet") {
       void updateSnapForPointer(event);
     }
     let interaction = dragInteraction.current;
     if (interaction === null) {
+      return;
+    }
+    if (interaction.mode === "edit-endpoint" && endpointDrag.current !== null) {
+      const target = endpointDrag.current;
+      const raw = clientPointToSvg({ x: event.clientX, y: event.clientY });
+      if (raw === null) return;
+      const rawPoint: [number, number] = [raw.x, -raw.y];
+      const tolerance = (currentViewBoxRef.current?.width ?? 1) / Math.max(drawingStageRef.current?.clientWidth ?? 1, 1) * 10;
+      const snapped = snapEnabled && !event.shiftKey && snapCandidate !== null && pointArrayDistance(snapCandidate.point, rawPoint) <= tolerance ? snapCandidate.point : rawPoint;
+      target.to = applyOrtho(snapped, target.origin, orthoEnabled);
+      interaction.moved = pointDistance(interaction.startClient, { x: event.clientX, y: event.clientY }) >= GESTURE_THRESHOLD_PX;
+      setDraftPoints([target.origin, target.to]);
+      if (interaction.moved) setPendingOperation({ kind: "endpoint", entity_id: target.entityId, vertex_index: target.vertexIndex, to: target.to });
       return;
     }
     if (event.buttons === 3 && interaction.mode !== "jw-gesture") {
@@ -879,6 +1041,11 @@ function App() {
 
     const endClient = { x: event.clientX, y: event.clientY };
     interaction.endClient = endClient;
+    if (interaction.mode === "edit-endpoint") {
+      suppressCanvasClick();
+      setEditMessage("Endpoint preview; Enter saves, Esc cancels");
+      return;
+    }
     if (interaction.mode === "edit-move") {
       const point = clientPointToSvg(endClient);
       if (point !== null) {
@@ -917,8 +1084,16 @@ function App() {
     }
 
     interaction.moved = pointDistance(interaction.startClient, endClient) >= GESTURE_THRESHOLD_PX;
-    if (interaction.mode === "zoom-area") {
-      setSelectionRect(clientSelectionRect(interaction.startClient, endClient));
+    if (interaction.mode === "zoom-area" || interaction.mode === "selection-area") {
+      if (interaction.mode === "selection-area" && interaction.moved) {
+        const stage = drawingStageRef.current;
+        if (stage !== null && !stage.hasPointerCapture(event.pointerId)) {
+          stage.setPointerCapture(event.pointerId);
+        }
+      }
+      setSelectionRect(interaction.moved
+        ? clientSelectionRect(interaction.startClient, endClient)
+        : null);
       return;
     }
     const gesture = classifyJwCadGesture(interaction.startClient, endClient);
@@ -954,6 +1129,13 @@ function App() {
           : { kind: "translate", entity_id: selectedEntityId, delta, duplicate: editorMode === "copy" });
       } else {
         setDraftPoints([]);
+      }
+      return;
+    }
+    if (interaction.mode === "selection-area") {
+      if (interaction.moved) {
+        suppressCanvasClick();
+        selectEntitiesInDrag(interaction.startClient, interaction.endClient);
       }
       return;
     }
@@ -1248,6 +1430,63 @@ function App() {
     }
   }
 
+  async function submitProjectSetup(values: {
+    parentDir: string;
+    folderName: string;
+    projectName: string;
+    drawing: string;
+    paper: string;
+    orientation: "landscape" | "portrait";
+    scaleDenominator: number;
+    sourceDrawing: string;
+  }) {
+    if (!isDesktop || projectSetupMode === null) return;
+    setProjectSetupBusy(true);
+    try {
+      if (projectSetupMode === "new") {
+        const state = await invoke<ProjectState>("create_project", {
+          request: {
+            parent_dir: values.parentDir,
+            folder_name: values.folderName,
+            project_name: values.projectName,
+            drawing: values.drawing,
+            paper: values.paper,
+            orientation: values.orientation,
+            scale_denominator: values.scaleDenominator,
+          },
+        });
+        setProjectSetupMode(null);
+        await openDesktopProject(state.project_path);
+      } else if (projectState !== null) {
+        if (projectSetupMode === "add") {
+          await invoke("add_drawing", {
+            request: {
+              project_path: projectState.project_path,
+              drawing: values.drawing,
+              paper: values.paper,
+              orientation: values.orientation,
+              scale_denominator: values.scaleDenominator,
+            },
+          });
+        } else {
+          await invoke("duplicate_drawing", {
+            request: {
+              project_path: projectState.project_path,
+              source_drawing: values.sourceDrawing,
+              drawing: values.drawing,
+            },
+          });
+        }
+        setProjectSetupMode(null);
+        await openDesktopProject(projectState.project_path, false);
+      }
+    } catch (error: unknown) {
+      setErrorMessage(formatError(error, "project operation failed"));
+    } finally {
+      setProjectSetupBusy(false);
+    }
+  }
+
   async function chooseJwwImport() {
     if (!isDesktop) {
       return;
@@ -1492,7 +1731,7 @@ function App() {
       }
     } catch (error: unknown) {
       setExportReport({
-        schema_version: "0.2",
+        schema_version: "0.3",
         status: "blocked",
         mode: "preserved_edited",
         output_path: outputPath,
@@ -1654,11 +1893,19 @@ function App() {
         setProjectState(reviewedState);
         currentDrawingRef.current = loaded.artifacts.currentDrawing;
         setArtifacts(loaded.artifacts);
-        setEditorMode("select");
-        setCadCommand("select");
-        setDraftPoints([]);
-        setPendingOperation(null);
-        setSnapCandidate(null);
+        const continueInsertion = editorModeRef.current === "insert_block" && insertionRevision.current === loaded.artifacts.editor.revision;
+        const keepIdleTool = draftActivityRef.current.points.length === 0 && draftActivityRef.current.operation === null;
+        // Watcher catch-up after our own save must not cancel the next command.
+        // SourceChecked still rejects changes to rules or blocks after a preview.
+        const sameDrawingRevision = currentEditorRevisionRef.current === loaded.artifacts.editor.revision;
+        if (!sameDrawingRevision) ++asyncDraftSequence.current;
+        if (!keepIdleTool && !sameDrawingRevision) {
+          setEditorMode(continueInsertion ? "insert_block" : "select");
+          setCadCommand(continueInsertion ? "insert_block" : "select");
+          setDraftPoints([]);
+          setPendingOperation(null);
+          setSnapCandidate(null);
+        }
         dragInteraction.current = null;
         const availableEntityIds = new Set(loaded.artifacts.editor.entities.map((entity) => entity.id));
         setSelectedEntityIds((entityIds) => new Set(
@@ -1733,14 +1980,145 @@ function App() {
   }
 
   function selectEditorMode(mode: EditorMode) {
+    ++asyncDraftSequence.current;
+    insertionRevision.current = null;
+    setDraftParameterError(false);
+    pendingRevision.current = null;
+    editorModeRef.current = mode;
     setEditorMode(mode);
     setCadCommand(mode);
     setDraftPoints([]);
     setPendingOperation(null);
     setSnapCandidate(null);
+    setEditPreview(null);
+    endpointDrag.current = null;
+    setEditMessage(mode === "stretch" ? "Pick two rectangle corners, a base point, then a destination" : mode === "endpoint" ? "Drag a vertex handle, or choose a handle and enter its coordinate" : "Pick geometry or enter coordinates; Enter applies, Esc cancels");
     if (mode !== "select") {
       setViewMode("sheet");
     }
+  }
+
+  function editSelectedBlock() {
+    setBlockDeletion(null);
+    const block = selectedEditorEntity?.block;
+    if (selectedEditorEntity?.type !== "block_ref" || typeof block !== "string") {
+      setEditMessage("Select a block reference to edit");
+      return;
+    }
+    setDraftingOptions(options => ({ ...options, block, blockName: artifacts?.blocks?.find(candidate => candidate.id === block)?.name ?? "" }));
+    selectEditorMode("edit_block");
+    const sequence = ++blockLoadSequence.current;
+    const projectPath = projectState?.project_path, drawing = artifacts?.currentDrawing;
+    const accepts = () => sequence === blockLoadSequence.current && editorModeRef.current === "edit_block" && projectStateRef.current?.project_path === projectPath && currentDrawingRef.current === drawing;
+    if (projectState !== null && artifacts !== null) void invoke<{ block: string; name: string; revision: string; entities: EditorEntity[]; svg: string }>("load_block_contents", { projectPath, drawing, block }).then(result => {
+      if (!accepts()) return;
+      setBlockEditing({ ...result, drawingRevision: artifacts.editor.revision, svg: sanitizeSvg(result.svg) }); setBlockEntityIndex(0);
+    }).catch(error => { if (accepts()) setEditMessage(formatError(error, "Unable to open block")); });
+  }
+
+  async function saveBlockOperation(operation: Record<string, unknown>, expectedRevision: string) {
+    if (projectState === null || artifacts === null || isEditSaving) return;
+    setIsEditSaving(true);
+    try {
+      await invoke("apply_block_contents", { projectPath: projectState.project_path, request: { drawing: artifacts.currentDrawing, expected_revision: expectedRevision, operation } });
+      setBlockEditing(null); selectEditorMode("select");
+      setEditMessage("Block saved"); enqueueDesktopReview(projectState.project_path);
+    } catch (error) { const message = formatError(error, "Block edit failed"); setEditMessage(message); setBlockEditMessage(message); }
+    finally { setIsEditSaving(false); }
+  }
+
+  function replaceBlockEntity(entity: EditorEntity) {
+    if (blockEditing === null || projectState === null || artifacts === null) return;
+    const entities = blockEditing.entities.map(current => current.id === entity.id ? entity : current);
+    stageBlockEntities(entities);
+  }
+
+  function stageBlockEntities(entities: EditorEntity[]) {
+    if (blockEditing === null || projectState === null || artifacts === null) return;
+    setBlockEditing({ ...blockEditing, entities });
+    void invoke<{ svg: string }>("load_block_contents", { projectPath: projectState.project_path, drawing: artifacts.currentDrawing, block: blockEditing.block, entities }).then(result => setBlockEditing(current => current?.entities === entities ? { ...current, svg: sanitizeSvg(result.svg) } : current)).catch(error => setBlockEditMessage(formatError(error, "Invalid block preview")));
+  }
+
+  async function resolveBlockDeletion() {
+    if (blockEditing === null || blockDeletion === null || projectState === null || artifacts === null) return;
+    const original = blockEditing.entities;
+    try {
+      const result = await invoke<{ entities: EditorEntity[]; svg: string }>("load_block_contents", {
+        projectPath: projectState.project_path, drawing: artifacts.currentDrawing, block: blockEditing.block,
+        entities: original, removeEntityId: blockDeletion.id, dimensionResolutions: blockDeletion.resolutions,
+      });
+      setBlockEditing(current => current?.entities === original ? { ...current, entities: result.entities, svg: sanitizeSvg(result.svg) } : current);
+      setBlockDeletion(null); setBlockEntityIndex(0);
+    } catch (error) { setBlockEditMessage(formatError(error, "Unable to resolve block dimensions")); }
+  }
+
+  useEffect(() => {
+    let active = true;
+    setBlockThumbnail("");
+    const block = draftingOptions.block || artifacts?.blocks?.[0]?.id;
+    if (editorMode === "insert_block" && block && projectState !== null && artifacts !== null) void invoke<{ svg: string }>("load_block_contents", { projectPath: projectState.project_path, drawing: artifacts.currentDrawing, block }).then(result => { if (active) setBlockThumbnail(sanitizeSvg(result.svg)); }).catch(() => { if (active) setBlockThumbnail(""); });
+    return () => { active = false; };
+  }, [editorMode, draftingOptions.block, projectState?.project_path, artifacts?.editor.revision]);
+
+  function applyDraftingParameters() {
+    if (draftParameterError) { setEditMessage("Correct invalid parameters before applying"); return; }
+    if (pendingOperation !== null) { void commitDrawingEdit(pendingOperation); return; }
+    if (artifacts === null) return;
+    const layer = activeLayerEditable();
+    const points = draftPoints;
+    const number = (value: string) => finiteDraftNumber(value);
+    if (["line", "rectangle", "hatch", "text", "polyline"].includes(editorMode) && layer === null) {
+      setEditMessage("Choose a visible, unlocked active layer in the layer list");
+      return;
+    }
+    if (editorMode === "line" && points.length === 1 && layer !== null) {
+      const length = number(draftingOptions.distance), angle = number(draftingOptions.angle);
+      if (length === null || angle === null || length <= 0) { setEditMessage("Length must be positive and angle finite"); return; }
+      const radians = angle * Math.PI / 180;
+      setPendingOperation({ kind: "create", entity: { type: "line", layer, pen: null, p1: points[0], p2: [points[0][0] + length * Math.cos(radians), points[0][1] + length * Math.sin(radians)] } });
+    } else if (editorMode === "rectangle" && points.length === 1 && layer !== null) {
+      const width = number(draftingOptions.width), height = number(draftingOptions.height);
+      if (width === null || height === null || width <= 0 || height <= 0) { setEditMessage("Width and height must be positive"); return; }
+      setPendingOperation({ kind: "rectangle", layer, p1: points[0], p2: [points[0][0] + width, points[0][1] + height] });
+    } else if (editorMode === "hatch" && !draftingOptions.hatchRegion && layer !== null) {
+      if (points.length < 3) { setEditMessage("Pick at least three boundary vertices"); return; }
+      stageHatch(points.length > 3 && pointArrayDistance(points[0], points.at(-1)!) < 1e-9 ? [points.slice(0, -1)] : [points], layer);
+    } else if (editorMode === "rectangular_array") {
+      const rows = number(draftingOptions.rows), columns = number(draftingOptions.columns);
+      const row_spacing = number(draftingOptions.rowSpacing), column_spacing = number(draftingOptions.columnSpacing);
+      if (rows === null || columns === null || row_spacing === null || column_spacing === null || !Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || columns < 1) { setEditMessage("Rows and columns must be positive integers; spacing must be finite"); return; }
+      setPendingOperation({ kind: "rectangular_array", entity_ids: [...selectedEntityIds], rows, columns, row_spacing, column_spacing });
+    } else if (editorMode === "edit_block" && draftingOptions.blockName.trim()) {
+      void commitDrawingEdit({ kind: "update_block_definition", block: draftingOptions.block, properties: { name: draftingOptions.blockName.trim() } });
+    } else if (editorMode === "create_block" && points.length === 1) {
+      const name = draftingOptions.blockName.trim();
+      if (!name || selectedEntityIds.size === 0) { setEditMessage("Select entities and enter a block name"); return; }
+      void saveBlockOperation({ type: "create", block: `block_${crypto.randomUUID().replaceAll("-", "")}`, name, base_point: points[0], entity_ids: [...selectedEntityIds], replace_originals: draftingOptions.replaceOriginals, detach_external_dimensions: draftingOptions.detachExternalDimensions }, artifacts.editor.revision);
+    } else if (editorMode === "text" && points.length > 0) {
+      stageText(points[0]);
+    } else if (editorMode === "rotate" && points.length > 0) {
+      const angle = number(draftingOptions.angle);
+      if (angle === null) { setEditMessage("Enter a finite angle"); return; }
+      setPendingOperation({ kind: "rotate", entity_ids: [...selectedEntityIds], center: points[0], angle_deg: angle });
+    } else if (editorMode === "polyline") {
+      completePolyline();
+    } else {
+      setEditMessage("Complete the point selection before applying");
+    }
+  }
+
+  function stageText(at: [number, number]) {
+    const layer = activeLayerEditable();
+    const style = draftingOptions.style || artifacts?.editor.text_styles[0];
+    if (layer === null || !style || !draftingOptions.text.trim()) { setEditMessage("Enter text and choose a style"); return; }
+    setPendingOperation({ kind: "create", entity: { type: "text", layer, pen: null, style, at, rotation_deg: 0, mirror_y: false, value: draftingOptions.text } });
+  }
+
+  function stageHatch(loops: [number, number][][], layer: string) {
+    const scale = finiteDraftNumber(draftingOptions.distance), angle = finiteDraftNumber(draftingOptions.angle);
+    const fill = draftingOptions.fill || artifacts?.editor.fills[0];
+    if (!fill || scale === null || scale <= 0 || angle === null) { setEditMessage("Choose a fill and finite angle with a positive pitch"); return; }
+    setPendingOperation({ kind: "create", entity: { type: "hatch", layer, pen: null, loops, pattern: draftingOptions.pattern, angle_deg: angle, scale, fill } });
   }
 
   function activeLayerEditable(): string | null {
@@ -1759,13 +2137,17 @@ function App() {
   }
 
   async function commitDrawingEdit(operation: EditOperation) {
+    if (operation === pendingOperation && draftParameterError) {
+      setEditMessage("Correct invalid parameters before applying");
+      return;
+    }
     if (isEditSaving || !isDesktop || projectState === null || artifacts === null) {
       return;
     }
     setIsEditSaving(true);
     setEditMessage("Saving edit...");
     try {
-      const expectedRevision = expectedRevisionForOperation(
+      const expectedRevision = (operation === pendingOperation ? pendingRevision.current : null) ?? expectedRevisionForOperation(
         operation,
         artifacts.editor.revision,
         artifacts.blocks,
@@ -1774,6 +2156,22 @@ function App() {
       if (expectedRevision === null) {
         throw new Error(`revision is unavailable for ${operation.kind}`);
       }
+      let sourceFiles = operation === pendingOperation ? editPreview?.source_files : undefined;
+      if (!["update_layout", "update_block_definition", "resolve_dimensions", "source_checked"].includes(operation.kind)) {
+        const preview = await previewDrawingEdit(projectState.project_path, { drawing: artifacts.currentDrawing, expected_revision: expectedRevision, operation });
+        sourceFiles ??= preview.source_files;
+        if (preview.dimension_impacts.length > 0) {
+          if (operation === pendingOperation && preview.dimension_impacts.every(id => dimensionResolutions[id] !== undefined)) {
+            operation = { kind: "resolve_dimensions", operation, resolutions: preview.dimension_impacts.map(entity_id => ({ entity_id, action: dimensionResolutions[entity_id] })) };
+          } else {
+            setPendingOperation(operation);
+            setEditPreview({ ...preview, svg: sanitizeSvg(preview.svg) });
+            setEditMessage("Choose how to resolve each affected dimension before applying");
+            return;
+          }
+        }
+      }
+      if (sourceFiles !== undefined && operation.kind !== "source_checked") operation = { kind: "source_checked", operation, expected_files: sourceFiles };
       const result = await applyDrawingEdit(projectState.project_path, {
         drawing: artifacts.currentDrawing,
         expected_revision: expectedRevision,
@@ -1798,9 +2196,12 @@ function App() {
       }
       setDraftPoints([]);
       setPendingOperation(null);
+      setEditPreview(null);
       setSnapCandidate(null);
-      setEditorMode("select");
-      setCadCommand("select");
+      if (repeatableCommand(editorMode)) lastSuccessfulCommand.current = editorMode;
+      insertionRevision.current = editorMode === "insert_block" ? result.revision : null;
+      setEditorMode(editorMode === "insert_block" ? "insert_block" : "select");
+      setCadCommand(editorMode === "insert_block" ? "insert_block" : "select");
       setEditMessage(`${result.operation} saved`);
       enqueueDesktopReview(projectState.project_path);
     } catch (error: unknown) {
@@ -1888,7 +2289,7 @@ function App() {
   }
 
   function updateSnapForPointer(event: PointerEvent) {
-    if (event.shiftKey || projectState === null || artifacts === null) {
+    if (!snapEnabled || event.shiftKey || projectState === null || artifacts === null) {
       setSnapCandidate(null);
       return;
     }
@@ -1911,7 +2312,16 @@ function App() {
     };
     snapTimerRef.current = setTimeout(() => {
       snapTimerRef.current = null;
-      void queryDrawingSnap(request.projectPath, request.drawing, request.revision, request.point, tolerance)
+      void queryDrawingSnap(
+        request.projectPath,
+        request.drawing,
+        request.revision,
+        request.point,
+        tolerance,
+        undefined,
+        undefined,
+        draftPoints.at(-1) ?? null,
+      )
         .then((candidate) => {
           if (sequence === snapSequenceRef.current) setSnapCandidate(candidate);
         })
@@ -1922,11 +2332,11 @@ function App() {
   }
 
   function clickedCadPoint(event: MouseEvent): [number, number] | null {
-    if (snapCandidate !== null && !event.shiftKey) {
-      return snapCandidate.point;
-    }
-    const point = clientPointToSvg({ x: event.clientX, y: event.clientY });
-    return point === null ? null : [point.x, -point.y];
+    const svgPoint = clientPointToSvg({ x: event.clientX, y: event.clientY });
+    const point = snapCandidate !== null && snapEnabled && !event.shiftKey
+      ? snapCandidate.point
+      : svgPoint === null ? null : [svgPoint.x, -svgPoint.y] as [number, number];
+    return point === null ? null : applyOrtho(point, draftPoints.at(-1) ?? null, orthoEnabled);
   }
 
   function completePolyline() {
@@ -1945,7 +2355,86 @@ function App() {
       return false;
     }
     const point = clickedCadPoint(event);
-    if (point === null || artifacts === null) {
+    if (point === null) {
+      return true;
+    }
+    return handleDraftPoint(point);
+  }
+
+  function handleDraftPoint(point: [number, number]): boolean {
+    if (editorMode === "select" || viewMode !== "sheet" || artifacts === null) {
+      return false;
+    }
+    if (editorMode === "endpoint") {
+      const target = endpointDrag.current;
+      if (target === null) { setEditMessage("Choose a vertex handle first"); return true; }
+      target.to = point;
+      setPendingOperation({ kind: "endpoint", entity_id: target.entityId, vertex_index: target.vertexIndex, to: point });
+      return true;
+    }
+    if (editorMode === "stretch") {
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      if (points.length === 4) setPendingOperation({ kind: "stretch", entity_ids: artifacts.editor.entities.map(entity => entity.id), min: [Math.min(points[0][0], points[1][0]), Math.min(points[0][1], points[1][1])], max: [Math.max(points[0][0], points[1][0]), Math.max(points[0][1], points[1][1])], delta: [points[3][0] - points[2][0], points[3][1] - points[2][1]] });
+      return true;
+    }
+    if (editorMode === "rectangle") {
+      const layer = activeLayerEditable();
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      if (layer !== null && points.length === 2) {
+        setDraftingOptions(options => ({ ...options, width: String(Math.abs(points[1][0] - points[0][0])), height: String(Math.abs(points[1][1] - points[0][1])) }));
+        setPendingOperation({ kind: "rectangle", layer, p1: points[0], p2: points[1] });
+      }
+      return true;
+    }
+    if (editorMode === "fillet" || editorMode === "chamfer") {
+      const ids = [...selectedEntityIds];
+      if (ids.length !== 2) { setEditMessage("Select exactly two lines first; then pick the retained side of each line"); return true; }
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      if (points.length < 2) return true;
+      const first = finiteDraftNumber(draftingOptions.distance), second = finiteDraftNumber(draftingOptions.secondDistance);
+      if (first === null || second === null || first <= 0 || second <= 0) { setEditMessage("Distances must be positive"); return true; }
+      const common = { first_entity_id: ids[0], second_entity_id: ids[1], first_pick: points[0], second_pick: points[1] };
+      setPendingOperation(editorMode === "fillet" ? { kind: "fillet", ...common, radius: first } : { kind: "chamfer", ...common, first_distance: first, second_distance: second });
+      return true;
+    }
+    if (editorMode === "create_block") {
+      setDraftPoints([point]);
+      setEditMessage("Base point set; enter a block name then Apply");
+      return true;
+    }
+    if (editorMode === "rectangular_array" || editorMode === "edit_block") return true;
+    if (editorMode === "dimension") {
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      const layer = activeLayerEditable(), style = artifacts.editor.dimension_styles[0];
+      if (layer === null || style === undefined) { setEditMessage("Choose an editable layer and a dimension style"); return true; }
+      const type = draftingOptions.dimension;
+      const selected = artifacts.editor.entities.filter(entity => selectedEntityIds.has(entity.id));
+      const fixed = (point: [number, number]) => ({ kind: "fixed", point });
+      const reference = (entity: EditorEntity, feature: string) => ({ kind: "entity", entity_id: entity.id, feature });
+      const anchor = (point: [number, number]) => draftingOptions.associate ? dimensionAnchorAt(artifacts, point) : fixed(point);
+      const create = (p1: [number, number], p2: [number, number], offset: number, measurement: Record<string, unknown>): EditOperation => ({ kind: "create", entity: { type: "dimension", layer, pen: null, style, p1, p2, offset, text_rotation_deg: 0, text_mirror_y: false, value: null, measurement } });
+      if (type === "radius" || type === "diameter") {
+        const target = selected.find(entity => entity.type === "circle" || entity.type === "arc");
+        const center = asCadPoint(target?.center);
+        if (!target || center === null || typeof target.radius !== "number") { setEditMessage("Select a circle or arc, then pick the dimension position"); return true; }
+        const rim: [number, number] = [center[0] + target.radius, center[1]];
+        setPendingOperation(create(center, rim, pointArrayDistance(center, point), { kind: type, center: draftingOptions.associate ? reference(target, "center") : fixed(center), rim: draftingOptions.associate ? reference(target, "radius") : fixed(rim) }));
+      } else if (type === "angle" && selected.length === 2 && selected.every(entity => entity.type === "line")) {
+        const first = selected[0], second = selected[1];
+        const lineAnchor = (entity: EditorEntity, feature: "start" | "end") => draftingOptions.associate ? reference(entity, feature) : fixed(asCadPoint(feature === "start" ? entity.p1 : entity.p2)!);
+        setPendingOperation(create(asCadPoint(first.p1)!, asCadPoint(first.p2)!, Math.max(pointArrayDistance(point, asCadPoint(first.p1)!), 1), { kind: "angle_lines", first_start: lineAnchor(first, "start"), first_end: lineAnchor(first, "end"), second_start: lineAnchor(second, "start"), second_end: lineAnchor(second, "end") }));
+      } else if (type === "chain" || type === "baseline") {
+        if (points.length < 3) { setEditMessage("Pick the first two measurement points, then the dimension offset; subsequent points add dimensions"); return true; }
+        const pairs = points.length === 3 ? [[points[0], points[1]]] : Array.from({ length: points.length - 2 }, (_, i) => [type === "baseline" ? points[0] : (i === 0 ? points[0] : i === 1 ? points[1] : points[i + 1]), i === 0 ? points[1] : points[i + 2]]);
+        setPendingOperation({ kind: "batch", operations: pairs.map(([a, b], index) => create(a, b, signedLineOffset(a, b, points[2]) + (type === "baseline" ? index * 10 : 0), { kind: "aligned", first: anchor(a), second: anchor(b) })) });
+      } else if (points.length >= 3) {
+        const measurement = type === "angle" ? { kind: "angle", vertex: anchor(points[0]), first: anchor(points[1]), second: anchor(points[2]) } : { kind: type, first: anchor(points[0]), second: anchor(points[1]) };
+        setPendingOperation(create(points[0], points[1], type === "angle" ? pointArrayDistance(points[0], points[1]) / 2 : signedLineOffset(points[0], points[1], points[2]), measurement));
+      }
       return true;
     }
     if (editorMode === "move" || editorMode === "copy") {
@@ -1971,14 +2460,10 @@ function App() {
         return true;
       }
       if (editorMode === "rotate") {
-        if (draftPoints.length === 0) {
-          setDraftPoints([point]);
-          return true;
-        }
-        const rawAngle = window.prompt("Rotation angle (degrees)", "90");
-        const angle = rawAngle === null ? NaN : Number(rawAngle);
-        if (Number.isFinite(angle)) {
-          setPendingOperation({ kind: "rotate", entity_ids: entityIds, center: draftPoints[0], angle_deg: angle });
+        setDraftPoints([point]);
+        const angle = finiteDraftNumber(draftingOptions.angle);
+        if (angle !== null) {
+          setPendingOperation({ kind: "rotate", entity_ids: entityIds, center: point, angle_deg: angle });
           setEditMessage("Rotate preview ready; press Enter to apply");
         } else {
           setEditMessage("Enter a finite rotation angle");
@@ -1994,10 +2479,10 @@ function App() {
         return true;
       }
       if (editorMode === "offset") {
-        const rawDistance = window.prompt("Offset distance", "10");
-        const distance = rawDistance === null ? NaN : Number(rawDistance);
-        if (Number.isFinite(distance)) {
-          setPendingOperation({ kind: "offset", entity_ids: entityIds, distance });
+        const distance = finiteDraftNumber(draftingOptions.distance);
+        if (distance !== null && distance > 0) {
+          const operations: EditOperation[] = entityIds.map(id => ({ kind: "offset", entity_ids: [id], distance: offsetSide(artifacts.editor.entities.find(entity => entity.id === id), point) * distance }));
+          setPendingOperation({ kind: "batch", operations });
           setEditMessage("Offset preview ready; press Enter to apply");
         } else {
           setEditMessage("Enter a finite offset distance");
@@ -2033,55 +2518,41 @@ function App() {
       return true;
     }
     if (editorMode === "text") {
-      const value = window.prompt("Text");
-      if (value !== null && value !== "") {
-        const style = artifacts.editor.text_styles[0];
-        if (style === undefined) {
-          setEditMessage("No text style is defined");
-        } else {
-          void commitDrawingEdit({
-            kind: "create",
-            entity: { type: "text", layer, pen: null, style, at: point, rotation_deg: 0, mirror_y: false, value },
-          });
-        }
-      }
+      setDraftPoints([point]);
+      stageText(point);
       return true;
     }
     if (editorMode === "insert_block") {
-      const block = artifacts.blocks?.[0];
+      const block = artifacts.blocks?.find(block => block.id === draftingOptions.block) ?? artifacts.blocks?.[0];
       if (block === undefined) {
         setEditMessage("No block definition is available");
         return true;
       }
-      void commitDrawingEdit({
+      const angle = finiteDraftNumber(draftingOptions.angle), scale = finiteDraftNumber(draftingOptions.scale);
+      if (angle === null || scale === null || scale <= 0) { setEditMessage("Choose a finite angle and positive scale"); return true; }
+      setPendingOperation({
         kind: "insert_block",
         block: block.id,
         layer,
         at: point,
-        rotation_deg: 0,
-        scale: 1,
+        rotation_deg: angle,
+        scale,
+        mirror_x: draftingOptions.mirrorX,
+        mirror_y: draftingOptions.mirrorY,
       });
       return true;
     }
     if (editorMode === "hatch") {
-      const points = [...draftPoints, point];
-      setDraftPoints(points);
-      if (points.length < 3) {
+      if (draftingOptions.hatchRegion && projectState !== null) {
+        const sequence = ++asyncDraftSequence.current, drawing = artifacts.currentDrawing, projectPath = projectState.project_path;
+        void invoke<[number, number][][]>("find_hatch_region", { projectPath, drawing, point }).then(loops => {
+          if (sequence === asyncDraftSequence.current && editorModeRef.current === "hatch" && projectStateRef.current?.project_path === projectPath && currentDrawingRef.current === drawing) stageHatch(loops, layer);
+        }).catch(error => { if (sequence === asyncDraftSequence.current) setEditMessage(formatError(error, "Cannot find a closed region")); });
         return true;
       }
-      void commitDrawingEdit({
-        kind: "create",
-        entity: {
-          type: "hatch",
-          layer,
-          pen: null,
-          loops: [points],
-          pattern: "solid",
-          angle_deg: 0,
-          scale: 1,
-          fill: null,
-        },
-      });
+      const points = [...draftPoints, point];
+      setDraftPoints(points);
+      setEditMessage(`${points.length} boundary vertices; Enter closes the hatch`);
       return true;
     }
     const points = [...draftPoints, point];
@@ -2089,7 +2560,7 @@ function App() {
     if (editorMode === "polyline") {
       return true;
     }
-    const needed = editorMode === "arc" || editorMode === "dimension" ? 3 : 2;
+    const needed = editorMode === "arc" ? 3 : 2;
     if (points.length < needed) {
       return true;
     }
@@ -2099,15 +2570,43 @@ function App() {
       void commitDrawingEdit({ kind: "create", entity: { type: "circle", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]) } });
     } else if (editorMode === "arc") {
       void commitDrawingEdit({ kind: "create", entity: { type: "arc", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]), start_deg: pointAngle(points[0], points[1]), end_deg: pointAngle(points[0], points[2]) } });
-    } else if (editorMode === "dimension") {
-      const style = artifacts.editor.dimension_styles[0];
-      if (style === undefined) {
-        setEditMessage("No dimension style is defined");
-      } else {
-        void commitDrawingEdit({ kind: "create", entity: { type: "dimension", layer, pen: null, style, p1: points[0], p2: points[1], offset: signedLineOffset(points[0], points[1], points[2]), text_rotation_deg: 0, text_mirror_y: false, value: null } });
-      }
     }
     return true;
+  }
+
+  function submitCommandInput() {
+    const value = commandInput.trim();
+    if (value === "") {
+      if (editorMode === "select" && lastSuccessfulCommand.current !== null) selectEditorMode(lastSuccessfulCommand.current);
+      else applyDraftingParameters();
+      return;
+    }
+    const coordinate = parseCoordinateInput(value, draftPoints.at(-1) ?? null);
+    if (coordinate !== null && editorMode !== "select") {
+      handleDraftPoint(applyOrtho(coordinate, draftPoints.at(-1) ?? null, orthoEnabled));
+      setCommandInput("");
+      return;
+    }
+    const command = commandFromText(value);
+    if (command !== null) {
+      if (command === "undo" || command === "redo") {
+        void runHistoryAction(command === "undo");
+      } else if (command === "delete") {
+        void deleteSelectedEntities();
+      } else if (command === "edit_block") {
+        editSelectedBlock();
+      } else if (command === "layout" || command === "print_preview") {
+        setCadCommand(command);
+        setEditorMode(command);
+        setViewMode("sheet");
+      } else {
+        selectEditorMode(command as EditorMode);
+        setViewMode("sheet");
+      }
+      setCommandInput("");
+      return;
+    }
+    setEditMessage("Enter a command or x,y / @dx,dy / @distance<angle");
   }
 
   function handleSvgClick(event: MouseEvent) {
@@ -2131,6 +2630,43 @@ function App() {
 
   return (
     <main class="app-shell">
+      {blockEditing !== null && artifacts !== null && <div class="dialog-backdrop"><section class="block-edit-dialog" role="dialog" aria-modal="true" aria-label="Edit block contents">
+        <h2>Edit block: {blockEditing.name}</h2>
+        <p>Changes are staged until Save contents. All references to this definition will update together.</p>
+        <div class="block-content-preview" dangerouslySetInnerHTML={{ __html: blockEditing.svg }} />
+        <button type="button" disabled={isEditSaving} onClick={() => {
+          const layer = activeLayerEditable();
+          if (layer === null) return;
+          const entity: EditorEntity = { schema_version: "0.3", id: newDraftEntityId(), type: "line", layer, pen: null, p1: [0, 0], p2: [100, 0] };
+          stageBlockEntities([...blockEditing.entities, entity]);
+          setBlockEntityIndex(blockEditing.entities.length);
+          setBlockEditMessage("New line staged. Set its coordinates below, then Save contents.");
+        }}>Add line</button>
+        <label>Entity<select aria-label="Block entity" value={blockEntityIndex} onChange={event => setBlockEntityIndex(Number(event.currentTarget.value))}>{blockEditing.entities.map((entity, index) => <option key={entity.id} value={index}>{entity.type} — {entity.id}</option>)}</select></label>
+        {blockEditing.entities[blockEntityIndex] !== undefined && <EntityPropertyEditor entity={blockEditing.entities[blockEntityIndex]} layers={artifacts.layers} pens={artifacts.editor.pens} message={blockEditMessage} onReplace={replaceBlockEntity} onTranslate={(delta, duplicate) => {
+          const entity = blockEditing.entities[blockEntityIndex];
+          const translated = translateEditorEntity(entity, delta);
+          if (translated === null) { setBlockEditMessage("Use coordinate properties for this entity type"); return; }
+          if (duplicate) stageBlockEntities([...blockEditing.entities, { ...translated, id: newDraftEntityId() }]);
+          else replaceBlockEntity(translated);
+        }} onDelete={() => {
+          const id = blockEditing.entities[blockEntityIndex].id;
+          const dimensions = blockEditing.entities.filter(entity => entity.type === "dimension" && dimensionReferences(entity.measurement, id)).map(entity => entity.id);
+          if (dimensions.length > 0) { setBlockDeletion({ id, dimensions, resolutions: {} }); return; }
+          stageBlockEntities(blockEditing.entities.filter((_, index) => index !== blockEntityIndex)); setBlockEntityIndex(0);
+        }} />}
+        {blockDeletion !== null && <section aria-label="Resolve block dimension references">
+          <p>Deleting this geometry affects these dimensions. Choose before changing the draft.</p>
+          {blockDeletion.dimensions.map(id => <label key={id}>{id}<select aria-label={`Block resolution for ${id}`} value={blockDeletion.resolutions[id] ?? ""} onChange={event => { const action = event.currentTarget.value; if (action === "delete" || action === "detach") setBlockDeletion(current => current === null ? null : { ...current, resolutions: { ...current.resolutions, [id]: action } }); }}><option value="">Choose…</option><option value="detach">Keep current coordinates</option><option value="delete">Delete dimension</option></select></label>)}
+          <button type="button" disabled={blockDeletion.dimensions.some(id => blockDeletion.resolutions[id] === undefined)} onClick={() => void resolveBlockDeletion()}>Resolve in draft</button>
+          <button type="button" onClick={() => setBlockDeletion(null)}>Keep geometry</button>
+        </section>}
+        <label>Independent copy name<input aria-label="Independent block name" value={draftingOptions.blockName} onInput={event => setDraftingOptions(options => ({ ...options, blockName: event.currentTarget.value }))} /></label>
+        <p role="status">{blockEditMessage}</p>
+        <button type="button" disabled={isEditSaving || blockDeletion !== null} onClick={() => void saveBlockOperation({ type: "update_contents", block: blockEditing.block, expected_block_revision: blockEditing.revision, entities: blockEditing.entities }, blockEditing.drawingRevision)}>Save contents</button>
+        <button type="button" disabled={isEditSaving || !draftingOptions.blockName.trim()} onClick={() => void saveBlockOperation({ type: "duplicate", source_block: blockEditing.block, expected_block_revision: blockEditing.revision, block: `block_${crypto.randomUUID().replaceAll("-", "")}`, name: draftingOptions.blockName.trim(), entities: blockEditing.entities }, blockEditing.drawingRevision)}>Duplicate block</button>
+        <button type="button" disabled={isEditSaving} onClick={() => { setBlockEditing(null); selectEditorMode("select"); }}>Cancel</button>
+      </section></div>}
       <header class="topbar">
         <div class="brand">
           <Layers3 size={20} aria-hidden="true" />
@@ -2142,6 +2678,10 @@ function App() {
               <button type="button" class="tool-button" onClick={chooseProject}>
                 <FolderOpen size={17} aria-hidden="true" />
                 Open Project
+              </button>
+              <button type="button" class="tool-button" onClick={() => setProjectSetupMode("new")}>
+                <FilePlus2 size={17} aria-hidden="true" />
+                New Project
               </button>
               <button type="button" class="tool-button" onClick={chooseJwwImport}>
                 <FileInput size={17} aria-hidden="true" />
@@ -2186,7 +2726,7 @@ function App() {
           <span class="diff-source">HEAD vs working tree</span>
         </div>
         {isDesktop && artifacts !== null && (
-        <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving || isHistoryBusy || pdfBusy}>
+        <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving || isHistoryBusy || pdfBusy || projectState?.editable === false}>
             <select
               class="drawing-select"
               aria-label="Current drawing"
@@ -2197,6 +2737,12 @@ function App() {
                 <option value={drawing} key={drawing}>{drawing}</option>
               ))}
             </select>
+            <button type="button" class="icon-button" aria-label="Add drawing" title="Add drawing" onClick={() => setProjectSetupMode("add")}>
+              <FilePlus2 size={16} />
+            </button>
+            <button type="button" class="icon-button" aria-label="Duplicate drawing" title="Duplicate drawing" onClick={() => setProjectSetupMode("duplicate")}>
+              <Copy size={16} />
+            </button>
             {(artifacts.layouts?.length ?? 0) > 0 && (
               <select
                 class="drawing-select"
@@ -2235,6 +2781,7 @@ function App() {
               <Redo2 size={16} />
             </button>
             <EditorToolButton mode="move" active={editorMode} label="Move" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
+            {(["endpoint", "stretch", "rectangle", "fillet", "chamfer", "rectangular_array", "create_block"] as const).map(mode => <EditorToolButton key={mode} mode={mode} active={editorMode} label={commandLabel(mode).replaceAll("_", " ")} icon={<PenLine size={16} />} onSelect={selectEditorMode} />)}
             <EditorToolButton mode="copy" active={editorMode} label="Copy" icon={<Plus size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="line" active={editorMode} label="Line" icon={<Minus size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="polyline" active={editorMode} label="Polyline" icon={<PenLine size={16} />} onSelect={selectEditorMode} />
@@ -2255,14 +2802,7 @@ function App() {
               aria-label="Edit Block"
               title="Edit Block"
               disabled={selectedEditorEntity?.type !== "block_ref"}
-              onClick={() => {
-                const block = selectedEditorEntity?.block;
-                if (typeof block !== "string") return;
-                const name = window.prompt("Block name", artifacts.blocks?.find((candidate) => candidate.id === block)?.name ?? "");
-                if (name === null || name.trim() === "") return;
-                setCadCommand("edit_block");
-                void commitDrawingEdit({ kind: "update_block_definition", block, properties: { name } });
-              }}
+              onClick={editSelectedBlock}
             >
               Edit Block
             </button>
@@ -2307,9 +2847,6 @@ function App() {
             <button type="button" class="icon-button" aria-label="Delete" title="Delete" onClick={() => void deleteSelectedEntities()}>
               Delete
             </button>
-            <span class="command-status" aria-live="polite">
-              Command: {commandLabel(cadCommand)}{selectedEntityIds.size > 0 ? ` · ${selectedEntityIds.size} selected` : ""}{historyState?.context_blocked ? ` · ${historyState.context_blocked}` : ""}{historyMessage !== "" ? ` · ${historyMessage}` : ""}
-            </span>
           </fieldset>
         )}
         <div class="mode-tabs" aria-label="SVG mode">
@@ -2451,6 +2988,30 @@ function App() {
         </aside>
 
         <section class="canvas-panel" aria-label="CAD paper">
+          {isDesktop && artifacts !== null && <DraftingPanel command={cadCommand} options={draftingOptions} artifacts={artifacts} onChange={options => {
+            setDraftingOptions(options);
+            if (editorMode === "dimension" && (options.dimension !== draftingOptions.dimension || options.associate !== draftingOptions.associate)) {
+              setPendingOperation(null);
+              setDraftPoints([]);
+              setEditPreview(null);
+              setDraftParameterError(false);
+              setEditMessage("Dimension settings changed. Pick the measurement points again.");
+              return;
+            }
+            if (pendingOperation !== null) {
+              const updated = retuneDraftOperation(pendingOperation, options);
+              setDraftParameterError(updated === null);
+              if (updated !== null) setPendingOperation(updated);
+              else setEditMessage("Correct invalid parameters before applying");
+            }
+          }} onApply={applyDraftingParameters} onCancel={() => selectEditorMode("select")} message={editMessage} busy={isEditSaving} invalid={draftParameterError} />}
+          {editorMode === "insert_block" && blockThumbnail !== "" && <div class="block-thumbnail" aria-label="Block preview" dangerouslySetInnerHTML={{ __html: blockThumbnail }} />}
+          {editPreview !== null && editPreview.dimension_impacts.length > 0 && <section class="drafting-panel" aria-label="Resolve dimension references">
+            <p>These dimensions would lose their references. Choose a resolution; nothing has been saved.</p>
+            {editPreview.dimension_impacts.map(id => <label key={id}>{id}<select aria-label={`Resolution for ${id}`} value={dimensionResolutions[id] ?? ""} onChange={event => { const action = event.currentTarget.value; if (action === "delete" || action === "detach") setDimensionResolutions(current => ({ ...current, [id]: action })); }}><option value="">Choose…</option><option value="detach">Keep current coordinates</option><option value="delete">Delete dimension</option></select></label>)}
+            <button type="button" disabled={isEditSaving || editPreview.dimension_impacts.some(id => dimensionResolutions[id] === undefined)} onClick={() => pendingOperation !== null && void commitDrawingEdit(pendingOperation)}>Apply with resolutions</button>
+            <button type="button" onClick={() => selectEditorMode("select")}>Cancel</button>
+          </section>}
           {loadState === "idle" && (
             <div class="empty-state">Open a CAD project folder to start desktop review.</div>
           )}
@@ -2499,6 +3060,11 @@ function App() {
                   points={draftPoints}
                   snap={snapCandidate}
                 />
+              )}
+              {isDesktop && viewMode === "sheet" && currentViewBox !== null && selectedEditorEntity !== null && ["select", "endpoint"].includes(editorMode) && entityEditableInView(selectedEditorEntity, artifacts!) && (
+                <svg class="vertex-overlay" viewBox={formatViewBox(currentViewBox)} preserveAspectRatio="xMinYMin meet" aria-label="Entity vertices">
+                  {entityVertices(selectedEditorEntity).map((point, index) => <circle key={index} role="button" aria-label={`Vertex ${index + 1}`} cx={point[0]} cy={-point[1]} r={currentViewBox.width / Math.max(drawingStageRef.current?.clientWidth ?? 1000, 1) * 5} onPointerDown={event => beginEndpoint(event, selectedEditorEntity, index, point)} />)}
+                </svg>
               )}
               {selectionRect !== null && (
                 <div
@@ -2554,6 +3120,33 @@ function App() {
           )}
         </aside>
       </section>
+      <footer class="command-bar">
+        <span class="command-prompt">{commandLabel(cadCommand)}</span>
+        <input
+          aria-label="Command or coordinate"
+          disabled={isEditSaving || isHistoryBusy}
+          value={commandInput}
+          placeholder="Command or x,y · @dx,dy · @distance<angle"
+          onInput={(event) => setCommandInput(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              submitCommandInput();
+            } else if (event.key === "Escape") {
+              setCommandInput("");
+            } else if (event.key === "Backspace" && commandInput === "" && draftPoints.length > 0) {
+              event.preventDefault();
+              setDraftPoints(points => points.slice(0, -1));
+              setPendingOperation(null);
+            }
+          }}
+        />
+        <button type="button" class={snapEnabled ? "command-toggle is-active" : "command-toggle"} onClick={() => setSnapEnabled((enabled) => !enabled)}>F3 SNAP</button>
+        <button type="button" class={orthoEnabled ? "command-toggle is-active" : "command-toggle"} onClick={() => setOrthoEnabled((enabled) => !enabled)}>F8 ORTHO</button>
+        <span class="command-status" aria-live="polite">
+          {snapCandidate !== null ? `${snapCandidate.kind} ${snapCandidate.point[0].toFixed(2)}, ${snapCandidate.point[1].toFixed(2)}` : selectedEntityIds.size > 0 ? `${selectedEntityIds.size} selected` : historyState?.context_blocked ?? historyMessage}
+        </span>
+      </footer>
       {exportOpen && artifacts !== null && (
         <ExportJwwDialog
           drawingNames={artifacts.drawingNames}
@@ -2563,8 +3156,32 @@ function App() {
           onExport={performJwwExport}
         />
       )}
+      {projectSetupMode !== null && (
+        <ProjectSetupDialog
+          mode={projectSetupMode}
+          busy={projectSetupBusy}
+          drawingNames={artifacts?.drawingNames ?? projectState?.drawings ?? []}
+          onCancel={() => setProjectSetupMode(null)}
+          onChooseParent={async () => {
+            const selected = await open({ directory: true, multiple: false, title: "Choose project parent folder" });
+            return typeof selected === "string" ? selected : null;
+          }}
+          onSubmit={submitProjectSetup}
+        />
+      )}
     </main>
   );
+}
+
+function applyOrtho(
+  point: [number, number],
+  base: [number, number] | null,
+  enabled: boolean,
+): [number, number] {
+  if (!enabled || base === null) return point;
+  return Math.abs(point[0] - base[0]) >= Math.abs(point[1] - base[1])
+    ? [point[0], base[1]]
+    : [base[0], point[1]];
 }
 
 function entityAnchor(entity: EditorEntity | null): { x: number; y: number } {
@@ -2631,6 +3248,91 @@ function DraftOverlay(props: {
       )}
     </svg>
   );
+}
+
+function asCadPoint(value: unknown): [number, number] | null {
+  return Array.isArray(value) && value.length === 2 && value.every(n => typeof n === "number" && Number.isFinite(n)) ? value as [number, number] : null;
+}
+
+function newDraftEntityId(): string {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let value = 0n;
+  for (const byte of crypto.getRandomValues(new Uint8Array(16))) value = (value << 8n) | BigInt(byte);
+  let encoded = "";
+  for (let i = 0; i < 26; i++) { encoded = alphabet[Number(value & 31n)] + encoded; value >>= 5n; }
+  return `ent_${encoded}`;
+}
+
+function dimensionReferences(value: unknown, entityId: string): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if ("entity_id" in value && value.entity_id === entityId) return true;
+  return Object.values(value).some(child => dimensionReferences(child, entityId));
+}
+
+function entityVertices(entity: EditorEntity): [number, number][] {
+  if (entity.type === "line") return [asCadPoint(entity.p1), asCadPoint(entity.p2)].filter((p): p is [number, number] => p !== null);
+  if (entity.type === "polyline" && Array.isArray(entity.points)) return entity.points.map(asCadPoint).filter((p): p is [number, number] => p !== null);
+  return [];
+}
+
+function entityEditableInView(entity: EditorEntity, artifacts: Artifacts): boolean {
+  const layer = artifacts.layers.layers.find(layer => layer.id === entity.layer);
+  const group = artifacts.layers.groups.find(group => group.id === layer?.group);
+  return layer !== undefined && layer.visible && !layer.locked && group?.visible !== false && group?.locked !== true;
+}
+
+function offsetSide(entity: EditorEntity | undefined, point: [number, number]): number {
+  if (entity === undefined) return 1;
+  const center = asCadPoint(entity.center);
+  if (center !== null && typeof entity.radius === "number") return pointArrayDistance(center, point) >= entity.radius ? 1 : -1;
+  const vertices = entityVertices(entity);
+  if (entity.type === "polyline" && entity.closed === true && vertices.length > 2 && pointArrayDistance(vertices[0], vertices[vertices.length - 1]) > 1e-9) vertices.push(vertices[0]);
+  let best = Infinity, side = 1;
+  for (let i = 1; i < vertices.length; i++) {
+    const a = vertices[i - 1], b = vertices[i];
+    const dx = b[0] - a[0], dy = b[1] - a[1], length2 = dx * dx + dy * dy;
+    if (length2 === 0) continue;
+    const t = Math.max(0, Math.min(1, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length2));
+    const distance = Math.hypot(point[0] - a[0] - t * dx, point[1] - a[1] - t * dy);
+    if (distance < best) { best = distance; side = dx * (point[1] - a[1]) - dy * (point[0] - a[0]) >= 0 ? 1 : -1; }
+  }
+  return side;
+}
+
+function dimensionAnchorAt(artifacts: Artifacts, point: [number, number]): Record<string, unknown> {
+  for (const entity of artifacts.editor.entities) {
+    const layer = artifacts.layers.layers.find(layer => layer.id === entity.layer);
+    const group = artifacts.layers.groups.find(group => group.id === layer?.group);
+    if (!layer?.visible || group?.visible === false) continue;
+    for (const [index, vertex] of entityVertices(entity).entries()) {
+      if (pointArrayDistance(vertex, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature: entity.type === "line" ? index === 0 ? "start" : "end" : "vertex", ...(entity.type === "polyline" ? { index } : {}) };
+    }
+    const center = asCadPoint(entity.center);
+    if (center !== null && ["circle", "arc"].includes(entity.type)) {
+      if (pointArrayDistance(center, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature: "center" };
+      if (entity.type === "arc" && typeof entity.radius === "number") for (const feature of ["start", "end"] as const) {
+        const angle = Number(entity[`${feature}_deg`]) * Math.PI / 180;
+        const endpoint: [number, number] = [center[0] + entity.radius * Math.cos(angle), center[1] + entity.radius * Math.sin(angle)];
+        if (pointArrayDistance(endpoint, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature };
+      }
+    }
+  }
+  return { kind: "fixed", point };
+}
+
+function translateEditorEntity(entity: EditorEntity, delta: [number, number]): EditorEntity | null {
+  const result = structuredClone(entity);
+  const move = (point: [number, number]): [number, number] => [point[0] + delta[0], point[1] + delta[1]];
+  if (["line", "polyline"].includes(entity.type)) {
+    if (entity.type === "line") { result.p1 = move(asCadPoint(entity.p1)!); result.p2 = move(asCadPoint(entity.p2)!); }
+    else result.points = entityVertices(entity).map(move);
+    return result;
+  }
+  for (const field of ["at", "center"]) {
+    const point = asCadPoint(entity[field]);
+    if (point !== null) { result[field] = move(point); return result; }
+  }
+  return null;
 }
 
 type PropertyPath = Array<string | number>;
@@ -2986,6 +3688,82 @@ function LayerWorkspace(props: {
   );
 }
 
+function ProjectSetupDialog(props: {
+  mode: ProjectSetupMode;
+  busy: boolean;
+  drawingNames: string[];
+  onCancel: () => void;
+  onChooseParent: () => Promise<string | null>;
+  onSubmit: (values: {
+    parentDir: string;
+    folderName: string;
+    projectName: string;
+    drawing: string;
+    paper: string;
+    orientation: "landscape" | "portrait";
+    scaleDenominator: number;
+    sourceDrawing: string;
+  }) => void | Promise<void>;
+}) {
+  const { mode, busy, drawingNames, onCancel, onChooseParent, onSubmit } = props;
+  const [parentDir, setParentDir] = useState("");
+  const [folderName, setFolderName] = useState("my-cad-project");
+  const [projectName, setProjectName] = useState("My CAD Project");
+  const [drawing, setDrawing] = useState(mode === "new" ? "plan" : "new-drawing");
+  const [paper, setPaper] = useState("A3");
+  const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
+  const [scaleDenominator, setScaleDenominator] = useState(100);
+  const [sourceDrawing, setSourceDrawing] = useState(drawingNames[0] ?? "");
+  const title = mode === "new" ? "New Project" : mode === "add" ? "Add Drawing" : "Duplicate Drawing";
+  const valid = drawing.trim() !== ""
+    && (mode !== "new" || (parentDir !== "" && folderName.trim() !== "" && projectName.trim() !== ""))
+    && (mode !== "duplicate" || sourceDrawing !== "");
+
+  return (
+    <div class="dialog-backdrop" role="presentation">
+      <section class="export-dialog project-setup-dialog" role="dialog" aria-modal="true" aria-labelledby="project-setup-title">
+        <header>
+          <div>
+            <p class="eyebrow">Canonical CAD source</p>
+            <h2 id="project-setup-title">{title}</h2>
+          </div>
+          <button type="button" class="tool-button" disabled={busy} onClick={onCancel}>Close</button>
+        </header>
+        {mode === "new" && (
+          <>
+            <label class="field-label">
+              Parent folder
+              <span class="folder-picker-row">
+                <input value={parentDir} readOnly placeholder="Choose a folder" />
+                <button type="button" class="tool-button" disabled={busy} onClick={() => void onChooseParent().then((path) => path !== null && setParentDir(path))}>Choose</button>
+              </span>
+            </label>
+            <label class="field-label">Project folder<input value={folderName} onInput={(event) => setFolderName(event.currentTarget.value)} /></label>
+            <label class="field-label">Project name<input value={projectName} onInput={(event) => setProjectName(event.currentTarget.value)} /></label>
+          </>
+        )}
+        {mode === "duplicate" && (
+          <label class="field-label">Source drawing<select value={sourceDrawing} onChange={(event) => setSourceDrawing(event.currentTarget.value)}>{drawingNames.map((name) => <option value={name} key={name}>{name}</option>)}</select></label>
+        )}
+        <label class="field-label">New drawing name<input value={drawing} onInput={(event) => setDrawing(event.currentTarget.value)} /></label>
+        {mode !== "duplicate" && (
+          <div class="template-grid">
+            <label class="field-label">Paper<select value={paper} onChange={(event) => setPaper(event.currentTarget.value)}><option>A3</option><option>A4</option></select></label>
+            <label class="field-label">Orientation<select value={orientation} onChange={(event) => setOrientation(event.currentTarget.value as "landscape" | "portrait")}><option value="landscape">Landscape</option><option value="portrait">Portrait</option></select></label>
+            <label class="field-label">Scale<select value={scaleDenominator} onChange={(event) => setScaleDenominator(Number(event.currentTarget.value))}>{[20, 50, 100, 200].map((value) => <option value={value} key={value}>1:{value}</option>)}</select></label>
+          </div>
+        )}
+        <footer>
+          <button type="button" class="tool-button primary" disabled={busy || !valid} onClick={() => void onSubmit({ parentDir, folderName, projectName, drawing, paper, orientation, scaleDenominator, sourceDrawing })}>
+            <FilePlus2 size={16} aria-hidden="true" />
+            {busy ? "Working" : title}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function ExportJwwDialog(props: {
   drawingNames: string[];
   busy: boolean;
@@ -3330,6 +4108,7 @@ async function loadArtifacts(): Promise<Artifacts> {
       text_styles: [],
       dimension_styles: [],
       pens: [],
+      fills: [],
     },
     blocks: [],
     layouts: [],

@@ -8,15 +8,9 @@ use rustix::io::Errno;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
-pub const CRATE_NAME: &str = "cad-export-jww";
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExportOptions {
@@ -79,6 +73,15 @@ pub enum ExportError {
     OutputExists(PathBuf),
     #[error("failed to encode JWW")]
     Codec(#[from] cad_jww_codec::CodecError),
+    #[error("failed to encode JWW compatibility report")]
+    Report(#[from] serde_json::Error),
+    #[error("invalid export destination: {0}")]
+    InvalidDestination(String),
+    #[error("{original}; recovery required: {details}")]
+    RecoveryRequired {
+        original: Box<ExportError>,
+        details: String,
+    },
     #[error("failed to write {path}")]
     Write {
         path: PathBuf,
@@ -166,6 +169,58 @@ pub fn export_jww_file_auto(
     )
 }
 
+pub fn export_jww_file_with_report(
+    project_path: impl AsRef<Path>,
+    drawing_name: &str,
+    output_path: impl AsRef<Path>,
+    report_path: impl AsRef<Path>,
+    options: ExportOptions,
+) -> ExportResult<ExportReport> {
+    export_with_report_pair(
+        project_path.as_ref(),
+        output_path.as_ref(),
+        report_path.as_ref(),
+        options.overwrite,
+        |staged_output| {
+            export_jww_file(
+                project_path.as_ref(),
+                drawing_name,
+                staged_output,
+                ExportOptions {
+                    overwrite: true,
+                    ..options
+                },
+            )
+        },
+    )
+}
+
+pub fn export_jww_file_auto_with_report(
+    project_path: impl AsRef<Path>,
+    drawing_name: &str,
+    output_path: impl AsRef<Path>,
+    report_path: impl AsRef<Path>,
+    options: AutoExportOptions,
+) -> ExportResult<ExportReport> {
+    export_with_report_pair(
+        project_path.as_ref(),
+        output_path.as_ref(),
+        report_path.as_ref(),
+        options.overwrite,
+        |staged_output| {
+            export_jww_file_auto(
+                project_path.as_ref(),
+                drawing_name,
+                staged_output,
+                AutoExportOptions {
+                    overwrite: true,
+                    ..options
+                },
+            )
+        },
+    )
+}
+
 pub fn extract_original_jww(
     project_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -190,6 +245,24 @@ pub fn export_jww_file_preserving(
         output_path,
         overwrite,
         false,
+    )
+}
+
+pub fn export_jww_file_preserving_with_report(
+    project_path: impl AsRef<Path>,
+    drawing_name: &str,
+    output_path: impl AsRef<Path>,
+    report_path: impl AsRef<Path>,
+    overwrite: bool,
+) -> ExportResult<ExportReport> {
+    export_with_report_pair(
+        project_path.as_ref(),
+        output_path.as_ref(),
+        report_path.as_ref(),
+        overwrite,
+        |staged_output| {
+            export_jww_file_preserving(project_path.as_ref(), drawing_name, staged_output, true)
+        },
     )
 }
 
@@ -222,7 +295,7 @@ pub fn export_jww_file_preserving_with_options(
         ensure_preservation_snapshot_current(project_path, &snapshot.source_manifest)?;
         publish(output_path, &snapshot.original_bytes, overwrite)?;
         return Ok(ExportReport {
-            schema_version: "0.2".to_owned(),
+            schema_version: "0.3".to_owned(),
             status: ExportStatus::Exported,
             mode: ExportMode::PreservedExact,
             output_path: output_path.display().to_string(),
@@ -272,7 +345,7 @@ pub fn export_jww_file_preserving_with_options(
             );
         }
         return Ok(ExportReport {
-            schema_version: "0.2".to_owned(),
+            schema_version: "0.3".to_owned(),
             status: ExportStatus::Blocked,
             mode: ExportMode::PreservedEdited,
             output_path: output_path.display().to_string(),
@@ -432,7 +505,7 @@ fn ensure_preservation_snapshot_current(
 
 fn preserved_blocked_report(output_path: &Path, blockers: Vec<ExportIssue>) -> ExportReport {
     ExportReport {
-        schema_version: "0.2".to_owned(),
+        schema_version: "0.3".to_owned(),
         status: ExportStatus::Blocked,
         mode: ExportMode::PreservedEdited,
         output_path: output_path.display().to_string(),
@@ -652,7 +725,7 @@ fn build_preserved_document(
         ExportStatus::Blocked
     };
     let report = ExportReport {
-        schema_version: "0.2".to_owned(),
+        schema_version: "0.3".to_owned(),
         status,
         mode: ExportMode::PreservedEdited,
         output_path: output_path.display().to_string(),
@@ -715,7 +788,7 @@ fn convert_preserved_entities<'a>(
                 });
                 continue;
             }
-            match preserved_dimension_with_value(original, entity) {
+            match preserved_dimension_with_value(project, original, entity) {
                 Ok(record) => output.push(record),
                 Err(message) => context.blockers.push(ExportIssue {
                     code: "unsupported_dimension_edit".to_owned(),
@@ -821,13 +894,15 @@ fn dimension_differs_only_by_value(
     canonical == current
 }
 
-fn preserved_dimension_with_value(original: &Record, entity: &Entity) -> Result<Record, String> {
-    let Entity::Dimension { p1, p2, value, .. } = entity else {
+fn preserved_dimension_with_value(
+    project: &ProjectSource,
+    original: &Record,
+    entity: &Entity,
+) -> Result<Record, String> {
+    let Entity::Dimension { .. } = entity else {
         return Err("the preserved dimension changed CAD entity type".to_owned());
     };
-    let label = value.clone().unwrap_or_else(|| {
-        cad_model::format_decimal_mm(((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt())
-    });
+    let label = cad_model::evaluate_dimension(project, entity)?.label;
     if SHIFT_JIS.encode(&label).2 {
         return Err(format!(
             "dimension text {label:?} cannot be represented in CP932"
@@ -980,19 +1055,6 @@ fn merge_preserved_record(original: &Record, generated: Record) -> Option<Record
         | (Record::Block { .. }, value @ Record::Block { .. }) => Some(value),
         _ => None,
     }
-}
-
-pub fn export_loaded_project(
-    project: &ProjectSource,
-    drawing_name: &str,
-    output_path: &Path,
-    options: ExportOptions,
-) -> ExportResult<ExportReport> {
-    let prepared = prepare_loaded_project(project, drawing_name, output_path, options)?;
-    if let Some(bytes) = prepared.bytes {
-        publish(output_path, &bytes, options.overwrite)?;
-    }
-    Ok(prepared.report)
 }
 
 struct PreparedJwwExport {
@@ -1157,7 +1219,7 @@ impl<'a> ExportContext<'a> {
 
     fn report(self, status: ExportStatus, written: usize, expanded: usize) -> ExportReport {
         ExportReport {
-            schema_version: "0.2".to_owned(),
+            schema_version: "0.3".to_owned(),
             status,
             mode: if self.options.strict_approximations {
                 ExportMode::GeneratedStrict
@@ -1354,7 +1416,7 @@ fn convert_entity(
                     p2: pair[1],
                 });
             }
-            if *closed && points.len() > 2 {
+            if *closed && points.len() > 2 && points.last() != points.first() {
                 records.push(Record::Line {
                     base,
                     p1: *points.last().expect("nonempty"),
@@ -1443,6 +1505,33 @@ fn convert_entity(
             ));
         }
         Entity::Dimension {
+            measurement: Some(_),
+            ..
+        } => {
+            let primitives = match cad_model::dimension_primitives(project, entity) {
+                Ok(primitives) => primitives,
+                Err(message) => {
+                    context.fatal(Some(entity), "dimension.invalid_reference", message);
+                    return;
+                }
+            };
+            context.approximate(
+                Some(entity),
+                "dimension_geometry_expanded",
+                "Dimension is expanded to evaluated lines, arcs and text.".to_owned(),
+            );
+            for primitive in primitives {
+                convert_entity(
+                    project,
+                    &primitive,
+                    layer_slots,
+                    block_numbers,
+                    records,
+                    context,
+                );
+            }
+        }
+        Entity::Dimension {
             style,
             p1,
             p2,
@@ -1495,14 +1584,21 @@ fn convert_entity(
                 );
                 return;
             };
-            let label = value.clone().unwrap_or_else(|| {
-                cad_model::format_decimal_mm(
-                    ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt(),
-                )
-            });
+            let label = match cad_model::evaluate_dimension(project, entity) {
+                Ok(evaluated) => value.clone().unwrap_or(evaluated.label),
+                Err(message) => {
+                    context.fatal(Some(entity), "dimension.invalid_reference", message);
+                    return;
+                }
+            };
             let text = text_record(
                 base,
-                [(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+                cad_model::dimension_text_anchor(
+                    [(d1[0] + d2[0]) / 2.0, (d1[1] + d2[1]) / 2.0],
+                    &label,
+                    text_style,
+                    *text_rotation_deg,
+                ),
                 *text_rotation_deg,
                 &label,
                 text_style,
@@ -1613,6 +1709,8 @@ fn convert_entity(
             at,
             rotation_deg,
             scale,
+            mirror_x,
+            mirror_y,
             ..
         } => {
             let Some(def_number) = block_numbers.get(block).copied() else {
@@ -1630,16 +1728,18 @@ fn convert_entity(
                 .unwrap_or([0.0, 0.0]);
             let angle = rotation_deg.to_radians();
             let (sin, cos) = angle.sin_cos();
+            let sx = scale * if *mirror_x { -1.0 } else { 1.0 };
+            let sy = scale * if *mirror_y { -1.0 } else { 1.0 };
             let base_offset = [
-                scale * (base_point[0] * cos - base_point[1] * sin),
-                scale * (base_point[0] * sin + base_point[1] * cos),
+                sx * base_point[0] * cos - sy * base_point[1] * sin,
+                sx * base_point[0] * sin + sy * base_point[1] * cos,
             ];
             records.push(Record::Block {
                 base,
                 ref_x: at[0] - base_offset[0],
                 ref_y: at[1] - base_offset[1],
-                scale_x: *scale,
-                scale_y: *scale,
+                scale_x: sx,
+                scale_y: sy,
                 rotation: rotation_deg.to_radians(),
                 def_number,
             });
@@ -1652,6 +1752,10 @@ fn convert_entity(
             fill,
             ..
         } => {
+            if let Err(error) = cad_model::validate_hatch(project, entity) {
+                context.fatal(Some(entity), "hatch.invalid", error.to_string());
+                return;
+            }
             if loops.is_empty() {
                 context.block(
                     Some(entity),
@@ -1660,7 +1764,7 @@ fn convert_entity(
                 );
                 return;
             }
-            if loops.len() > 1 {
+            if pattern == "solid" && loops.len() > 1 {
                 context.approximate(
                     Some(entity),
                     "hatch_loops_approximated",
@@ -1681,13 +1785,48 @@ fn convert_entity(
                 );
                 return;
             };
-            context.approximate(
-                Some(entity),
-                "hatch_pattern_approximated",
-                format!(
-                    "hatch pattern {pattern:?}, angle {angle_deg}, and scale {scale} are emitted as solid polygon fill"
-                ),
-            );
+            if pattern != "solid" {
+                context.approximate(
+                    Some(entity),
+                    "hatch_pattern_expanded",
+                    format!(
+                        "hatch pattern {pattern:?}, angle {angle_deg}, and model-space pitch {scale} are expanded to clipped JWW lines"
+                    ),
+                );
+                if context.options.strict_approximations {
+                    return;
+                }
+                let Some(pen_color) = stroke_color_number(
+                    project,
+                    fill.as_deref().expect("validated hatch fill"),
+                    entity,
+                    context,
+                ) else {
+                    return;
+                };
+                let line_base = Base { pen_color, ..base };
+                let mut families = vec![*angle_deg];
+                if pattern == "cross" {
+                    families.push(angle_deg.rem_euclid(360.0) + 90.0);
+                }
+                for angle in families {
+                    let segments = match cad_model::hatch_line_segments(loops, angle, *scale) {
+                        Ok(segments) => segments,
+                        Err(error) => {
+                            context.fatal(Some(entity), "hatch.invalid", error.to_string());
+                            return;
+                        }
+                    };
+                    for (p1, p2) in segments {
+                        records.push(Record::Line {
+                            base: line_base,
+                            p1,
+                            p2,
+                        });
+                    }
+                }
+                return;
+            }
             for loop_points in loops {
                 if loop_points.len() < 3
                     || loop_points
@@ -1949,16 +2088,7 @@ fn paper_code(paper: &str, context: &mut ExportContext<'_>) -> u32 {
 }
 
 fn parse_layout_scale(scale: &str, context: &mut ExportContext<'_>) -> Option<f64> {
-    let scale = scale.trim();
-    let value = scale
-        .strip_prefix("1/")
-        .and_then(|value| value.parse::<f64>().ok())
-        .or_else(|| {
-            scale
-                .strip_prefix("1:")
-                .and_then(|value| value.parse::<f64>().ok())
-        })
-        .or_else(|| scale.parse::<f64>().ok());
+    let value = cad_model::parse_layout_scale(scale);
     match value {
         Some(value) if value.is_finite() && value > 0.0 => Some(value),
         _ => {
@@ -2012,6 +2142,379 @@ fn cp932_text(value: &str, entity: Option<&Entity>, context: &mut ExportContext<
     }
 }
 
+fn export_with_report_pair(
+    project_path: &Path,
+    output_path: &Path,
+    report_path: &Path,
+    overwrite: bool,
+    export_to: impl FnOnce(&Path) -> ExportResult<ExportReport>,
+) -> ExportResult<ExportReport> {
+    validate_export_targets(output_path, report_path)?;
+    if !overwrite {
+        for path in [output_path, report_path] {
+            if path.exists() {
+                return Err(ExportError::OutputExists(path.to_path_buf()));
+            }
+        }
+    }
+    let expected_manifest = cad_model::source_manifest(project_path)?;
+    let output_parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent).map_err(|source| ExportError::Write {
+        path: output_parent.to_path_buf(),
+        source,
+    })?;
+    let staging_dir = tempfile::Builder::new()
+        .prefix(".cad-jww-pair-")
+        .tempdir_in(output_parent)
+        .map_err(|source| ExportError::Write {
+            path: output_parent.to_path_buf(),
+            source,
+        })?;
+    let staged_output = staging_dir.path().join("output.jww");
+    let mut report = export_to(&staged_output)?;
+    report.output_path = output_path.display().to_string();
+    let output_bytes = if report.status == ExportStatus::Exported {
+        Some(
+            fs::read(&staged_output).map_err(|source| ExportError::Write {
+                path: staged_output.clone(),
+                source,
+            })?,
+        )
+    } else {
+        None
+    };
+    let mut report_bytes = serde_json::to_vec_pretty(&report)?;
+    report_bytes.push(b'\n');
+    ensure_preservation_snapshot_current(project_path, &expected_manifest)?;
+    publish_pair(
+        output_path,
+        output_bytes.as_deref(),
+        report_path,
+        &report_bytes,
+        overwrite,
+    )?;
+    Ok(report)
+}
+
+fn staged_file(path: &Path, bytes: &[u8]) -> ExportResult<tempfile::NamedTempFile> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| ExportError::Write {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let mut staging = tempfile::Builder::new()
+        .prefix(".cad-jww-publish-")
+        .tempfile_in(parent)
+        .map_err(|source| ExportError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    staging
+        .write_all(bytes)
+        .map_err(|source| ExportError::Write {
+            path: staging.path().to_path_buf(),
+            source,
+        })?;
+    staging
+        .as_file()
+        .sync_all()
+        .map_err(|source| ExportError::Write {
+            path: staging.path().to_path_buf(),
+            source,
+        })?;
+    Ok(staging)
+}
+
+fn checked_metadata(path: &Path) -> ExportResult<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(ExportError::InvalidDestination(format!(
+            "{} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ExportError::Write {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn resolved_destination(path: &Path) -> ExportResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| ExportError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            component => {
+                resolved.push(component.as_os_str());
+                match fs::canonicalize(&resolved) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(ExportError::Write {
+                            path: resolved,
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
+/// Validates both destinations before any existing output is changed.
+pub fn validate_export_targets(output: &Path, report: &Path) -> ExportResult<()> {
+    let left = checked_metadata(output)?;
+    let right = checked_metadata(report)?;
+    if resolved_destination(output)? == resolved_destination(report)?
+        || left
+            .as_ref()
+            .zip(right.as_ref())
+            .is_some_and(|(left, right)| same_file(left, right))
+    {
+        return Err(ExportError::InvalidDestination(
+            "JWW and compatibility report paths must differ".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+struct PublicationTarget<'a> {
+    path: &'a Path,
+    backup: Option<tempfile::TempPath>,
+    published: Option<fs::Metadata>,
+}
+
+impl<'a> PublicationTarget<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            backup: None,
+            published: None,
+        }
+    }
+
+    fn backup(&mut self) -> ExportResult<()> {
+        if checked_metadata(self.path)?.is_none() {
+            return Ok(());
+        }
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup = tempfile::Builder::new()
+            .prefix(".cad-jww-backup-")
+            .tempfile_in(parent)
+            .map_err(|source| ExportError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?
+            .into_temp_path();
+        fs::rename(self.path, &backup).map_err(|source| ExportError::Write {
+            path: self.path.to_path_buf(),
+            source,
+        })?;
+        self.backup = Some(backup);
+        Ok(())
+    }
+
+    fn publish(&mut self, staging: tempfile::NamedTempFile) -> ExportResult<()> {
+        let identity = staging
+            .as_file()
+            .metadata()
+            .map_err(|source| ExportError::Write {
+                path: self.path.to_path_buf(),
+                source,
+            })?;
+        // Even overwrite exports must not replace a new file created after backup.
+        renameat_with(CWD, staging.path(), CWD, self.path, RenameFlags::NOREPLACE).map_err(
+            |error| {
+                if error == Errno::EXIST || error == Errno::NOTEMPTY {
+                    ExportError::OutputExists(self.path.to_path_buf())
+                } else {
+                    ExportError::Write {
+                        path: self.path.to_path_buf(),
+                        source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+                    }
+                }
+            },
+        )?;
+        self.published = Some(identity);
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), String> {
+        // Keep the backup before attempting recovery; a failed recovery must never
+        // let TempPath's destructor delete the only remaining original.
+        let backup = self
+            .backup
+            .take()
+            .map(|mut backup| {
+                backup.disable_cleanup(true);
+                backup
+                    .keep()
+                    .map_err(|error| format!("{}; backup: {}", error.error, error.path.display()))
+            })
+            .transpose()?;
+        let restore = || -> std::io::Result<()> {
+            if let Some(identity) = &self.published {
+                match fs::symlink_metadata(self.path) {
+                    Ok(current) if same_file(identity, &current) => fs::remove_file(self.path)?,
+                    Ok(_) => {
+                        return Err(std::io::Error::other(
+                            "published output was replaced externally",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(backup) = &backup {
+                renameat_with(CWD, backup, CWD, self.path, RenameFlags::NOREPLACE)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+            }
+            Ok(())
+        };
+        restore().map_err(|error| {
+            format!(
+                "{}: {error}; backup: {}",
+                self.path.display(),
+                backup
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+            )
+        })
+    }
+}
+
+fn rollback_pair(
+    original: ExportError,
+    output: &mut PublicationTarget<'_>,
+    report: &mut PublicationTarget<'_>,
+) -> ExportError {
+    let errors = [output.rollback(), report.rollback()]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        original
+    } else {
+        ExportError::RecoveryRequired {
+            original: Box::new(original),
+            details: errors.join("; "),
+        }
+    }
+}
+
+fn publish_pair(
+    output_path: &Path,
+    output_bytes: Option<&[u8]>,
+    report_path: &Path,
+    report_bytes: &[u8],
+    overwrite: bool,
+) -> ExportResult<()> {
+    publish_pair_with_hook(
+        output_path,
+        output_bytes,
+        report_path,
+        report_bytes,
+        overwrite,
+        || Ok(()),
+    )
+}
+
+fn publish_pair_with_hook(
+    output_path: &Path,
+    output_bytes: Option<&[u8]>,
+    report_path: &Path,
+    report_bytes: &[u8],
+    overwrite: bool,
+    after_report_publish: impl FnOnce() -> ExportResult<()>,
+) -> ExportResult<()> {
+    publish_pair_with_hooks(
+        output_path,
+        output_bytes,
+        report_path,
+        report_bytes,
+        overwrite,
+        || Ok(()),
+        after_report_publish,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_pair_with_hooks(
+    output_path: &Path,
+    output_bytes: Option<&[u8]>,
+    report_path: &Path,
+    report_bytes: &[u8],
+    overwrite: bool,
+    before_report_publish: impl FnOnce() -> ExportResult<()>,
+    after_report_publish: impl FnOnce() -> ExportResult<()>,
+) -> ExportResult<()> {
+    validate_export_targets(output_path, report_path)?;
+    let staged_report = staged_file(report_path, report_bytes)?;
+    let staged_output = output_bytes
+        .map(|bytes| staged_file(output_path, bytes))
+        .transpose()?;
+    if !overwrite {
+        for path in [output_path, report_path] {
+            if checked_metadata(path)?.is_some() {
+                return Err(ExportError::OutputExists(path.to_path_buf()));
+            }
+        }
+    }
+    let mut report = PublicationTarget::new(report_path);
+    let mut output = PublicationTarget::new(output_path);
+    let result = (|| {
+        if overwrite {
+            report.backup()?;
+            if staged_output.is_some() {
+                output.backup()?;
+            }
+        }
+        before_report_publish()?;
+        report.publish(staged_report)?;
+        after_report_publish()?;
+        if let Some(staging) = staged_output {
+            output.publish(staging)?;
+        }
+        Ok(())
+    })();
+    result.map_err(|error| rollback_pair(error, &mut output, &mut report))
+}
 fn publish(output: &Path, bytes: &[u8], overwrite: bool) -> ExportResult<()> {
     let parent = output
         .parent()
@@ -2058,9 +2561,397 @@ fn publish(output: &Path, bytes: &[u8], overwrite: bool) -> ExportResult<()> {
 mod tests {
     use super::*;
 
+    fn export_fixture(
+        project: &ProjectSource,
+        drawing_name: &str,
+        output_path: &Path,
+        options: ExportOptions,
+    ) -> ExportResult<ExportReport> {
+        let prepared = prepare_loaded_project(project, drawing_name, output_path, options)?;
+        if let Some(bytes) = prepared.bytes {
+            super::publish(output_path, &bytes, options.overwrite)?;
+        }
+        Ok(prepared.report)
+    }
+
     #[test]
-    fn exposes_crate_name() {
-        assert_eq!(crate_name(), "cad-export-jww");
+    fn acceptance_drawing_exports_report_and_reflected_blocks() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("acceptance.jww");
+        let report_path = temp.path().join("acceptance.report.json");
+        let report = export_jww_file_auto_with_report(
+            &root,
+            "acceptance",
+            &output,
+            &report_path,
+            AutoExportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.status,
+            ExportStatus::Exported,
+            "{:?}",
+            report.blockers
+        );
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|issue| issue.code == "dimension_geometry_expanded")
+                .count(),
+            6
+        );
+        assert!(report_path.exists());
+        let decoded = cad_jww_codec::read_document(&fs::read(&output).unwrap()).unwrap();
+        assert!(decoded.entities.iter().all(|entity| match entity {
+            cad_jww_codec::DecodedEntity::Line(line) =>
+                line.base.pen_color != 10 && line.start != line.end,
+            _ => true,
+        }));
+        let blocks = decoded
+            .entities
+            .iter()
+            .filter_map(|entity| {
+                if let cad_jww_codec::DecodedEntity::Block(block) = entity {
+                    Some(block)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!((blocks[1].scale_x, blocks[1].scale_y), (-1.0, -1.0));
+        assert_eq!((blocks[2].scale_x, blocks[2].scale_y), (-1.0, 1.0));
+        assert!(
+            decoded
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, cad_jww_codec::DecodedEntity::Arc(_)))
+        );
+        assert!(
+            decoded
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, cad_jww_codec::DecodedEntity::Text(_)))
+        );
+        let imported_root = temp.path().join("reimported");
+        cad_import_jww::import_jww_file(&output, &imported_root).unwrap();
+        assert!(cad_check::check_project(&imported_root).is_ok());
+        let imported = cad_model::load_project(&imported_root).unwrap();
+        let entities = &imported.drawings[0].entities;
+        assert_eq!(entities.len(), decoded.entities.len());
+        assert!(entities.iter().any(|record| matches!(&record.entity,
+            Entity::Line { p1, p2, .. } if *p1 == [6000.,0.] && *p2 == [7500.,0.])));
+        assert!(entities.iter().any(|record| matches!(&record.entity,
+            Entity::Circle { center, radius, .. } if *center == [7000.,3000.] && *radius == 600.)));
+        assert!(entities.iter().any(|record| matches!(&record.entity,
+            Entity::Arc { center, radius, start_deg, end_deg, .. } if *center == [9000.,3000.] && *radius == 500. && (*start_deg - 90.).abs() < 1e-6 && end_deg.abs() < 1e-6)));
+        let dashed = entities
+            .iter()
+            .find(|record| {
+                matches!(&record.entity,
+            Entity::Line { p1, p2, .. } if *p1 == [0.,2000.] && *p2 == [5000.,2000.])
+            })
+            .unwrap();
+        let pen_name = serde_json::to_value(&dashed.entity).unwrap()["pen"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let pen = &imported.styles.pens[&pen_name];
+        assert_eq!(pen.line_width, 0.18);
+        assert!(imported.styles.line_types[&pen.line_type].dash.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "unsupported_line_type"
+                    && issue.entity_id.as_deref() == Some("ent_01JZ0000000000000000000105"))
+        );
+    }
+
+    #[test]
+    fn associative_dimensions_expand_and_strict_export_preserves_existing_output() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).unwrap();
+        let entity: Entity = serde_json::from_value(serde_json::json!({
+            "schema_version":cad_model::CURRENT_SCHEMA_VERSION,"id":"ent_01JZ0000000000000000000099","type":"dimension","layer":"0-1","style":"dim_100",
+            "p1":[0,0],"p2":[1,0],"offset":100,"value":null,
+            "measurement":{"kind":"horizontal","first":{"kind":"entity","entity_id":"ent_01JZ0000000000000000000000","feature":"start"},"second":{"kind":"entity","entity_id":"ent_01JZ0000000000000000000000","feature":"end"}}
+        })).unwrap();
+        project.drawings[0]
+            .entities
+            .push(cad_model::EntityRecord { line: 99, entity });
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("dimension.jww");
+        let report =
+            export_fixture(&project, "plan_1f", &output, ExportOptions::default()).unwrap();
+        assert_eq!(report.status, ExportStatus::Exported);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "dimension_geometry_expanded"
+                    && issue.entity_id.as_deref() == Some("ent_01JZ0000000000000000000099"))
+        );
+        let original = fs::read(&output).unwrap();
+        let report = export_fixture(
+            &project,
+            "plan_1f",
+            &output,
+            ExportOptions {
+                overwrite: true,
+                strict_approximations: true,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.status, ExportStatus::Blocked);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|issue| issue.code == "dimension_geometry_expanded")
+        );
+        assert_eq!(fs::read(&output).unwrap(), original);
+        project.drawings[0].entities.remove(0);
+        let report = export_fixture(
+            &project,
+            "plan_1f",
+            &output,
+            ExportOptions {
+                overwrite: true,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.status, ExportStatus::Blocked);
+        assert_eq!(fs::read(&output).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_hatches_block_best_effort_without_overwriting() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        {
+            let (pattern, fill, width) = ("unknown", serde_json::json!("jw_black"), 10.0);
+            let mut project = cad_model::load_project(&root).unwrap();
+            let entity = serde_json::from_value(serde_json::json!({
+                "schema_version": "0.3", "id": "ent_01JZ0000000000000000000010",
+                "type": "hatch", "layer": "0-1", "loops": [[[0.0,0.0],[width,0.0],[width,10.0],[0.0,10.0]]],
+                "pattern": pattern, "angle_deg": 0.0, "scale": 1.0, "fill": fill
+            })).unwrap();
+            project.drawings[0]
+                .entities
+                .push(cad_model::EntityRecord { line: 2, entity });
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp.path().join("result.jww");
+            fs::write(&output, b"original").unwrap();
+            let report = export_fixture(
+                &project,
+                "plan_1f",
+                &output,
+                ExportOptions {
+                    allow_lossy: true,
+                    overwrite: true,
+                    strict_approximations: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(report.status, ExportStatus::Blocked);
+            assert!(
+                report
+                    .blockers
+                    .iter()
+                    .any(|issue| issue.entity_id.as_deref()
+                        == Some("ent_01JZ0000000000000000000010"))
+            );
+            assert_eq!(fs::read(output).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn paired_publish_replaces_both_outputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("drawing.jww");
+        let report = temp.path().join("drawing.jww.report.json");
+        fs::write(&output, b"old-jww").expect("old jww");
+        fs::write(&report, b"old-report").expect("old report");
+
+        publish_pair(&output, Some(b"new-jww"), &report, b"new-report", true)
+            .expect("publish pair");
+
+        assert_eq!(fs::read(output).expect("jww"), b"new-jww");
+        assert_eq!(fs::read(report).expect("report"), b"new-report");
+    }
+
+    #[test]
+    fn export_destinations_reject_aliases_and_non_files_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("result.jww");
+        fs::create_dir(temp.path().join("sub")).unwrap();
+        assert!(validate_export_targets(&output, &temp.path().join("sub/../result.jww")).is_err());
+        fs::write(&output, b"original").unwrap();
+        let report = temp.path().join("report");
+        fs::create_dir(&report).unwrap();
+        fs::write(report.join("keep"), b"directory contents").unwrap();
+        assert!(publish_pair(&output, Some(b"new"), &report, b"report", true).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"original");
+        assert_eq!(
+            fs::read(report.join("keep")).unwrap(),
+            b"directory contents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_destinations_reject_links_and_special_files() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("result.jww");
+        fs::write(&output, b"original").unwrap();
+        let alias = temp.path().join("alias");
+        fs::hard_link(&output, &alias).unwrap();
+        assert!(validate_export_targets(&output, &alias).is_err());
+        let link = temp.path().join("link");
+        symlink(&output, &link).unwrap();
+        assert!(publish_pair(&output, Some(b"new"), &link, b"report", true).is_err());
+        let parent_link = temp.path().join("parent-link");
+        symlink(temp.path(), &parent_link).unwrap();
+        assert!(validate_export_targets(&output, &parent_link.join("result.jww")).is_err());
+        let socket = temp.path().join("socket");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(publish_pair(&output, Some(b"new"), &socket, b"report", true).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"original");
+    }
+
+    #[test]
+    fn failed_noreplace_does_not_delete_the_competing_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("result.jww");
+        let report = temp.path().join("report.json");
+        let result = publish_pair_with_hooks(
+            &output,
+            Some(b"new"),
+            &report,
+            b"new report",
+            false,
+            || {
+                fs::write(&report, b"competitor").unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(ExportError::OutputExists(_))));
+        assert_eq!(fs::read(report).unwrap(), b"competitor");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn failed_noreplace_rolls_back_only_the_published_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("result.jww");
+        let report = temp.path().join("report.json");
+        let result =
+            publish_pair_with_hook(&output, Some(b"new"), &report, b"new report", false, || {
+                fs::write(&output, b"competitor").unwrap();
+                Ok(())
+            });
+        assert!(matches!(result, Err(ExportError::OutputExists(_))));
+        assert_eq!(fs::read(output).unwrap(), b"competitor");
+        assert!(!report.exists());
+    }
+
+    #[test]
+    fn failed_recovery_retains_backup_and_reports_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("result.jww");
+        let report = temp.path().join("report.json");
+        fs::write(&output, b"original jww").unwrap();
+        fs::write(&report, b"original report").unwrap();
+        let result =
+            publish_pair_with_hook(&output, Some(b"new"), &report, b"new report", true, || {
+                fs::create_dir(&output).unwrap();
+                Ok(())
+            });
+        let error = result.unwrap_err();
+        assert!(matches!(error, ExportError::RecoveryRequired { .. }));
+        assert!(output.is_dir());
+        assert_eq!(fs::read(&report).unwrap(), b"original report");
+        let backups = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".cad-jww-backup-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"original jww");
+        assert!(
+            error
+                .to_string()
+                .contains(&backups[0].display().to_string())
+        );
+    }
+
+    #[test]
+    fn paired_publish_rolls_back_both_outputs_after_report_failure_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("drawing.jww");
+        let report = temp.path().join("drawing.jww.report.json");
+        fs::write(&output, b"old-jww").expect("old jww");
+        fs::write(&report, b"old-report").expect("old report");
+
+        let result = publish_pair_with_hook(
+            &output,
+            Some(b"new-jww"),
+            &report,
+            b"new-report",
+            true,
+            || {
+                Err(ExportError::Write {
+                    path: PathBuf::from("injected"),
+                    source: std::io::Error::other("injected publish failure"),
+                })
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(output).expect("jww"), b"old-jww");
+        assert_eq!(fs::read(report).expect("report"), b"old-report");
+    }
+
+    #[test]
+    fn paired_publish_preflights_both_destinations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("drawing.jww");
+        let report = temp.path().join("drawing.jww.report.json");
+        fs::write(&report, b"existing-report").expect("existing report");
+
+        let result = publish_pair(&output, Some(b"new-jww"), &report, b"new-report", false);
+
+        assert!(matches!(result, Err(ExportError::OutputExists(path)) if path == report));
+        assert!(!output.exists());
+        assert_eq!(fs::read(report).expect("report"), b"existing-report");
+    }
+
+    #[test]
+    fn blocked_pair_publishes_only_the_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("drawing.jww");
+        let report = temp.path().join("drawing.jww.report.json");
+
+        publish_pair(&output, None, &report, b"blocked-report", true)
+            .expect("publish blocked report");
+
+        assert!(!output.exists());
+        assert_eq!(fs::read(&report).expect("report"), b"blocked-report");
+        fs::write(&output, b"old-jww").unwrap();
+        publish_pair(&output, None, &report, b"another-blocked-report", true).unwrap();
+        assert_eq!(fs::read(output).unwrap(), b"old-jww");
+        assert_eq!(fs::read(report).unwrap(), b"another-blocked-report");
     }
 
     #[test]
@@ -2070,45 +2961,6 @@ mod tests {
         assert_eq!(nearest_builtin_color_number("#F01010"), 2);
         assert_eq!(nearest_builtin_color_number("#FAFAFA"), 8);
         assert_eq!(nearest_builtin_color_number("invalid"), 1);
-    }
-
-    #[test]
-    fn existing_dimension_compatibility_allows_only_value_changes() {
-        let canonical = serde_json::json!({
-            "schema_version": "0.2",
-            "id": "ent_01JZ0000000000000000000006",
-            "type": "dimension",
-            "layer": "0-1",
-            "pen": "pen_1",
-            "style": "dim_100",
-            "p1": [0.0, 0.0],
-            "p2": [100.0, 0.0],
-            "offset": 10.0,
-            "text_rotation_deg": 0.0,
-            "text_mirror_y": false,
-            "value": "100"
-        });
-        let mut value_only = canonical.clone();
-        value_only["value"] = serde_json::Value::Null;
-        assert!(dimension_differs_only_by_value(&canonical, &value_only));
-
-        for (field, changed) in [
-            ("layer", serde_json::json!("0-2")),
-            ("pen", serde_json::json!("pen_2")),
-            ("style", serde_json::json!("dim_50")),
-            ("p1", serde_json::json!([1.0, 0.0])),
-            ("p2", serde_json::json!([101.0, 0.0])),
-            ("offset", serde_json::json!(11.0)),
-            ("text_rotation_deg", serde_json::json!(90.0)),
-            ("text_mirror_y", serde_json::json!(true)),
-        ] {
-            let mut current = value_only.clone();
-            current[field] = changed;
-            assert!(
-                !dimension_differs_only_by_value(&canonical, &current),
-                "{field} must be blocked"
-            );
-        }
     }
 
     #[test]
@@ -2172,25 +3024,28 @@ mod tests {
 
         assert_eq!(report.status, ExportStatus::Exported);
         assert_eq!(report.mode, ExportMode::PreservedExact);
-        let edited = cad_jww_codec::read_document(&fs::read(exported).expect("preserved output"))
-            .expect("exported document");
-        let original = cad_jww_codec::read_document(&fs::read(fixture).expect("fixture"))
-            .expect("source document");
-        assert_eq!(edited.header, original.header);
-        assert_eq!(edited.entities.len(), original.entities.len());
-        for (index, (edited, original)) in
-            edited.entities.iter().zip(&original.entities).enumerate()
-        {
-            assert_eq!(edited, original, "record {index}");
-        }
-        assert_eq!(edited.block_defs, original.block_defs);
+        assert_eq!(fs::read(exported).unwrap(), fs::read(fixture).unwrap());
+    }
+
+    fn write_minimal_line_fixture(root: &Path) -> PathBuf {
+        let path = root.join("Test1.jww");
+        let bytes = cad_jww_codec::write_document(&Document {
+            records: vec![Record::Line {
+                base: Base::default(),
+                p1: [0.0, 0.0],
+                p2: [10.0, 0.0],
+            }],
+            ..Document::default()
+        })
+        .unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
     }
 
     #[test]
     fn verified_snapshot_rejects_tampered_jww_bytes() {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
         let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = write_minimal_line_fixture(temp.path());
         let imported = temp.path().join("imported");
         cad_import_jww::import_jww_file(&fixture, &imported).expect("import");
         fs::write(
@@ -2217,36 +3072,9 @@ mod tests {
     }
 
     #[test]
-    fn final_source_manifest_conflict_preserves_existing_output() {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let imported = temp.path().join("imported");
-        cad_import_jww::import_jww_file(&fixture, &imported).expect("import");
-        let snapshot = cad_model::verified_jww_preservation_snapshot(&imported)
-            .expect("snapshot")
-            .expect("provenance");
-        let output = temp.path().join("existing.jww");
-        fs::write(&output, b"existing output").expect("existing output");
-        let entities = imported.join("drawings/test1/entities.ndjson");
-        let mut source = fs::read_to_string(&entities).expect("entities");
-        source.push(' ');
-        fs::write(&entities, source).expect("concurrent source edit");
-
-        let error = ensure_preservation_snapshot_current(&imported, &snapshot.source_manifest)
-            .expect_err("stale snapshot must fail");
-        assert!(error.to_string().contains("revision_conflict"));
-        assert_eq!(
-            fs::read(output).expect("existing output"),
-            b"existing output"
-        );
-    }
-
-    #[test]
     fn generated_fallback_rechecks_sources_before_publish() {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures/Test1.jww");
         let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = write_minimal_line_fixture(temp.path());
         let imported = temp.path().join("imported");
         cad_import_jww::import_jww_file(&fixture, &imported).expect("import");
         let expected = cad_model::source_manifest(&imported).expect("source manifest");
@@ -2457,6 +3285,7 @@ mod tests {
 
         let report = export_jww_file_preserving(&imported, "dimension", &exported, false)
             .expect("preserve export");
+        assert_eq!(report.status, ExportStatus::Exported, "{report:?}");
         let decoded = cad_jww_codec::read_document(&fs::read(exported).expect("export"))
             .expect("exported document");
         let cad_jww_codec::DecodedEntity::Dimension(dimension) = &decoded.entities[0] else {
@@ -2493,7 +3322,7 @@ mod tests {
         else {
             panic!("record must remain dimension");
         };
-        assert_eq!(measured_dimension.text.content, "100");
+        assert_eq!(measured_dimension.text.content, "100 mm");
         assert_eq!(measured_dimension.line.start, [0.0, 10.0]);
 
         value["p1"] = serde_json::json!([10.0, 0.0]);
@@ -2684,7 +3513,7 @@ mod tests {
         let block_dir = imported.join("blocks/jww_7");
         fs::write(
             block_dir.join("definition.toml"),
-            "schema_version = \"0.2\"\nname = \"renamed\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"renamed\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("rename block");
         let renamed_output = temp.path().join("renamed.jww");
@@ -2694,7 +3523,7 @@ mod tests {
 
         fs::write(
             block_dir.join("definition.toml"),
-            "schema_version = \"0.2\"\nname = \"renamed\"\nbase_point = [1.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"renamed\"\nbase_point = [1.0, 0.0]\n",
         )
         .expect("move block base");
         let base_output = temp.path().join("base-change.jww");
@@ -2728,7 +3557,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000009","type":"block_ref","layer":"0-1","block":"door","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000009","type":"block_ref","layer":"0-1","block":"door","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
         )
         .expect("block entity");
         project.drawings[0]
@@ -2736,7 +3565,7 @@ mod tests {
             .push(cad_model::EntityRecord { line: 2, entity });
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("blocked.jww");
-        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
+        let report = export_fixture(&project, "plan_1f", &output, ExportOptions::default())
             .expect("blocked report");
         assert_eq!(report.status, ExportStatus::Blocked);
         assert!(!output.exists());
@@ -2761,7 +3590,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
 
         let strict_output = temp.path().join("strict.jww");
-        let strict = export_loaded_project(
+        let strict = export_fixture(
             &project,
             "plan_1f",
             &strict_output,
@@ -2779,7 +3608,7 @@ mod tests {
         );
 
         let lossy_output = temp.path().join("lossy.jww");
-        let lossy = export_loaded_project(
+        let lossy = export_fixture(
             &project,
             "plan_1f",
             &lossy_output,
@@ -2813,8 +3642,8 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         for source in [
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000008","type":"solid","layer":"0-1","points":[[0.0,0.0],[100.0,0.0],[100.0,50.0],[0.0,50.0]],"fill":"jw_black"}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000007","type":"curve_solid","layer":"0-1","center":[200.0,200.0],"radius":100.0,"flatness":0.5,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0,"solid_param":20.0,"encoding_code":1,"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000008","type":"solid","layer":"0-1","points":[[0.0,0.0],[100.0,0.0],[100.0,50.0],[0.0,50.0]],"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000007","type":"curve_solid","layer":"0-1","center":[200.0,200.0],"radius":100.0,"flatness":0.5,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0,"solid_param":20.0,"encoding_code":1,"fill":"jw_black"}"#,
         ] {
             let entity: Entity = serde_json::from_str(source).expect("solid entity");
             project.drawings[0]
@@ -2825,7 +3654,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("solid-roundtrip.jww");
         let reimported = temp.path().join("solid-roundtrip");
-        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
+        let report = export_fixture(&project, "plan_1f", &output, ExportOptions::default())
             .expect("solid export");
         assert_eq!(report.status, ExportStatus::Exported);
         let decoded = cad_jww_codec::read_document(&fs::read(&output).expect("JWW bytes"))
@@ -2853,11 +3682,11 @@ mod tests {
     }
 
     #[test]
-    fn simple_hatch_is_emitted_as_solid_polygons_with_a_warning() {
+    fn solid_hatch_is_emitted_as_solid_polygons_without_pattern_warning() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000010","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]]],"pattern":"solid","angle_deg":30.0,"scale":2.0,"fill":"jw_black"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000010","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]]],"pattern":"solid","angle_deg":30.0,"scale":2.0,"fill":"jw_black"}"#,
         )
         .expect("hatch entity");
         project.drawings[0]
@@ -2866,14 +3695,14 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("hatch.jww");
-        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
+        let report = export_fixture(&project, "plan_1f", &output, ExportOptions::default())
             .expect("hatch export");
         assert_eq!(report.status, ExportStatus::Exported);
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|issue| issue.code == "hatch_pattern_approximated")
+                .all(|issue| issue.code != "hatch_pattern_expanded")
         );
 
         let decoded = cad_jww_codec::read_document(&fs::read(&output).expect("JWW bytes"))
@@ -2883,6 +3712,38 @@ mod tests {
                 .entities
                 .iter()
                 .any(|entity| matches!(entity, cad_jww_codec::DecodedEntity::Solid(_)))
+        );
+    }
+
+    #[test]
+    fn patterned_hatch_is_expanded_to_clipped_lines_with_a_warning() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
+        let mut project = cad_model::load_project(root).expect("example");
+        let entity: Entity = serde_json::from_str(
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000010","type":"hatch","layer":"0-1","loops":[[[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]]],"pattern":"cross","angle_deg":30.0,"scale":20.0,"fill":"jw_black"}"#,
+        )
+        .expect("hatch entity");
+        project.drawings[0]
+            .entities
+            .push(cad_model::EntityRecord { line: 2, entity });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("pattern-hatch.jww");
+        let report = export_fixture(&project, "plan_1f", &output, ExportOptions::default())
+            .expect("hatch export");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "hatch_pattern_expanded")
+        );
+        let decoded = cad_jww_codec::read_document(&fs::read(&output).expect("JWW bytes"))
+            .expect("JWW should decode");
+        assert!(
+            decoded
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, cad_jww_codec::DecodedEntity::Line(_)))
         );
     }
 
@@ -2934,7 +3795,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
         let mut project = cad_model::load_project(root).expect("example");
         let child: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000098","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000098","type":"line","layer":"0-1","p1":[10.0,20.0],"p2":[20.0,20.0]}"#,
         )
         .expect("block child");
         project.blocks.insert(
@@ -2953,7 +3814,7 @@ mod tests {
             },
         );
         let reference: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000099","type":"block_ref","layer":"0-1","block":"door_test","at":[100.0,200.0],"rotation_deg":90.0,"scale":2.0}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000099","type":"block_ref","layer":"0-1","block":"door_test","at":[100.0,200.0],"rotation_deg":90.0,"scale":2.0}"#,
         )
         .expect("block reference");
         project.drawings[0].entities.push(cad_model::EntityRecord {
@@ -2963,8 +3824,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("base-point.jww");
 
-        let report = export_loaded_project(&project, "plan_1f", &output, ExportOptions::default())
-            .expect("export");
+        let report =
+            export_fixture(&project, "plan_1f", &output, ExportOptions::default()).expect("export");
         assert_eq!(report.status, ExportStatus::Exported);
         let decoded = cad_jww_codec::read_document(
             &fs::read(output).expect("exported JWW should be readable"),

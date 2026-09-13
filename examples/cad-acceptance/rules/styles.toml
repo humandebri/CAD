@@ -1,0 +1,32 @@
+[colors.black]
+rgb = "#000000"
+print_width = 0.25
+
+[colors.gray]
+rgb = "#808080"
+print_width = 0.18
+
+[line_types.solid]
+dash = []
+
+[line_types.dashed]
+dash = [100, 50]
+
+[pens.dashed]
+color = "gray"
+line_type = "dashed"
+line_width = 0.18
+
+[text_styles.note]
+font_family = "MS Gothic"
+height = 120
+width = 60
+spacing = 0
+align = "center"
+
+[dimension_styles.dim]
+text_style = "note"
+arrow_size = 60
+extension_gap = 30
+precision = 0
+unit = "mm"

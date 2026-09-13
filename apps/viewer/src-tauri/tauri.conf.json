@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
-    "category": "DeveloperTool"
+    "category": "DeveloperTool",
+    "icon": ["icons/icon.png", "icons/icon.icns"]
   }
 }

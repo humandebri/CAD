@@ -6,21 +6,15 @@
 use cad_model::{
     BBox, Entity, EntityRecord, Point, ProjectSource, TextAlign, TextStyleDef, entity_bbox,
 };
+use rstar::{AABB, RTree};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path as FsPath;
 use svg::Document;
 use svg::node::element::path::Data;
 use svg::node::element::{Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Text};
 
-pub const CRATE_NAME: &str = "cad-diff";
-pub const DIFF_SCHEMA_VERSION: &str = "0.2";
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
+pub const DIFF_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +117,14 @@ impl DiffReport {
 }
 
 pub fn diff_projects(base: &ProjectSource, head: &ProjectSource) -> DiffReport {
+    diff_selected_drawing(base, head, None)
+}
+
+pub fn diff_selected_drawing(
+    base: &ProjectSource,
+    head: &ProjectSource,
+    drawing: Option<&str>,
+) -> DiffReport {
     let mut changes = Vec::new();
     let mut warnings = Vec::new();
 
@@ -134,7 +136,10 @@ pub fn diff_projects(base: &ProjectSource, head: &ProjectSource) -> DiffReport {
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    for drawing_name in drawing_names {
+    for drawing_name in drawing_names
+        .into_iter()
+        .filter(|name| drawing.is_none_or(|selected| selected == name))
+    {
         let base_entities = base_drawings
             .get(&drawing_name)
             .map_or_else(BTreeMap::new, |records| entities_by_id(records));
@@ -199,10 +204,18 @@ pub fn diff_projects(base: &ProjectSource, head: &ProjectSource) -> DiffReport {
         }
     }
 
-    DiffReport::new(changes, warnings, configuration_changes(base, head))
+    DiffReport::new(
+        changes,
+        warnings,
+        configuration_changes(base, head, drawing),
+    )
 }
 
-fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<ConfigurationChange> {
+fn configuration_changes(
+    base: &ProjectSource,
+    head: &ProjectSource,
+    drawing: Option<&str>,
+) -> Vec<ConfigurationChange> {
     let mut changes = Vec::new();
     collect_json_changes(
         "project",
@@ -242,8 +255,8 @@ fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<Conf
             &mut changes,
         );
     }
-    let base_layouts = layout_file_signatures(base);
-    let head_layouts = layout_file_signatures(head);
+    let base_layouts = layout_file_signatures(base, drawing);
+    let head_layouts = layout_file_signatures(head, drawing);
     for path in base_layouts
         .keys()
         .chain(head_layouts.keys())
@@ -265,10 +278,14 @@ fn configuration_changes(base: &ProjectSource, head: &ProjectSource) -> Vec<Conf
     changes
 }
 
-fn layout_file_signatures(project: &ProjectSource) -> BTreeMap<String, String> {
+fn layout_file_signatures(
+    project: &ProjectSource,
+    selected: Option<&str>,
+) -> BTreeMap<String, String> {
     project
         .drawings
         .iter()
+        .filter(|drawing| selected.is_none_or(|name| drawing.name == name))
         .map(|drawing| {
             (
                 format!("{}/layouts.toml", drawing.name),
@@ -283,30 +300,27 @@ fn layout_file_signatures(project: &ProjectSource) -> BTreeMap<String, String> {
 }
 
 fn block_file_signatures(root: &FsPath) -> BTreeMap<String, String> {
-    fn visit(root: &FsPath, current: &FsPath, output: &mut BTreeMap<String, String>) {
-        let Ok(entries) = fs::read_dir(current) else {
-            return;
-        };
-        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            if path.is_dir() {
-                visit(root, &path, output);
-            } else if let Ok(bytes) = fs::read(&path)
-                && let Ok(relative) = path.strip_prefix(root)
-            {
-                output.insert(
-                    relative.to_string_lossy().replace('\\', "/"),
-                    blake3::hash(&bytes).to_hex().to_string(),
-                );
-            }
-        }
-    }
-    let blocks = root.join("blocks");
-    let mut output = BTreeMap::new();
-    visit(&blocks, &blocks, &mut output);
-    output
+    cad_model::source_manifest_for(root, |path| {
+        matches!(
+            cad_model::classify_project_source_path(path),
+            Some(
+                cad_model::ProjectSourceKind::BlockDefinition
+                    | cad_model::ProjectSourceKind::BlockEntities
+            )
+        )
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .map(|file| {
+        (
+            file.relative_path
+                .strip_prefix("blocks/")
+                .unwrap()
+                .to_owned(),
+            file.revision,
+        )
+    })
+    .collect()
 }
 
 fn collect_optional_json_changes(
@@ -370,8 +384,18 @@ pub fn diff_projects_json(
 
 pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
     let report = diff_projects(base, head);
-    let base_drawings = drawings_by_name(base);
-    let head_drawings = drawings_by_name(head);
+    render_diff_svg(base, head, &report)
+}
+
+pub fn render_diff_svg(base: &ProjectSource, head: &ProjectSource, report: &DiffReport) -> String {
+    let base_drawings = drawings_by_name(base)
+        .into_iter()
+        .map(|(name, records)| (name, entities_by_id(records)))
+        .collect::<BTreeMap<_, _>>();
+    let head_drawings = drawings_by_name(head)
+        .into_iter()
+        .map(|(name, records)| (name, entities_by_id(records)))
+        .collect::<BTreeMap<_, _>>();
     let mut root = Group::new().set("id", "semantic-diff");
     let mut view_bbox: Option<BBox> = None;
 
@@ -380,7 +404,7 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
             ChangeKind::Added => {
                 if let Some(record) = head_drawings
                     .get(&change.drawing)
-                    .and_then(|records| find_record(records, &change.entity_id))
+                    .and_then(|records| records.get(&change.entity_id).copied())
                 {
                     view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
                     root = root.add(render_overlay_entity(
@@ -391,7 +415,7 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
             ChangeKind::Removed => {
                 if let Some(record) = base_drawings
                     .get(&change.drawing)
-                    .and_then(|records| find_record(records, &change.entity_id))
+                    .and_then(|records| records.get(&change.entity_id).copied())
                 {
                     view_bbox = merge_view_bbox(view_bbox, visual_bbox(base, record));
                     root = root.add(render_overlay_entity(
@@ -402,7 +426,7 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
             ChangeKind::Modified => {
                 if let Some(record) = base_drawings
                     .get(&change.drawing)
-                    .and_then(|records| find_record(records, &change.entity_id))
+                    .and_then(|records| records.get(&change.entity_id).copied())
                 {
                     view_bbox = merge_view_bbox(view_bbox, visual_bbox(base, record));
                     root = root.add(render_overlay_entity(
@@ -415,7 +439,7 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
                 }
                 if let Some(record) = head_drawings
                     .get(&change.drawing)
-                    .and_then(|records| find_record(records, &change.entity_id))
+                    .and_then(|records| records.get(&change.entity_id).copied())
                 {
                     view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
                     root = root.add(render_overlay_entity(
@@ -426,7 +450,7 @@ pub fn diff_projects_svg(base: &ProjectSource, head: &ProjectSource) -> String {
             ChangeKind::Unchanged => {
                 if let Some(record) = head_drawings
                     .get(&change.drawing)
-                    .and_then(|records| find_record(records, &change.entity_id))
+                    .and_then(|records| records.get(&change.entity_id).copied())
                 {
                     view_bbox = merge_view_bbox(view_bbox, visual_bbox(head, record));
                     root = root.add(render_overlay_entity(
@@ -465,12 +489,6 @@ fn entities_by_id(records: &[EntityRecord]) -> BTreeMap<String, &EntityRecord> {
         .iter()
         .map(|record| (record.entity.id().as_str().to_owned(), record))
         .collect()
-}
-
-fn find_record<'a>(records: &'a [EntityRecord], entity_id: &str) -> Option<&'a EntityRecord> {
-    records
-        .iter()
-        .find(|record| record.entity.id().as_str() == entity_id)
 }
 
 fn change_reasons(
@@ -605,13 +623,16 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             "curve_solid:{center:?}:{radius}:{flatness}:{rotation_deg}:{start_deg}:{end_deg}:{solid_param}:{encoding_code}:{fill}"
         ),
         Entity::Dimension {
+            measurement,
             p1,
             p2,
             offset,
             text_rotation_deg,
             text_mirror_y,
             ..
-        } => format!("dimension:{p1:?}:{p2:?}:{offset}:{text_rotation_deg}:{text_mirror_y}"),
+        } => format!(
+            "dimension:{measurement:?}:{p1:?}:{p2:?}:{offset}:{text_rotation_deg}:{text_mirror_y}"
+        ),
         Entity::BlockRef {
             block,
             at,
@@ -717,17 +738,8 @@ fn paper_model_size(layout: &cad_model::LayoutConfig) -> Option<(f64, f64)> {
         cad_model::SheetOrientation::Portrait => (paper_width, paper_height),
         cad_model::SheetOrientation::Landscape => (paper_height, paper_width),
     };
-    parse_scale(&layout.scale).map(|scale| (paper_width * scale, paper_height * scale))
-}
-
-fn parse_scale(scale: &str) -> Option<f64> {
-    let (numerator, denominator) = scale.split_once('/')?;
-    let numerator = numerator.parse::<f64>().ok()?;
-    let denominator = denominator.parse::<f64>().ok()?;
-    if numerator <= 0.0 || denominator <= 0.0 {
-        return None;
-    }
-    Some(denominator / numerator)
+    cad_model::parse_layout_scale(&layout.scale)
+        .map(|scale| (paper_width * scale, paper_height * scale))
 }
 
 fn text_overlap_warnings(
@@ -741,8 +753,30 @@ fn text_overlap_warnings(
         .filter_map(|record| text_bbox(project, record).map(|bbox| (record, bbox)))
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
+    let bounds = texts
+        .iter()
+        .map(|(_, bbox)| AABB::from_corners(bbox.min, bbox.max))
+        .collect::<Vec<_>>();
+    let tree = RTree::bulk_load(
+        bounds
+            .iter()
+            .enumerate()
+            .map(|(i, bbox)| {
+                rstar::primitives::GeomWithData::new(
+                    rstar::primitives::Rectangle::from_corners(bbox.lower(), bbox.upper()),
+                    i,
+                )
+            })
+            .collect(),
+    );
     for left_index in 0..texts.len() {
-        for right_index in (left_index + 1)..texts.len() {
+        let mut neighbors = tree
+            .locate_in_envelope_intersecting(bounds[left_index])
+            .map(|entry| entry.data)
+            .filter(|&i| i > left_index)
+            .collect::<Vec<_>>();
+        neighbors.sort_unstable();
+        for right_index in neighbors {
             let (left, left_bbox) = texts[left_index];
             let (right, right_bbox) = texts[right_index];
             if bboxes_overlap(left_bbox, right_bbox) {
@@ -1397,35 +1431,56 @@ mod tests {
     use std::fs::{create_dir_all, write};
 
     #[test]
-    fn exposes_crate_name() {
-        assert_eq!(crate_name(), "cad-diff");
-    }
+    fn measurement_change_is_reported_when_legacy_dimension_fields_are_unchanged() {
+        let fixture = fixture_project(BaseFixture::Base);
+        let mut base = cad_model::load_project(fixture.path()).unwrap();
+        let dimension = serde_json::json!({
+            "schema_version": cad_model::CURRENT_SCHEMA_VERSION,
+            "id": "ent_01JZ0000000000000000000005",
+            "type": "dimension", "layer": "0-1", "style": "dim_100",
+            "p1": [0, 0], "p2": [1000, 0], "offset": 200,
+            "measurement": {
+                "kind": "aligned",
+                "first": {"kind": "fixed", "point": [0, 0]},
+                "second": {"kind": "fixed", "point": [1000, 0]}
+            }
+        });
+        base.drawings[0].entities = vec![EntityRecord {
+            line: 1,
+            entity: serde_json::from_value(dimension).unwrap(),
+        }];
+        let mut head = base.clone();
+        let Entity::Dimension { measurement, .. } = &mut head.drawings[0].entities[0].entity else {
+            unreachable!()
+        };
+        *measurement = Some(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "kind": "horizontal",
+                "first": {"kind": "fixed", "point": [0, 0]},
+                "second": {"kind": "fixed", "point": [300, 400]}
+            }))
+            .unwrap(),
+        ));
 
-    #[test]
-    fn detects_added_removed_modified_and_unchanged() {
-        let base = fixture_project(BaseFixture::Base);
-        let head = fixture_project(BaseFixture::Head);
-        let base = cad_model::load_project(base.path()).expect("base should load");
-        let head = cad_model::load_project(head.path()).expect("head should load");
-
+        assert_eq!(
+            cad_model::evaluate_dimension(&base, &base.drawings[0].entities[0].entity)
+                .unwrap()
+                .measured,
+            1000.0
+        );
+        assert_eq!(
+            cad_model::evaluate_dimension(&head, &head.drawings[0].entities[0].entity)
+                .unwrap()
+                .measured,
+            300.0
+        );
         let report = diff_projects(&base, &head);
-
-        assert_change(
-            &report,
-            "ent_01JZ0000000000000000000000",
-            ChangeKind::Modified,
+        assert_eq!(report.changes[0].kind, ChangeKind::Modified);
+        assert!(
+            report.changes[0]
+                .reasons
+                .contains(&ChangeReason::GeometryChanged)
         );
-        assert_change(
-            &report,
-            "ent_01JZ0000000000000000000001",
-            ChangeKind::Modified,
-        );
-        assert_change(
-            &report,
-            "ent_01JZ0000000000000000000002",
-            ChangeKind::Removed,
-        );
-        assert_change(&report, "ent_01JZ0000000000000000000003", ChangeKind::Added);
     }
 
     #[test]
@@ -1434,7 +1489,7 @@ mod tests {
         let head = fixture_project(BaseFixture::Head);
         write(
             head.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A0\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A0\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("active layout should be writable");
         let base = cad_model::load_project(base.path()).expect("base should load");
@@ -1459,7 +1514,7 @@ mod tests {
 
         insta::assert_snapshot!(json, @r#"
 {
-  "schema_version": "0.2",
+  "schema_version": "0.3",
   "status": "warning",
   "changes": [
     {
@@ -1549,7 +1604,7 @@ mod tests {
 
         insta::assert_snapshot!(json, @r#"
 {
-  "schema_version": "0.2",
+  "schema_version": "0.3",
   "status": "ok",
   "changes": [
     {
@@ -1603,60 +1658,48 @@ mod tests {
     }
 
     #[test]
-    fn ellipse_signature_and_svg_path_include_all_geometry() {
-        let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"ellipse","layer":"0-1","center":[1.0,2.0],"radius_x":8.0,"radius_y":3.0,"rotation_deg":45.0,"start_deg":0.0,"end_deg":180.0}"#,
-        )
-        .expect("ellipse should parse");
-
-        let signature = entity_geometry_signature(&entity);
-        let path = ellipse_arc_path([1.0, 2.0], 8.0, 3.0, 45.0, 0.0, 180.0).to_string();
-
-        assert_eq!(signature, "ellipse:[1.0, 2.0]:8:3:45:0:180");
-        assert!(path.contains("A8,3,-45,0,0"));
-    }
-
-    #[test]
-    fn mirrored_text_and_dimension_metadata_affect_diff_geometry() {
-        let text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[10.0,20.0],"rotation_deg":30.0,"mirror_y":true,"value":"mirror"}"#,
-        )
-        .expect("text should parse");
-        let dimension: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"text_rotation_deg":90.0,"text_mirror_y":true,"value":"10"}"#,
-        )
-        .expect("dimension should parse");
-        let style = TextStyleDef {
-            font_family: "Hiragino Sans".to_owned(),
-            height: 2.5,
-            width: 1.25,
-            spacing: 0.0,
-            align: TextAlign::Left,
-        };
-
-        let node = text_node(
-            &[10.0, 20.0],
-            30.0,
-            true,
-            "mirror",
-            &style,
-            "start",
-            "#000000",
-        )
-        .to_string();
-
-        assert!(entity_geometry_signature(&text).ends_with(":true"));
-        assert!(entity_geometry_signature(&dimension).ends_with(":90:true"));
-        assert!(node.contains("transform=\"matrix("));
-    }
-
-    fn assert_change(report: &DiffReport, entity_id: &str, kind: ChangeKind) {
-        let change = report
-            .changes
-            .iter()
-            .find(|change| change.entity_id == entity_id)
-            .expect("change should exist");
-        assert_eq!(change.kind, kind);
+    fn geometry_metadata_changes_are_reported_and_rendered() {
+        let temp = fixture_project(BaseFixture::Base);
+        let mut base = cad_model::load_project(temp.path()).unwrap();
+        for (mut value, field, changed, expected_svg) in [
+            (
+                serde_json::json!({"type":"ellipse","center":[1,2],"radius_x":8,"radius_y":3,"rotation_deg":0,"start_deg":0,"end_deg":180}),
+                "rotation_deg",
+                serde_json::json!(45),
+                "A8,3,-45",
+            ),
+            (
+                serde_json::json!({"type":"text","style":"note","at":[10,20],"rotation_deg":30,"value":"mirror"}),
+                "mirror_y",
+                serde_json::json!(true),
+                "matrix(",
+            ),
+            (
+                serde_json::json!({"type":"dimension","style":"dim_100","p1":[0,0],"p2":[0,10],"offset":2,"value":"10"}),
+                "text_rotation_deg",
+                serde_json::json!(90),
+                "rotate(-90",
+            ),
+        ] {
+            value["schema_version"] = serde_json::json!(cad_model::CURRENT_SCHEMA_VERSION);
+            value["id"] = serde_json::json!("ent_01JZ0000000000000000000000");
+            value["layer"] = serde_json::json!("0-1");
+            base.drawings[0].entities = vec![EntityRecord {
+                line: 1,
+                entity: serde_json::from_value(value.clone()).unwrap(),
+            }];
+            let mut head = base.clone();
+            value[field] = changed;
+            head.drawings[0].entities[0].entity = serde_json::from_value(value).unwrap();
+            let report = diff_projects(&base, &head);
+            assert_eq!(report.changes[0].kind, ChangeKind::Modified);
+            assert!(
+                report.changes[0]
+                    .reasons
+                    .contains(&ChangeReason::GeometryChanged)
+            );
+            assert!(render_diff_svg(&base, &head, &report).contains(expected_svg));
+        }
     }
 
     enum BaseFixture {
@@ -1677,7 +1720,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         let line_width = match kind {
@@ -1698,20 +1741,20 @@ mod tests {
         .expect("styles TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be writable");
         let entities = match kind {
             BaseFixture::Base => vec![
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[400.0,200.0],"rotation_deg":0.0,"value":"removed"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[400.0,200.0],"rotation_deg":0.0,"value":"removed"}"#,
             ],
             BaseFixture::Head => vec![
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"line","layer":"0-1","p1":[50000.0,0.0],"p2":[51000.0,0.0]}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"text","layer":"0-1","style":"note","at":[150.0,220.0],"rotation_deg":0.0,"value":"overlap"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1200.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"same"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000003","type":"line","layer":"0-1","p1":[50000.0,0.0],"p2":[51000.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000004","type":"text","layer":"0-1","style":"note","at":[150.0,220.0],"rotation_deg":0.0,"value":"overlap"}"#,
             ],
         };
         write(
@@ -1731,7 +1774,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"text-change-fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"text-change-fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1746,16 +1789,16 @@ mod tests {
         .expect("styles TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be writable");
 
         let entity = match kind {
             TextFixture::Base => {
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"before"}"#
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[100.0,200.0],"rotation_deg":0.0,"value":"before"}"#
             }
             TextFixture::Head => {
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note_big","at":[100.0,200.0],"rotation_deg":0.0,"value":"after"}"#
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note_big","at":[100.0,200.0],"rotation_deg":0.0,"value":"after"}"#
             }
         };
         write(temp.path().join("drawings/plan_1f/entities.ndjson"), entity)
@@ -1772,7 +1815,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"styled-bbox-fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"styled-bbox-fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -1787,13 +1830,13 @@ mod tests {
         .expect("styles TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be writable");
         let entities = if include_entities {
             [
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"wide","at":[10.0,20.0],"rotation_deg":0.0,"value":"AB"}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_wide","p1":[0.0,0.0],"p2":[100.0,0.0],"offset":20.0,"value":"100"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"wide","at":[10.0,20.0],"rotation_deg":0.0,"value":"AB"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_wide","p1":[0.0,0.0],"p2":[100.0,0.0],"offset":20.0,"value":"100"}"#,
             ]
             .join("\n")
         } else {

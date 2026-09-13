@@ -4,9 +4,45 @@ Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
 ## Current Phase
 
-Phase 5E-A provides crash-safe schema 0.2 editing, canonical layouts, native
+The drafting workspace uses schema 0.3, with transactional editing, canonical layouts, native
 desktop watching, cached Git review, real-file macOS GUI verification, and
 styled PDF output suitable for Jw_cad migration review.
+
+Schema 0.3 is the only editable project format; no legacy reader or migration
+command is provided. Repository samples and JWW imports produce this format.
+
+## Drafting workflow
+
+`rectangle`, `endpoint`, `stretch`, `fillet`, `chamfer`, and `rectangular_array`
+are available from the toolbar and command bar. Select two lines before a
+fillet/chamfer and pick the retained side of each. Stretch takes two selection
+rectangle corners, a base point, and a destination; it moves only enclosed
+line/polyline vertices, or whole enclosed non-line entities. Hidden and locked
+entities are excluded. Circle/arc trimming and concentric offsets use the same
+geometry functions as curve snapping. Offset creates new entities.
+
+The drafting parameter panel supplies distances, angles, text, hatch settings,
+and block placement. A preview is not a save: Enter or Apply confirms it and
+Esc cancels it. Backspace removes the last draft point; Enter or Space while
+idle repeats the last successful drafting command, never deletion or export.
+The command bar also accepts `x,y`, `@dx,dy`, and `@distance<angle`.
+
+Dimensions can be fixed or reference geometry in the same drawing/block.
+Aligned, horizontal, vertical, chained, baseline, angular, radius, and diameter
+dimensions use the common model evaluator for checking and output. An edit
+that invalidates a reference stops for an explicit detach-or-delete decision;
+external dangling references are checker errors, never silently repaired.
+Dimension-driven geometry and references into a placed block are not supported.
+
+Block creation captures selected geometry at a chosen base point. Its contents
+can be staged in the block editor, saved for all placements, or duplicated as
+an independent definition. Placement offers rotation, positive uniform scale,
+and reflection. Hatch vertices are completed with Enter, or use enclosed-region
+pickup; gaps are not healed. Curved hatch boundaries become polygon loops within
+the documented geometry tolerance and expansion limit, not associative boundaries.
+
+See [the acceptance drawing and checklist](docs/cad-acceptance.md) for automatic
+checks and the remaining Jw_cad display/print acceptance work.
 
 ## Layout
 
@@ -96,6 +132,13 @@ In the app, choose `Open Project` and select a CAD project directory such as
 project files do not exist in `HEAD`, check/render still runs and diff is shown
 as unavailable.
 
+`New Project` creates a validated canonical project without overwriting an
+existing folder. The template supports A3/A4, portrait/landscape, and scales
+1:20, 1:50, 1:100, and 1:200; the default is A3 landscape at 1:100. The drawing
+selector can add a blank drawing or duplicate a drawing with new entity IDs.
+The local unsigned arm64 application is produced under
+`target/release/bundle/macos/` by `desktop:build`.
+
 Desktop review watches the opened project's CAD source files continuously.
 Changes to project, rule, drawing, and comment TOML/NDJSON files are debounced
 for 250ms and automatically re-run check/render/diff. The toolbar reports
@@ -104,7 +147,7 @@ last successful SVG visible and retries on the next source change. Zoom,
 previous view, and a still-existing entity selection are preserved across
 same-project refreshes. `Re-run Review` remains available as a manual retry.
 Generated `build/` and Git files are excluded from watching.
-Semantic diff JSON uses schema `0.2`; besides entity changes it reports typed
+Semantic diff JSON uses schema `0.3`; besides entity changes it reports typed
 project, layout, layer, pen, style, and drawing configuration changes. When Git
 diff is unavailable the diff pane remains explicitly unavailable instead of
 showing the current drawing review as a substitute.
@@ -125,10 +168,13 @@ strict blockers or lossy substitutions.
 Desktop editing is scoped to the selected drawing. The toolbar creates line,
 polyline, circle, arc, text, dimension, and point entities. The detail panel
 edits typed entity properties and supports numeric move/copy/delete operations;
-Move and Copy also support pointer placement. Endpoint, midpoint, and nearby
-line intersection snaps use a 10px screen tolerance, with Shift temporarily
-disabling snap. Hidden layers do not snap, while locked layers remain available
-as snap references but cannot be edited.
+Move and Copy also support pointer placement. Endpoint, midpoint, nearby line
+intersection, center, quadrant, nearest, and perpendicular snaps use a 10px
+screen tolerance. F3 toggles snap, F8 toggles orthogonal input, and Shift
+temporarily disables snap. The lower command bar accepts command names plus
+`x,y`, `@dx,dy`, and `@distance<angle`. Shift-drag selects by window (left to
+right) or crossing (right to left). Hidden layers do not snap, while locked
+layers remain available as snap references but cannot be edited.
 
 Each edit includes a BLAKE3 revision of the exact `entities.ndjson` bytes.
 Application-internal file-backed writers are serialized and use an atomic
@@ -143,7 +189,11 @@ newline policy, permissions, and file-existence state.
 
 Generated AI context is published as a matched JSON/Markdown generation under
 `build/ai-context/`. `build/ai-context-current.json` atomically points to the
-current pair, so readers never combine files from different selections.
+current pair, so readers never combine files from different selections. Identical
+content reuses its existing generation; `generated_at` records when that generation
+was first created. Earlier generations are retained, including generations created
+before content reuse was introduced. Incomplete or mismatched generations are
+rejected without replacing the current manifest.
 
 PDF can also be exported without the desktop app:
 
@@ -230,7 +280,7 @@ concurrent import cannot overwrite an existing destination directory.
 
 Reflected JWW block text is preserved in CAD source with `text.mirror_y`.
 Dimension text uses `dimension.text_rotation_deg` and
-`dimension.text_mirror_y`; all three fields are explicit in schema `0.2`.
+`dimension.text_mirror_y`; all three fields are explicit in schema `0.3`.
 For a mapped existing JWW dimension, strict preservation accepts only a
 displayed-value change and retains the original dimension line, text geometry,
 SXF fields, auxiliary lines, and auxiliary points. Normal best-effort export
@@ -246,14 +296,32 @@ an existing output.
 
 Best-effort export writes JWW version 600 with CP932 strings. It supports
 line, polyline expansion, arc, circle, ellipse, text, dimension, point,
-polygon solid, curve solid, deterministic block references, and simple hatch
-loops. Active layout paper and scale are written to the JWW header. Strict mode does not create an output
+polygon solid, curve solid, deterministic block references, and hatch loops.
+Parallel and cross hatch families use model-space millimetres for pitch and are
+expanded to clipped JWW lines with an explicit compatibility warning. Active
+layout paper and scale are written to the JWW header. Strict mode does not create an output
 when a drawing requires an approximation. Normal mode records every expansion,
 substitution, or omission in the export report; `--strict` promotes those
 conditions to blockers. Existing files require `--force` in the CLI, and failed
 generation leaves the existing file intact. Point records and the public
 `Test1.jww` fixture are covered; solid compatibility still requires a licensed
 public fixture containing polygon, circle, ellipse, arc, and ring solids.
+Desktop export writes the JSON compatibility report beside the selected JWW as
+`<name>.jww.report.json`; disabling `Allow lossy export` also blocks all
+approximations.
+Paired exports reject aliased destinations and non-regular target files. On a
+publication failure they restore the previous files; if recovery itself fails,
+the error lists retained backup paths for manual recovery. This does not provide
+two-file atomicity across power loss.
+
+Breaking change for canonical v0.3 hatch data: `pattern` must be `solid`,
+`parallel`, or `cross`, and `fill` must name a color in `rules/styles.toml`.
+Existing arbitrary pattern names and omitted/null fills are rejected; there is
+no automatic migration or fallback. Correct the entity and field identified by
+the diagnostic before checking, rendering, or exporting again. Each patterned
+hatch family is limited to 20,000 candidate lines; excessive density blocks
+rendering and export, including best-effort JWW. Increase its model-space pitch
+or reduce its extent.
 
 JWW provenance is selected automatically. With no relevant source change it
 publishes the original JWW byte-for-byte. For an edited compatible project it
@@ -264,7 +332,7 @@ v600 file and records `preservation_fallback_generated`; `--strict` blocks the
 fallback. This is measured file-format compatibility, not a claim of complete
 Jw_cad compatibility.
 
-JWW block definitions and references are retained in schema `0.2`, and export
+JWW block definitions and references are retained in schema `0.3`, and export
 uses the retained block list. Unsupported block constructs remain a strict
 export blocker rather than a lossy
 reconstruction. Lossless block round-trip is outside the current source schema.
@@ -276,8 +344,10 @@ or Jw_cad execution is not a release requirement.
 
 PDF export uses the active layout's paper, orientation, scale, origin, margins,
 and plot area and publishes the result atomically. Only visible, printable
-layers are rendered; block references are transformed and simple hatch loops
-are filled. PDF stroke color, physical line width, dash pattern, fill color,
+layers are rendered; block references are transformed, solid hatches are
+filled, and parallel/cross hatches are clipped to their even-odd loops. PDF
+circles, arcs, and ellipses use cubic Bézier path segments instead of visible
+polyline faceting. PDF stroke color, physical line width, dash pattern, fill color,
 text size/width/spacing/alignment, dimension geometry, and curve solids use the
 same canonical style data as SVG. Japanese text uses an OFL-licensed M+ 1p
 TrueType subset embedded as a CID font with a ToUnicode map. PDF appearance and

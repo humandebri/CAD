@@ -28,7 +28,12 @@ function run(command, args) {
 let succeeded = false;
 try {
   run("pnpm", ["exec", "tauri", "build", "--debug", "--no-bundle", "--features", "desktop-e2e", "--config", "src-tauri/tauri.e2e.conf.json"]);
-  run("pnpm", ["exec", "wdio", "run", "wdio.desktop.conf.mjs"]);
+  for (const scenario of ["edits, comments, and observes", "persists a dimensioned room"]) {
+    rmSync(projectPath, { recursive: true, force: true });
+    cpSync(resolve(workspaceRoot, "examples/house-small"), projectPath, { recursive: true });
+    rmSync(pdfPath, { force: true });
+    run("pnpm", ["exec", "wdio", "run", "wdio.desktop.conf.mjs", "--mochaOpts.grep", scenario]);
+  }
   succeeded = true;
 } finally {
   if (!succeeded) {

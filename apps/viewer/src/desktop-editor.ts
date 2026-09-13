@@ -5,6 +5,7 @@ import type {
   DrawingHistoryState,
   DrawingEditRequest,
   DrawingEditResult,
+  DrawingEditPreview,
   EditOperation,
   LayoutWorkspaceState,
   SnapCandidate,
@@ -47,6 +48,14 @@ export function applyDrawingEdit(
   return invokeCommand<DrawingEditResult>("apply_drawing_edit", { projectPath, request });
 }
 
+export function previewDrawingEdit(
+  projectPath: string,
+  request: DrawingEditRequest,
+  invokeCommand: InvokeEditor = invokeEditor,
+): Promise<DrawingEditPreview> {
+  return invokeCommand<DrawingEditPreview>("preview_drawing_edit", { projectPath, request });
+}
+
 export function undoDrawingEdit(
   projectPath: string,
   request: DrawingHistoryRequest,
@@ -71,22 +80,15 @@ export function listDrawingHistory(
   return invokeCommand<DrawingHistoryState>("list_drawing_history", { projectPath, drawing });
 }
 
-export function clearDrawingHistory(
-  projectPath: string,
-  drawing: string,
-  invokeCommand: InvokeEditor = invokeEditor,
-): Promise<void> {
-  return invokeCommand<void>("clear_drawing_history", { projectPath, drawing });
-}
-
 export function queryDrawingSnap(
   projectPath: string,
   drawing: string,
   revision: string,
   point: [number, number],
   toleranceMm: number,
-  modes: SnapKind[] = ["endpoint", "midpoint", "intersection"],
+  modes: SnapKind[] = ["endpoint", "midpoint", "intersection", "center", "quadrant", "nearest", "perpendicular"],
   invokeCommand: InvokeEditor = invokeEditor,
+  referencePoint: [number, number] | null = null,
 ): Promise<SnapCandidate | null> {
   return invokeCommand<SnapCandidate | null>("query_snap", {
     projectPath,
@@ -95,5 +97,6 @@ export function queryDrawingSnap(
     point,
     toleranceMm,
     modes,
+    ...(referencePoint === null ? {} : { referencePoint }),
   });
 }

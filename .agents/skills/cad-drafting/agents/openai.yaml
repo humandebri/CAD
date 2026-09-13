@@ -1,0 +1,6 @@
+interface:
+  display_name: "CAD作図・壁面展開図"
+  short_description: "CAD正本を直接編集し、平面図と部品資料から展開図を作図・検証・出力する"
+  default_prompt: "$cad-drafting を使い、平面図と部品資料から室内の壁面展開図を作成してください。"
+policy:
+  allow_implicit_invocation: true

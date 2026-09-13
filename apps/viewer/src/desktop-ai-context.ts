@@ -99,8 +99,5 @@ export class LatestAiContextWriteQueue {
       }
     }
     this.running = false;
-    if (this.pending !== null) {
-      this.start();
-    }
   }
 }

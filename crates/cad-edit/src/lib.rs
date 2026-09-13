@@ -9,7 +9,7 @@ use geo::{
 use rstar::{AABB, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -17,12 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const CRATE_NAME: &str = "cad-edit";
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
+pub mod block_edit;
+mod geometry_edit;
+pub mod region_hatch;
 
 #[derive(Debug, Error)]
 pub enum EditError {
@@ -59,6 +56,506 @@ pub enum EditError {
 }
 
 pub type EditResult<T> = Result<T, EditError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectTemplateRequest {
+    pub parent_dir: String,
+    pub folder_name: String,
+    pub project_name: String,
+    pub drawing: String,
+    pub paper: String,
+    pub orientation: cad_model::SheetOrientation,
+    pub scale_denominator: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrawingTemplateRequest {
+    pub project_path: String,
+    pub drawing: String,
+    pub paper: String,
+    pub orientation: cad_model::SheetOrientation,
+    pub scale_denominator: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateDrawingRequest {
+    pub project_path: String,
+    pub source_drawing: String,
+    pub drawing: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectMutationResult {
+    pub project_path: String,
+    pub drawing: String,
+    pub changed_files: Vec<String>,
+}
+
+pub fn create_project(request: &ProjectTemplateRequest) -> EditResult<ProjectMutationResult> {
+    validate_source_component(&request.folder_name, "project folder")?;
+    validate_drawing_name(&request.drawing)?;
+    validate_template(&request.paper, request.scale_denominator)?;
+    if request.project_name.trim().is_empty() {
+        return Err(EditError::InvalidEntity(
+            "project name must not be empty".to_owned(),
+        ));
+    }
+    let parent = fs::canonicalize(&request.parent_dir).map_err(|source| EditError::Read {
+        path: PathBuf::from(&request.parent_dir),
+        source,
+    })?;
+    let destination = parent.join(&request.folder_name);
+    if destination.exists() {
+        return Err(EditError::RevisionConflict);
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".cad-project-")
+        .tempdir_in(&parent)
+        .map_err(|source| EditError::Write {
+            path: parent.clone(),
+            source,
+        })?;
+    fs::create_dir_all(staging.path().join("rules")).map_err(|source| EditError::Write {
+        path: staging.path().join("rules"),
+        source,
+    })?;
+    fs::create_dir_all(staging.path().join("drawings").join(&request.drawing)).map_err(
+        |source| EditError::Write {
+            path: staging.path().join("drawings").join(&request.drawing),
+            source,
+        },
+    )?;
+    fs::create_dir_all(staging.path().join("build")).map_err(|source| EditError::Write {
+        path: staging.path().join("build"),
+        source,
+    })?;
+    let project = cad_model::ProjectConfig {
+        schema_version: cad_model::CURRENT_SCHEMA_VERSION.to_owned(),
+        name: request.project_name.trim().to_owned(),
+    };
+    write_toml(&staging.path().join("cad.project.toml"), &project)?;
+    write_toml(
+        &staging.path().join("rules/layers.toml"),
+        &default_layers(request.scale_denominator),
+    )?;
+    write_toml(
+        &staging.path().join("rules/styles.toml"),
+        &default_styles(request.scale_denominator),
+    )?;
+    write_drawing_template(
+        staging.path(),
+        &request.drawing,
+        &request.paper,
+        request.orientation.clone(),
+        request.scale_denominator,
+        "",
+    )?;
+    validate_project_for_publish(staging.path())?;
+    publish_directory_no_replace(staging.path(), &destination)?;
+    Ok(ProjectMutationResult {
+        project_path: destination.to_string_lossy().into_owned(),
+        drawing: request.drawing.clone(),
+        changed_files: vec![
+            "cad.project.toml".to_owned(),
+            "rules/layers.toml".to_owned(),
+            "rules/styles.toml".to_owned(),
+            format!("drawings/{}/layouts.toml", request.drawing),
+            format!("drawings/{}/entities.ndjson", request.drawing),
+        ],
+    })
+}
+
+pub fn add_drawing(request: &DrawingTemplateRequest) -> EditResult<ProjectMutationResult> {
+    validate_drawing_name(&request.drawing)?;
+    validate_template(&request.paper, request.scale_denominator)?;
+    publish_drawing(
+        Path::new(&request.project_path),
+        &request.drawing,
+        &request.paper,
+        request.orientation.clone(),
+        request.scale_denominator,
+        "",
+    )
+}
+
+pub fn duplicate_drawing(request: &DuplicateDrawingRequest) -> EditResult<ProjectMutationResult> {
+    validate_drawing_name(&request.source_drawing)?;
+    validate_drawing_name(&request.drawing)?;
+    let root = fs::canonicalize(&request.project_path).map_err(|source| EditError::Read {
+        path: PathBuf::from(&request.project_path),
+        source,
+    })?;
+    validate_project_for_publish(&root)?;
+    let source_dir = root.join("drawings").join(&request.source_drawing);
+    let source_layouts =
+        fs::read(source_dir.join("layouts.toml")).map_err(|source| EditError::Read {
+            path: source_dir.join("layouts.toml"),
+            source,
+        })?;
+    let source_entities =
+        fs::read_to_string(source_dir.join("entities.ndjson")).map_err(|source| {
+            EditError::Read {
+                path: source_dir.join("entities.ndjson"),
+                source,
+            }
+        })?;
+    let mut copied = Vec::new();
+    let mut replacements = BTreeMap::new();
+    for line in source_entities.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut value: Value = serde_json::from_str(line)
+            .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+        let entity: Entity = serde_json::from_value(value.clone())
+            .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+        let id = next_id();
+        replacements.insert(
+            entity.id().clone(),
+            cad_model::EntityId::parse(&id)
+                .map_err(|error| EditError::InvalidEntity(error.to_string()))?,
+        );
+        value["id"] = Value::String(id);
+        copied.push((value, entity));
+    }
+    let copied = copied
+        .into_iter()
+        .map(|(mut value, mut entity)| {
+            cad_model::remap_dimension_references(&mut entity, &replacements);
+            if let Entity::Dimension {
+                measurement: Some(measurement),
+                ..
+            } = entity
+            {
+                value["measurement"] = serde_json::to_value(measurement)
+                    .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+            }
+            serde_json::to_string(&value)
+                .map_err(|error| EditError::InvalidEntity(error.to_string()))
+        })
+        .collect::<EditResult<Vec<_>>>()?;
+    let entities = if copied.is_empty() {
+        String::new()
+    } else {
+        copied.join("\n") + "\n"
+    };
+    publish_drawing_bytes(
+        &root,
+        &request.drawing,
+        &source_layouts,
+        entities.as_bytes(),
+    )
+}
+
+fn publish_drawing(
+    project_path: &Path,
+    drawing: &str,
+    paper: &str,
+    orientation: cad_model::SheetOrientation,
+    scale_denominator: u32,
+    entities: &str,
+) -> EditResult<ProjectMutationResult> {
+    let root = fs::canonicalize(project_path).map_err(|source| EditError::Read {
+        path: project_path.to_path_buf(),
+        source,
+    })?;
+    validate_project_for_publish(&root)?;
+    let layouts = template_layouts(paper, orientation, scale_denominator);
+    let layouts = toml::to_string_pretty(&layouts)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    publish_drawing_bytes(&root, drawing, layouts.as_bytes(), entities.as_bytes())
+}
+
+fn publish_drawing_bytes(
+    root: &Path,
+    drawing: &str,
+    layouts: &[u8],
+    entities: &[u8],
+) -> EditResult<ProjectMutationResult> {
+    let destination = root.join("drawings").join(drawing);
+    if destination.exists() {
+        return Err(EditError::RevisionConflict);
+    }
+    let mut project = cad_model::load_project(root)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    let layouts_text = std::str::from_utf8(layouts)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    let entities_text = std::str::from_utf8(entities)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    project.drawings.push(cad_model::DrawingSource {
+        name: drawing.to_owned(),
+        layouts: toml::from_str(layouts_text)
+            .map_err(|error| EditError::InvalidEntity(error.to_string()))?,
+        entities: entities_text
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                Ok(EntityRecord {
+                    line: index + 1,
+                    entity: serde_json::from_str(line)
+                        .map_err(|error| EditError::InvalidEntity(error.to_string()))?,
+                })
+            })
+            .collect::<EditResult<Vec<_>>>()?,
+    });
+    validate_loaded_project_for_publish(&project)?;
+    let staging_root = root.join("build");
+    fs::create_dir_all(&staging_root).map_err(|source| EditError::Write {
+        path: staging_root.clone(),
+        source,
+    })?;
+    let staging = tempfile::Builder::new()
+        .prefix(".cad-drawing-")
+        .tempdir_in(&staging_root)
+        .map_err(|source| EditError::Write {
+            path: staging_root,
+            source,
+        })?;
+    write_synced(&staging.path().join("layouts.toml"), layouts)?;
+    write_synced(&staging.path().join("entities.ndjson"), entities)?;
+    publish_directory_no_replace(staging.path(), &destination)?;
+    Ok(ProjectMutationResult {
+        project_path: root.to_string_lossy().into_owned(),
+        drawing: drawing.to_owned(),
+        changed_files: vec![
+            format!("drawings/{drawing}/layouts.toml"),
+            format!("drawings/{drawing}/entities.ndjson"),
+        ],
+    })
+}
+
+fn validate_template(paper: &str, scale_denominator: u32) -> EditResult<()> {
+    if !matches!(paper, "A3" | "A4") {
+        return Err(EditError::InvalidEntity(
+            "template paper must be A3 or A4".to_owned(),
+        ));
+    }
+    if !matches!(scale_denominator, 20 | 50 | 100 | 200) {
+        return Err(EditError::InvalidEntity(
+            "template scale must be 1:20, 1:50, 1:100, or 1:200".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_component(value: &str, label: &str) -> EditResult<()> {
+    let mut components = Path::new(value).components();
+    if value.trim().is_empty()
+        || value != value.trim()
+        || value.contains(['/', '\\'])
+        || value.chars().any(char::is_control)
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(EditError::InvalidEntity(format!(
+            "{label} must be one safe path component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_project_for_publish(root: &Path) -> EditResult<()> {
+    let project = cad_model::load_project(root)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    validate_loaded_project_for_publish(&project)
+}
+
+fn validate_loaded_project_for_publish(project: &ProjectSource) -> EditResult<()> {
+    let errors = cad_check::check_loaded_project(project)
+        .diagnostics
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(EditError::CheckFailed(errors.join("; ")))
+    }
+}
+
+fn write_drawing_template(
+    root: &Path,
+    drawing: &str,
+    paper: &str,
+    orientation: cad_model::SheetOrientation,
+    scale_denominator: u32,
+    entities: &str,
+) -> EditResult<()> {
+    let drawing_dir = root.join("drawings").join(drawing);
+    write_toml(
+        &drawing_dir.join("layouts.toml"),
+        &template_layouts(paper, orientation, scale_denominator),
+    )?;
+    write_synced(&drawing_dir.join("entities.ndjson"), entities.as_bytes())
+}
+
+fn template_layouts(
+    paper: &str,
+    orientation: cad_model::SheetOrientation,
+    scale_denominator: u32,
+) -> cad_model::LayoutsConfig {
+    cad_model::LayoutsConfig {
+        schema_version: cad_model::CURRENT_SCHEMA_VERSION.to_owned(),
+        active_layout: "default".to_owned(),
+        layouts: BTreeMap::from([(
+            "default".to_owned(),
+            cad_model::LayoutConfig {
+                name: "default".to_owned(),
+                paper: paper.to_owned(),
+                orientation,
+                scale: format!("1/{scale_denominator}"),
+                origin: [0.0, 0.0],
+                margins: [10.0; 4],
+                plot_area: None,
+            },
+        )]),
+    }
+}
+
+fn default_layers(scale_denominator: u32) -> cad_model::LayerRules {
+    let specs = [
+        ("0-1", "WALL", 0.35, true),
+        ("0-2", "OPENING", 0.25, true),
+        ("0-3", "FIXTURE", 0.18, true),
+        ("0-4", "TEXT", 0.18, true),
+        ("0-5", "DIMENSION", 0.18, true),
+        ("0-6", "HATCH", 0.13, true),
+        ("0-7", "AUX", 0.13, false),
+    ];
+    cad_model::LayerRules {
+        groups: BTreeMap::from([(
+            "0".to_owned(),
+            cad_model::LayerGroupDef {
+                name: "ARCHITECTURE".to_owned(),
+                order: 0,
+                scale_denominator: f64::from(scale_denominator),
+                visible: true,
+                locked: false,
+            },
+        )]),
+        active_layer: Some("0-1".to_owned()),
+        layers: specs
+            .into_iter()
+            .enumerate()
+            .map(|(order, (id, name, width, printable))| {
+                (
+                    id.to_owned(),
+                    cad_model::LayerDef {
+                        name: name.to_owned(),
+                        group: Some("0".to_owned()),
+                        order: order as u16,
+                        locked: false,
+                        visible: true,
+                        printable,
+                        color: "black".to_owned(),
+                        line_type: "solid".to_owned(),
+                        line_width: width,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn default_styles(scale_denominator: u32) -> cad_model::StyleRules {
+    let scale = f64::from(scale_denominator);
+    cad_model::StyleRules {
+        colors: BTreeMap::from([
+            (
+                "black".to_owned(),
+                cad_model::ColorDef {
+                    rgb: "#111827".to_owned(),
+                    print_rgb: Some("#000000".to_owned()),
+                    print_width: 0.18,
+                },
+            ),
+            (
+                "blue".to_owned(),
+                cad_model::ColorDef {
+                    rgb: "#2563EB".to_owned(),
+                    print_rgb: Some("#000000".to_owned()),
+                    print_width: 0.13,
+                },
+            ),
+        ]),
+        line_types: BTreeMap::from([
+            ("solid".to_owned(), cad_model::LineTypeDef { dash: vec![] }),
+            (
+                "dashed".to_owned(),
+                cad_model::LineTypeDef {
+                    dash: vec![4.0, 2.0],
+                },
+            ),
+            (
+                "center".to_owned(),
+                cad_model::LineTypeDef {
+                    dash: vec![8.0, 2.0, 2.0, 2.0],
+                },
+            ),
+        ]),
+        pens: BTreeMap::new(),
+        text_styles: BTreeMap::from([(
+            "standard".to_owned(),
+            cad_model::TextStyleDef {
+                font_family: "M PLUS 1p".to_owned(),
+                height: 2.5 * scale,
+                width: 1.25 * scale,
+                spacing: 0.0,
+                align: cad_model::TextAlign::Left,
+            },
+        )]),
+        dimension_styles: BTreeMap::from([(
+            "standard".to_owned(),
+            cad_model::DimensionStyleDef {
+                text_style: "standard".to_owned(),
+                arrow_size: 1.2 * scale,
+                extension_gap: 0.4 * scale,
+                precision: 0,
+                unit: "mm".to_owned(),
+            },
+        )]),
+    }
+}
+
+fn write_toml<T: Serialize>(path: &Path, value: &T) -> EditResult<()> {
+    let text = toml::to_string_pretty(value)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    write_synced(path, text.as_bytes())
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> EditResult<()> {
+    fs::write(path, bytes).map_err(|source| EditError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| EditError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn publish_directory_no_replace(staging: &Path, destination: &Path) -> EditResult<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        staging,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST || error == rustix::io::Errno::NOTEMPTY {
+            EditError::RevisionConflict
+        } else {
+            EditError::Write {
+                path: destination.to_path_buf(),
+                source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct SourceTransaction {
@@ -121,6 +618,52 @@ const fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EditOperation {
+    SourceChecked {
+        operation: Box<EditOperation>,
+        expected_files: Vec<cad_model::SourceFileRevision>,
+    },
+    ResolveDimensions {
+        operation: Box<EditOperation>,
+        resolutions: Vec<DimensionResolution>,
+    },
+    Endpoint {
+        entity_id: String,
+        vertex_index: usize,
+        to: Point,
+    },
+    Stretch {
+        entity_ids: Vec<String>,
+        min: Point,
+        max: Point,
+        delta: Point,
+    },
+    Rectangle {
+        layer: String,
+        p1: Point,
+        p2: Point,
+    },
+    RectangularArray {
+        entity_ids: Vec<String>,
+        rows: usize,
+        columns: usize,
+        row_spacing: f64,
+        column_spacing: f64,
+    },
+    Fillet {
+        first_entity_id: String,
+        second_entity_id: String,
+        first_pick: Point,
+        second_pick: Point,
+        radius: f64,
+    },
+    Chamfer {
+        first_entity_id: String,
+        second_entity_id: String,
+        first_pick: Point,
+        second_pick: Point,
+        first_distance: f64,
+        second_distance: f64,
+    },
     Batch {
         operations: Vec<EditOperation>,
     },
@@ -178,6 +721,10 @@ pub enum EditOperation {
         rotation_deg: f64,
         scale: f64,
         #[serde(default)]
+        mirror_x: bool,
+        #[serde(default)]
+        mirror_y: bool,
+        #[serde(default)]
         entity_id: Option<String>,
     },
     UpdateHatch {
@@ -200,10 +747,108 @@ pub enum EditOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimensionResolution {
+    pub entity_id: String,
+    pub action: DimensionResolutionAction,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DimensionResolutionAction {
+    Delete,
+    Detach,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrawingEditRequest {
     pub drawing: String,
     pub expected_revision: String,
     pub operation: EditOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrawingEditPreview {
+    pub source_files: Vec<cad_model::SourceFileRevision>,
+    pub drawing: String,
+    pub expected_revision: String,
+    pub entities: Vec<Value>,
+    pub entity_ids: Vec<String>,
+    pub warnings: Vec<String>,
+    pub dimension_impacts: Vec<String>,
+}
+
+/// Evaluates the same operation as commit without writing source or history.
+pub fn preview_edit(
+    project_path: &Path,
+    request: &DrawingEditRequest,
+) -> EditResult<DrawingEditPreview> {
+    let source_files = cad_model::source_manifest(project_path)
+        .map_err(|e| EditError::InvalidEntity(e.to_string()))?;
+    let mut project = cad_model::load_project(project_path)
+        .map_err(|e| EditError::InvalidEntity(e.to_string()))?;
+    let index = project
+        .drawings
+        .iter()
+        .position(|d| d.name == request.drawing)
+        .ok_or_else(|| EditError::DrawingNotFound(request.drawing.clone()))?;
+    let path = entities_path(project_path, &request.drawing);
+    let bytes = fs::read(&path).map_err(|source| EditError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    if revision(&bytes) != request.expected_revision {
+        return Err(EditError::RevisionConflict);
+    }
+    let baseline = checker_errors(&project);
+    let text = String::from_utf8(bytes).map_err(|e| EditError::InvalidEntity(e.to_string()))?;
+    let mut raw = split_raw_lines(&text);
+    let mut entities = project.drawings[index]
+        .entities
+        .iter()
+        .map(|r| r.entity.clone())
+        .collect::<Vec<_>>();
+    let before = entities.clone();
+    let warnings = geometry_edit::warnings(&project, &before, &request.operation);
+    let result = apply_operation(&request.operation, &project, &mut entities, &mut raw)?;
+    geometry_edit::remap_trim_endpoints(&before, &mut entities, &mut raw, &request.operation)?;
+    geometry_edit::remap_retained_vertices(&before, &mut entities, &mut raw)?;
+    let dimension_impacts = geometry_edit::dimension_impacts(&before, &entities);
+    project.drawings[index].entities = entities
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, entity)| EntityRecord {
+            line: index + 1,
+            entity,
+        })
+        .collect();
+    let errors = checker_errors(&project)
+        .difference(&baseline)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !errors.is_empty() && dimension_impacts.is_empty() {
+        return Err(EditError::CheckFailed(errors.join("; ")));
+    }
+    Ok(DrawingEditPreview {
+        source_files: {
+            if cad_model::source_manifest(project_path)
+                .map_err(|e| EditError::InvalidEntity(e.to_string()))?
+                != source_files
+            {
+                return Err(EditError::RevisionConflict);
+            }
+            source_files
+        },
+        drawing: request.drawing.clone(),
+        expected_revision: request.expected_revision.clone(),
+        entities: entities
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| EditError::InvalidEntity(e.to_string()))?,
+        entity_ids: result.entity_ids,
+        warnings: warnings.into_iter().chain(errors).collect(),
+        dimension_impacts,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +922,7 @@ pub struct EditorDrawingState {
     pub text_styles: Vec<String>,
     pub dimension_styles: Vec<String>,
     pub pens: Vec<String>,
+    pub fills: Vec<String>,
 }
 
 pub fn editor_state(project: &ProjectSource, drawing: &str) -> EditResult<EditorDrawingState> {
@@ -301,6 +947,7 @@ pub fn editor_state(project: &ProjectSource, drawing: &str) -> EditResult<Editor
         text_styles: project.styles.text_styles.keys().cloned().collect(),
         dimension_styles: project.styles.dimension_styles.keys().cloned().collect(),
         pens: project.styles.pens.keys().cloned().collect(),
+        fills: project.styles.colors.keys().cloned().collect(),
     })
 }
 
@@ -792,7 +1439,18 @@ pub fn list_drawing_history(project_path: &Path, drawing: &str) -> EditResult<Dr
 }
 
 pub fn clear_drawing_history(project_path: &Path, drawing: &str) -> EditResult<()> {
-    with_history_lock(|| clear_drawing_history_locked(project_path, drawing))
+    clear_drawing_history_with(project_path, drawing, || {})
+}
+
+fn clear_drawing_history_with(
+    project_path: &Path,
+    drawing: &str,
+    before_clear: impl FnOnce(),
+) -> EditResult<()> {
+    with_history_lock(|| {
+        before_clear();
+        clear_drawing_history_locked(project_path, drawing)
+    })
 }
 
 fn clear_drawing_history_locked(project_path: &Path, drawing: &str) -> EditResult<()> {
@@ -1345,6 +2003,34 @@ pub fn apply_edit(
         }
     };
 
+    let before_entities = project.drawings[drawing_index]
+        .entities
+        .iter()
+        .map(|r| r.entity.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = geometry_edit::remap_trim_endpoints(
+        &before_entities,
+        &mut entities,
+        &mut raw_lines,
+        &request.operation,
+    ) {
+        history_stage.abort();
+        return Err(error);
+    }
+    if let Err(error) =
+        geometry_edit::remap_retained_vertices(&before_entities, &mut entities, &mut raw_lines)
+    {
+        history_stage.abort();
+        return Err(error);
+    }
+    let impacts = geometry_edit::dimension_impacts(&before_entities, &entities);
+    if !impacts.is_empty() {
+        history_stage.abort();
+        return Err(EditError::InvalidEntity(format!(
+            "dimension_resolution_required: {}",
+            impacts.join(", ")
+        )));
+    }
     project.drawings[drawing_index].entities = entities
         .into_iter()
         .enumerate()
@@ -1387,6 +2073,10 @@ pub fn apply_edit(
         return Err(error);
     }
     if let Err(error) = history_stage.prepare_commit_journal() {
+        history_stage.abort();
+        return Err(error);
+    }
+    if let Err(error) = geometry_edit::verify_source_checks(project_path, &request.operation) {
         history_stage.abort();
         return Err(error);
     }
@@ -1722,6 +2412,59 @@ fn apply_operation(
     raw_lines: &mut Vec<RawLine>,
 ) -> EditResult<OperationResult> {
     match operation {
+        EditOperation::SourceChecked {
+            operation,
+            expected_files,
+        } => {
+            if cad_model::source_manifest(&project.root)
+                .map_err(|e| EditError::InvalidEntity(e.to_string()))?
+                != *expected_files
+            {
+                return Err(EditError::RevisionConflict);
+            }
+            apply_operation(operation, project, entities, raw_lines)
+        }
+        EditOperation::ResolveDimensions {
+            operation,
+            resolutions,
+        } => {
+            let ids = resolutions
+                .iter()
+                .map(|r| r.entity_id.clone())
+                .collect::<Vec<_>>();
+            ensure_unique_entity_ids(&ids)?;
+            for resolution in resolutions {
+                let index = entity_index(entities, &resolution.entity_id)?;
+                ensure_layer_editable(project, entities[index].layer())?;
+                if !matches!(entities[index], Entity::Dimension { .. }) {
+                    return Err(EditError::InvalidEntity(
+                        "resolution requires dimension".into(),
+                    ));
+                }
+                match resolution.action {
+                    DimensionResolutionAction::Delete => {
+                        remove_raw_line(raw_lines, index);
+                        entities.remove(index);
+                    }
+                    DimensionResolutionAction::Detach => {
+                        cad_model::detach_dimension(project, &mut entities[index])
+                            .map_err(EditError::InvalidEntity)?;
+                        raw_lines[index].content = entity_json(&entities[index])?;
+                    }
+                }
+            }
+            let mut result = apply_operation(operation, project, entities, raw_lines)?;
+            result.entity_ids.extend(ids);
+            Ok(result)
+        }
+        EditOperation::Endpoint { .. }
+        | EditOperation::Stretch { .. }
+        | EditOperation::Rectangle { .. }
+        | EditOperation::RectangularArray { .. }
+        | EditOperation::Fillet { .. }
+        | EditOperation::Chamfer { .. } => {
+            geometry_edit::apply(operation, project, entities, raw_lines)
+        }
         EditOperation::Batch { operations } => {
             if operations.is_empty() {
                 return Err(EditError::InvalidEntity(
@@ -1755,6 +2498,8 @@ fn apply_operation(
             at,
             rotation_deg,
             scale,
+            mirror_x,
+            mirror_y,
             entity_id,
         } => {
             if !project.blocks.contains_key(block) {
@@ -1782,6 +2527,8 @@ fn apply_operation(
                 "at": at,
                 "rotation_deg": rotation_deg,
                 "scale": scale,
+                "mirror_x": mirror_x,
+                "mirror_y": mirror_y,
             }))?;
             let id = entity.id().as_str().to_owned();
             append_raw_line(raw_lines, entity_json(&entity)?);
@@ -1839,6 +2586,7 @@ fn apply_operation(
             }
             let source_ids = entity_ids.clone();
             let mut result_ids = Vec::new();
+            let mut replacements = BTreeMap::new();
             for entity_id in source_ids {
                 let index = entity_index(entities, &entity_id)?;
                 ensure_layer_editable(project, entities[index].layer())?;
@@ -1846,6 +2594,11 @@ fn apply_operation(
                 validate_entity_geometry(&translated)?;
                 let id = if *duplicate {
                     let id = next_id();
+                    replacements.insert(
+                        translated.id().clone(),
+                        cad_model::EntityId::parse(&id)
+                            .map_err(|e| EditError::InvalidEntity(e.to_string()))?,
+                    );
                     set_entity_id(&mut translated, &id)?;
                     insert_raw_line_after(raw_lines, index, entity_json(&translated)?);
                     entities.insert(index + 1, translated);
@@ -1856,6 +2609,13 @@ fn apply_operation(
                     entity_id
                 };
                 result_ids.push(id);
+            }
+            if *duplicate {
+                for id in &result_ids {
+                    let index = entity_index(entities, id)?;
+                    cad_model::remap_dimension_references(&mut entities[index], &replacements);
+                    raw_lines[index].content = entity_json(&entities[index])?;
+                }
             }
             Ok(OperationResult {
                 entity_ids: result_ids,
@@ -1945,14 +2705,22 @@ fn apply_operation(
                     "offset distance is invalid".to_owned(),
                 ));
             }
-            transform_entities(
-                project,
-                entities,
-                raw_lines,
-                entity_ids,
-                |entity| offset_entity(entity, *distance),
-                "offset",
-            )
+            let mut result_ids = Vec::new();
+            for entity_id in entity_ids {
+                let index = entity_index(entities, entity_id)?;
+                ensure_layer_editable(project, entities[index].layer())?;
+                let mut entity = offset_entity(&entities[index], *distance)?;
+                validate_entity_geometry(&entity)?;
+                let id = next_id();
+                set_entity_id(&mut entity, &id)?;
+                append_raw_line(raw_lines, entity_json(&entity)?);
+                entities.push(entity);
+                result_ids.push(id);
+            }
+            Ok(OperationResult {
+                entity_ids: result_ids,
+                operation: "offset",
+            })
         }
         EditOperation::Trim {
             target_entity_id,
@@ -1973,12 +2741,23 @@ fn apply_operation(
             let cutter = entity_index(entities, cutter_entity_id)?;
             ensure_layer_editable(project, entities[target].layer())?;
             ensure_layer_editable(project, entities[cutter].layer())?;
-            let trimmed = trim_entity(&entities[target], &entities[cutter], *pick_point)?;
-            validate_entity_geometry(&trimmed)?;
-            raw_lines[target].content = entity_json(&trimmed)?;
-            entities[target] = trimmed;
+            let trimmed = geometry_edit::trim(&entities[target], &entities[cutter], *pick_point)?;
+            let mut result_ids = vec![target_entity_id.clone()];
+            for (part, mut entity) in trimmed.into_iter().enumerate() {
+                validate_entity_geometry(&entity)?;
+                if part == 0 {
+                    raw_lines[target].content = entity_json(&entity)?;
+                    entities[target] = entity;
+                } else {
+                    let id = next_id();
+                    set_entity_id(&mut entity, &id)?;
+                    append_raw_line(raw_lines, entity_json(&entity)?);
+                    entities.push(entity);
+                    result_ids.push(id);
+                }
+            }
             Ok(OperationResult {
-                entity_ids: vec![target_entity_id.clone()],
+                entity_ids: result_ids,
                 operation: "trim",
             })
         }
@@ -2001,7 +2780,8 @@ fn apply_operation(
             let boundary = entity_index(entities, boundary_entity_id)?;
             ensure_layer_editable(project, entities[target].layer())?;
             ensure_layer_editable(project, entities[boundary].layer())?;
-            let extended = extend_entity(&entities[target], &entities[boundary], *pick_point)?;
+            let extended =
+                geometry_edit::extend(&entities[target], &entities[boundary], *pick_point)?;
             validate_entity_geometry(&extended)?;
             raw_lines[target].content = entity_json(&extended)?;
             entities[target] = extended;
@@ -2176,6 +2956,19 @@ fn add_angle_fields(value: &mut Value, angle_deg: f64) {
 
 fn offset_entity(entity: &Entity, distance: f64) -> EditResult<Entity> {
     match entity {
+        Entity::Circle { radius, .. } | Entity::Arc { radius, .. } => {
+            let radius = radius + distance;
+            if !radius.is_finite() || radius <= 0.0 {
+                return Err(EditError::InvalidEntity(format!(
+                    "{}: offset radius must be positive",
+                    entity.id().as_str()
+                )));
+            }
+            let mut value = serde_json::to_value(entity)
+                .map_err(|e| EditError::InvalidEntity(e.to_string()))?;
+            value["radius"] = Value::from(radius);
+            serde_json::from_value(value).map_err(|e| EditError::InvalidEntity(e.to_string()))
+        }
         Entity::Line { p1, p2, .. } => {
             let normal = offset_normal(*p1, *p2, distance)?;
             replace_entity_points(
@@ -2199,6 +2992,11 @@ fn offset_entity(entity: &Entity, distance: f64) -> EditResult<Entity> {
 }
 
 fn offset_polyline(points: &[Point], closed: bool, distance: f64) -> EditResult<Vec<Point>> {
+    if closed && points.len() > 2 && points.first() == points.last() {
+        let mut result = offset_polyline(&points[..points.len() - 1], true, distance)?;
+        result.push(result[0]);
+        return Ok(result);
+    }
     let segment_count = if closed {
         points.len()
     } else {
@@ -2257,6 +3055,11 @@ fn offset_polyline(points: &[Point], closed: bool, distance: f64) -> EditResult<
 }
 
 fn polyline_self_intersects(points: &[Point], closed: bool) -> bool {
+    let points = if closed && points.len() > 2 && points.first() == points.last() {
+        &points[..points.len() - 1]
+    } else {
+        points
+    };
     let segment_count = if closed {
         points.len()
     } else {
@@ -2321,136 +3124,6 @@ fn replace_entity_points(entity: &Entity, points: &[Point]) -> EditResult<Entity
     serde_json::from_value(value).map_err(|error| EditError::InvalidEntity(error.to_string()))
 }
 
-fn trim_entity(target: &Entity, cutter: &Entity, pick_point: Point) -> EditResult<Entity> {
-    let target_segments = path_segments(target)?;
-    let cutter_segments = path_segments(cutter)?;
-    let intersections = segment_intersections(&target_segments, &cutter_segments);
-    if intersections.is_empty() {
-        return Err(EditError::InvalidEntity(
-            "trim entities do not intersect".to_owned(),
-        ));
-    }
-    if intersections.len() > 1 {
-        return Err(EditError::InvalidEntity(
-            "trim intersection is ambiguous".to_owned(),
-        ));
-    }
-    let (segment_index, intersection) = intersections[0];
-    match target {
-        Entity::Line { p1, p2, .. } => {
-            let keep_start = distance_sq(pick_point, *p1) > distance_sq(pick_point, *p2);
-            let points = if keep_start {
-                [*p1, intersection]
-            } else {
-                [intersection, *p2]
-            };
-            replace_entity_points(target, &points)
-        }
-        Entity::Polyline { points, closed, .. } if !closed => {
-            let prefix_distance = path_distance_to_segment(points, segment_index, intersection);
-            let pick_distance = nearest_path_distance(points, pick_point);
-            if (pick_distance - prefix_distance).abs() <= 1e-9 {
-                return Err(EditError::InvalidEntity(
-                    "trim pick side is ambiguous".to_owned(),
-                ));
-            }
-            let kept = if pick_distance > prefix_distance {
-                let mut kept = points[..=segment_index].to_vec();
-                if distance_sq(*kept.last().expect("segment start"), intersection) > 1e-18 {
-                    kept.push(intersection);
-                }
-                kept
-            } else {
-                let mut kept = vec![intersection];
-                kept.extend_from_slice(&points[segment_index + 1..]);
-                kept
-            };
-            replace_entity_points(target, &kept)
-        }
-        Entity::Polyline { closed: true, .. } => Err(EditError::InvalidEntity(
-            "trim does not support closed polylines".to_owned(),
-        )),
-        _ => Err(EditError::InvalidEntity(
-            "trim supports line and open polyline entities only".to_owned(),
-        )),
-    }
-}
-
-fn extend_entity(target: &Entity, boundary: &Entity, pick_point: Point) -> EditResult<Entity> {
-    let target_points = match target {
-        Entity::Line { p1, p2, .. } => vec![*p1, *p2],
-        Entity::Polyline { points, closed, .. } if !closed => points.clone(),
-        Entity::Polyline { closed: true, .. } => {
-            return Err(EditError::InvalidEntity(
-                "extend does not support closed polylines".to_owned(),
-            ));
-        }
-        _ => {
-            return Err(EditError::InvalidEntity(
-                "extend supports line and open polyline entities only".to_owned(),
-            ));
-        }
-    };
-    let boundary_segments = path_segments(boundary)?;
-    let target_length = path_length(&target_points);
-    let pick_distance = nearest_path_distance(&target_points, pick_point);
-    let extend_start = pick_distance <= target_length / 2.0;
-    let endpoint = if extend_start {
-        target_points[0]
-    } else {
-        *target_points.last().expect("target endpoint")
-    };
-    let adjacent = if extend_start {
-        target_points[1]
-    } else {
-        target_points[target_points.len() - 2]
-    };
-    let extension_line_end = [
-        endpoint[0] + endpoint[0] - adjacent[0],
-        endpoint[1] + endpoint[1] - adjacent[1],
-    ];
-    let mut intersections = Vec::new();
-    for (boundary_start, boundary_end) in boundary_segments {
-        let Some(intersection) =
-            infinite_line_intersection(endpoint, extension_line_end, boundary_start, boundary_end)
-        else {
-            continue;
-        };
-        if !point_on_segment(intersection, boundary_start, boundary_end)
-            || point_on_segment(intersection, endpoint, adjacent)
-        {
-            continue;
-        }
-        if !intersections
-            .iter()
-            .any(|candidate: &Point| distance_sq(*candidate, intersection) <= 1e-18)
-        {
-            intersections.push(intersection);
-        }
-    }
-    let intersection = match intersections.as_slice() {
-        [] => {
-            return Err(EditError::InvalidEntity(
-                "extend boundary does not intersect the target path".to_owned(),
-            ));
-        }
-        [intersection] => *intersection,
-        _ => {
-            return Err(EditError::InvalidEntity(
-                "extend boundary intersection is ambiguous".to_owned(),
-            ));
-        }
-    };
-    let mut points = target_points;
-    if extend_start {
-        points[0] = intersection;
-    } else {
-        let last = points.len() - 1;
-        points[last] = intersection;
-    }
-    replace_entity_points(target, &points)
-}
-
 fn point_on_segment(point: Point, start: Point, end: Point) -> bool {
     point[0] >= start[0].min(end[0]) - 1e-9
         && point[0] <= start[0].max(end[0]) + 1e-9
@@ -2466,7 +3139,7 @@ fn path_segments(entity: &Entity) -> EditResult<Vec<(Point, Point)>> {
                 .windows(2)
                 .map(|pair| (pair[0], pair[1]))
                 .collect::<Vec<_>>();
-            if *closed {
+            if *closed && points.first() != points.last() {
                 segments.push((*points.last().expect("polyline point"), points[0]));
             }
             Ok(segments)
@@ -2505,14 +3178,6 @@ fn path_length(points: &[Point]) -> f64 {
         .windows(2)
         .map(|pair| distance_sq(pair[0], pair[1]).sqrt())
         .sum()
-}
-
-fn path_distance_to_segment(points: &[Point], segment_index: usize, point: Point) -> f64 {
-    points[..segment_index]
-        .windows(2)
-        .map(|pair| distance_sq(pair[0], pair[1]).sqrt())
-        .sum::<f64>()
-        + distance_sq(points[segment_index], point).sqrt()
 }
 
 fn nearest_path_distance(points: &[Point], point: Point) -> f64 {
@@ -3942,7 +4607,12 @@ pub fn translate_entity(entity: &Entity, delta: Point) -> EditResult<Entity> {
             [point[0] + delta[0], point[1] + delta[1]]
         });
     }
-    serde_json::from_value(value).map_err(|error| EditError::InvalidEntity(error.to_string()))
+    let mut result: Entity = serde_json::from_value(value)
+        .map_err(|error| EditError::InvalidEntity(error.to_string()))?;
+    cad_model::transform_dimension_fixed_anchors(&mut result, &|p| {
+        [p[0] + delta[0], p[1] + delta[1]]
+    });
+    Ok(result)
 }
 
 fn translate_json_point(value: &mut Value, delta: Point) -> EditResult<()> {
@@ -3965,6 +4635,10 @@ pub enum SnapKind {
     Endpoint,
     Midpoint,
     Intersection,
+    Center,
+    Quadrant,
+    Nearest,
+    Perpendicular,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4000,6 +4674,10 @@ impl RTreeObject for SnapSegment {
 pub struct SnapIndex {
     segments: RTree<SnapSegment>,
     points: Vec<(SnapKind, Point)>,
+    point_index: RTree<rstar::primitives::GeomWithData<Point, usize>>,
+    geometry: Vec<Entity>,
+    geometry_index:
+        RTree<rstar::primitives::GeomWithData<rstar::primitives::Rectangle<Point>, usize>>,
 }
 
 impl SnapIndex {
@@ -4025,25 +4703,115 @@ impl SnapIndex {
         }
         let mut seen = BTreeSet::new();
         points.retain(|(kind, point)| seen.insert((*kind, point[0].to_bits(), point[1].to_bits())));
+        let geometry = drawing
+            .entities
+            .iter()
+            .filter(|r| {
+                layer_visible(project, r.entity.layer())
+                    && matches!(
+                        r.entity,
+                        Entity::Line { .. }
+                            | Entity::Polyline { .. }
+                            | Entity::Circle { .. }
+                            | Entity::Arc { .. }
+                    )
+            })
+            .map(|r| r.entity.clone())
+            .collect::<Vec<_>>();
+        let point_index = RTree::bulk_load(
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, (_, point))| rstar::primitives::GeomWithData::new(*point, i))
+                .collect(),
+        );
+        let geometry_index = RTree::bulk_load(
+            geometry
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entity)| {
+                    cad_model::entity_bbox(entity).map(|bbox| {
+                        rstar::primitives::GeomWithData::new(
+                            rstar::primitives::Rectangle::from_corners(bbox.min, bbox.max),
+                            i,
+                        )
+                    })
+                })
+                .collect(),
+        );
         Ok(Self {
             segments: RTree::bulk_load(segments),
             points,
+            point_index,
+            geometry,
+            geometry_index,
         })
     }
 
     #[must_use]
     pub fn query(&self, point: Point, tolerance: f64, modes: &[SnapKind]) -> Option<SnapCandidate> {
+        self.query_with_reference(point, tolerance, modes, None)
+    }
+
+    #[must_use]
+    pub fn query_with_reference(
+        &self,
+        point: Point,
+        tolerance: f64,
+        modes: &[SnapKind],
+        reference: Option<Point>,
+    ) -> Option<SnapCandidate> {
         if tolerance <= 0.0 || !tolerance.is_finite() {
             return None;
         }
         let enabled = modes.iter().copied().collect::<BTreeSet<_>>();
-        let mut candidates = self
-            .points
-            .iter()
+        let envelope = AABB::from_corners(
+            [point[0] - tolerance, point[1] - tolerance],
+            [point[0] + tolerance, point[1] + tolerance],
+        );
+        let mut point_indices = self
+            .point_index
+            .locate_in_envelope_intersecting(envelope)
+            .map(|entry| entry.data)
+            .collect::<Vec<_>>();
+        point_indices.sort_unstable();
+        let mut candidates = point_indices
+            .into_iter()
+            .map(|i| &self.points[i])
             .filter(|(kind, _)| enabled.contains(kind))
             .filter_map(|(kind, candidate)| snap_candidate(*kind, *candidate, point, tolerance))
             .collect::<Vec<_>>();
+        let mut geometry_indices = self
+            .geometry_index
+            .locate_in_envelope_intersecting(envelope)
+            .map(|entry| entry.data)
+            .collect::<Vec<_>>();
+        geometry_indices.sort_unstable();
+        let local_geometry = geometry_indices
+            .into_iter()
+            .map(|i| &self.geometry[i])
+            .collect::<Vec<_>>();
         if enabled.contains(&SnapKind::Intersection) {
+            for left in 0..local_geometry.len() {
+                for right in left + 1..local_geometry.len() {
+                    if !matches!(
+                        local_geometry[left],
+                        Entity::Arc { .. } | Entity::Circle { .. }
+                    ) && !matches!(
+                        local_geometry[right],
+                        Entity::Arc { .. } | Entity::Circle { .. }
+                    ) {
+                        continue;
+                    }
+                    if let Ok(hits) =
+                        geometry_edit::intersections(local_geometry[left], local_geometry[right])
+                    {
+                        candidates.extend(hits.into_iter().filter_map(|p| {
+                            snap_candidate(SnapKind::Intersection, p, point, tolerance)
+                        }));
+                    }
+                }
+            }
             let envelope = AABB::from_corners(
                 [point[0] - tolerance, point[1] - tolerance],
                 [point[0] + tolerance, point[1] + tolerance],
@@ -4064,11 +4832,62 @@ impl SnapIndex {
                 }
             }
         }
-        candidates.into_iter().min_by(|left, right| {
+        if enabled.contains(&SnapKind::Nearest) || enabled.contains(&SnapKind::Perpendicular) {
+            for entity in &local_geometry {
+                if enabled.contains(&SnapKind::Nearest)
+                    && let Some(p) = geometry_edit::nearest_curve_point(entity, point)
+                    && let Some(candidate) = snap_candidate(SnapKind::Nearest, p, point, tolerance)
+                {
+                    candidates.push(candidate);
+                }
+                if enabled.contains(&SnapKind::Perpendicular)
+                    && let Some(reference) = reference
+                    && let Some(p) = geometry_edit::perpendicular_curve_point(entity, reference)
+                    && let Some(candidate) =
+                        snap_candidate(SnapKind::Perpendicular, p, point, tolerance)
+                {
+                    candidates.push(candidate);
+                }
+            }
+            let envelope = AABB::from_corners(
+                [point[0] - tolerance, point[1] - tolerance],
+                [point[0] + tolerance, point[1] + tolerance],
+            );
+            for segment in self.segments.locate_in_envelope_intersecting(envelope) {
+                if enabled.contains(&SnapKind::Nearest)
+                    && let Some(candidate) = snap_candidate(
+                        SnapKind::Nearest,
+                        nearest_point_on_segment(point, *segment),
+                        point,
+                        tolerance,
+                    )
+                {
+                    candidates.push(candidate);
+                }
+                if enabled.contains(&SnapKind::Perpendicular)
+                    && let Some(reference) = reference
+                    && let Some(candidate) = snap_candidate(
+                        SnapKind::Perpendicular,
+                        nearest_point_on_segment(reference, *segment),
+                        point,
+                        tolerance,
+                    )
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        let compare_distance = |left: &SnapCandidate, right: &SnapCandidate| {
             left.distance
                 .partial_cmp(&right.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        };
+        candidates
+            .iter()
+            .filter(|candidate| candidate.kind != SnapKind::Nearest)
+            .min_by(|left, right| compare_distance(left, right))
+            .cloned()
+            .or_else(|| candidates.into_iter().min_by(compare_distance))
     }
 }
 
@@ -4128,6 +4947,7 @@ fn append_direct_snap_points(entity: &Entity, output: &mut Vec<(SnapKind, Point)
             end_deg,
             ..
         } => {
+            output.push((SnapKind::Center, *center));
             output.push((
                 SnapKind::Endpoint,
                 polar_point(*center, *radius, *start_deg),
@@ -4137,6 +4957,11 @@ fn append_direct_snap_points(entity: &Entity, output: &mut Vec<(SnapKind, Point)
                 SnapKind::Midpoint,
                 polar_point(*center, *radius, (*start_deg + *end_deg) / 2.0),
             ));
+            for angle in [0.0, 90.0, 180.0, 270.0] {
+                if angle_on_arc(angle, *start_deg, *end_deg) {
+                    output.push((SnapKind::Quadrant, polar_point(*center, *radius, angle)));
+                }
+            }
         }
         Entity::Ellipse {
             center,
@@ -4147,6 +4972,7 @@ fn append_direct_snap_points(entity: &Entity, output: &mut Vec<(SnapKind, Point)
             end_deg,
             ..
         } => {
+            output.push((SnapKind::Center, *center));
             output.push((
                 SnapKind::Endpoint,
                 cad_model::ellipse_point(*center, *radius_x, *radius_y, *rotation_deg, *start_deg),
@@ -4165,9 +4991,29 @@ fn append_direct_snap_points(entity: &Entity, output: &mut Vec<(SnapKind, Point)
                     (*start_deg + *end_deg) / 2.0,
                 ),
             ));
+            for angle in [0.0, 90.0, 180.0, 270.0] {
+                if angle_on_arc(angle, *start_deg, *end_deg) {
+                    output.push((
+                        SnapKind::Quadrant,
+                        cad_model::ellipse_point(
+                            *center,
+                            *radius_x,
+                            *radius_y,
+                            *rotation_deg,
+                            angle,
+                        ),
+                    ));
+                }
+            }
         }
-        Entity::Circle { center, .. } | Entity::Point { at: center, .. } => {
-            output.push((SnapKind::Midpoint, *center));
+        Entity::Circle { center, radius, .. } => {
+            output.push((SnapKind::Center, *center));
+            for angle in [0.0, 90.0, 180.0, 270.0] {
+                output.push((SnapKind::Quadrant, polar_point(*center, *radius, angle)));
+            }
+        }
+        Entity::Point { at, .. } => {
+            output.push((SnapKind::Endpoint, *at));
         }
         Entity::Text { at, .. } | Entity::BlockRef { at, .. } => {
             output.push((SnapKind::Endpoint, *at));
@@ -4186,6 +5032,39 @@ fn polar_point(center: Point, radius: f64, degrees: f64) -> Point {
 
 fn midpoint(left: Point, right: Point) -> Point {
     [(left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0]
+}
+
+fn angle_on_arc(angle: f64, start: f64, end: f64) -> bool {
+    const ANGLE_EPSILON: f64 = 1.0e-9;
+    let normalize = |value: f64| value.rem_euclid(360.0);
+    let sweep = end - start;
+    if sweep.abs() >= 360.0 - ANGLE_EPSILON {
+        return true;
+    }
+    if sweep >= 0.0 {
+        normalize(angle - start) <= sweep + ANGLE_EPSILON
+    } else {
+        normalize(start - angle) <= -sweep + ANGLE_EPSILON
+    }
+}
+
+fn nearest_point_on_segment(point: Point, segment: SnapSegment) -> Point {
+    let delta = [
+        segment.end[0] - segment.start[0],
+        segment.end[1] - segment.start[1],
+    ];
+    let length_squared = delta[0] * delta[0] + delta[1] * delta[1];
+    if length_squared <= f64::EPSILON {
+        return segment.start;
+    }
+    let projection = ((point[0] - segment.start[0]) * delta[0]
+        + (point[1] - segment.start[1]) * delta[1])
+        / length_squared;
+    let t = projection.clamp(0.0, 1.0);
+    [
+        segment.start[0] + t * delta[0],
+        segment.start[1] + t * delta[1],
+    ]
 }
 
 fn snap_candidate(
@@ -4226,6 +5105,172 @@ fn segment_intersection(left: SnapSegment, right: SnapSegment) -> Option<Point> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_template_is_published_as_a_valid_canonical_project() {
+        let parent = tempfile::tempdir().expect("parent");
+        let result = create_project(&ProjectTemplateRequest {
+            parent_dir: parent.path().to_string_lossy().into_owned(),
+            folder_name: "daily-cad".to_owned(),
+            project_name: "Daily CAD".to_owned(),
+            drawing: "plan".to_owned(),
+            paper: "A3".to_owned(),
+            orientation: cad_model::SheetOrientation::Landscape,
+            scale_denominator: 100,
+        })
+        .expect("create project");
+
+        let project = cad_model::load_project(&result.project_path).expect("load project");
+        assert_eq!(project.project.name, "Daily CAD");
+        assert_eq!(project.drawings.len(), 1);
+        let plan = project
+            .drawings
+            .iter()
+            .find(|drawing| drawing.name == "plan")
+            .expect("plan");
+        assert_eq!(plan.layouts.layouts["default"].scale, "1/100");
+        assert!(
+            cad_check::check_loaded_project(&project)
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error)
+        );
+    }
+
+    #[test]
+    fn drawing_templates_add_and_duplicate_without_reusing_entity_ids() {
+        let parent = tempfile::tempdir().expect("parent");
+        let created = create_project(&ProjectTemplateRequest {
+            parent_dir: parent.path().to_string_lossy().into_owned(),
+            folder_name: "drawing-ops".to_owned(),
+            project_name: "Drawing operations".to_owned(),
+            drawing: "plan".to_owned(),
+            paper: "A3".to_owned(),
+            orientation: cad_model::SheetOrientation::Landscape,
+            scale_denominator: 100,
+        })
+        .expect("create project");
+        let source = Path::new(&created.project_path).join("drawings/plan/entities.ndjson");
+        fs::write(
+            &source,
+            "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,0.0],\"p2\":[10.0,0.0]}\n",
+        )
+        .expect("source entity");
+        let line = fs::read_to_string(&source).expect("line");
+        let dimension = serde_json::json!({
+            "schema_version": cad_model::CURRENT_SCHEMA_VERSION,
+            "id": "ent_01JZ0000000000000000000001",
+            "type": "dimension", "layer": "0-1", "style": "standard",
+            "p1": [0, 0], "p2": [10, 0], "offset": 2,
+            "measurement": {
+                "kind": "aligned",
+                "first": {"kind": "entity", "entity_id": "ent_01JZ0000000000000000000000", "feature": "start"},
+                "second": {"kind": "entity", "entity_id": "ent_01JZ0000000000000000000000", "feature": "end"}
+            }
+        });
+        // Put the dimension before its target to exercise forward references.
+        fs::write(&source, format!("{dimension}\n{line}")).expect("associated dimension");
+
+        add_drawing(&DrawingTemplateRequest {
+            project_path: created.project_path.clone(),
+            drawing: "detail".to_owned(),
+            paper: "A4".to_owned(),
+            orientation: cad_model::SheetOrientation::Portrait,
+            scale_denominator: 20,
+        })
+        .expect("add drawing");
+        duplicate_drawing(&DuplicateDrawingRequest {
+            project_path: created.project_path.clone(),
+            source_drawing: "plan".to_owned(),
+            drawing: "plan-copy".to_owned(),
+        })
+        .expect("duplicate drawing");
+
+        let project = cad_model::load_project(&created.project_path).expect("load project");
+        assert_eq!(project.drawings.len(), 3);
+        let original_id = project
+            .drawings
+            .iter()
+            .find(|drawing| drawing.name == "plan")
+            .expect("plan")
+            .entities[0]
+            .entity
+            .id()
+            .as_str()
+            .to_owned();
+        let copied_id = project
+            .drawings
+            .iter()
+            .find(|drawing| drawing.name == "plan-copy")
+            .expect("plan copy")
+            .entities[0]
+            .entity
+            .id()
+            .as_str()
+            .to_owned();
+        assert_ne!(original_id, copied_id);
+        let copy = project
+            .drawings
+            .iter()
+            .find(|drawing| drawing.name == "plan-copy")
+            .unwrap();
+        assert_eq!(
+            cad_model::evaluate_dimension(&project, &copy.entities[0].entity)
+                .unwrap()
+                .measured,
+            10.0
+        );
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            format!("{dimension}\n{line}")
+        );
+        assert!(
+            cad_check::check_loaded_project(&project)
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error)
+        );
+
+        let root = Path::new(&created.project_path);
+        let before = cad_model::source_manifest(root).unwrap();
+        let layouts = fs::read(root.join("drawings/plan/layouts.toml")).unwrap();
+        // Without its target line this dimension must never reach the drawings directory.
+        assert!(matches!(
+            publish_drawing_bytes(
+                root,
+                "invalid-copy",
+                &layouts,
+                format!("{dimension}\n").as_bytes()
+            ),
+            Err(EditError::CheckFailed(_))
+        ));
+        assert!(!root.join("drawings/invalid-copy").exists());
+        assert_eq!(cad_model::source_manifest(root).unwrap(), before);
+    }
+
+    #[test]
+    fn project_template_refuses_unsafe_or_existing_destinations() {
+        let parent = tempfile::tempdir().expect("parent");
+        let mut request = ProjectTemplateRequest {
+            parent_dir: parent.path().to_string_lossy().into_owned(),
+            folder_name: "../escape".to_owned(),
+            project_name: "Unsafe".to_owned(),
+            drawing: "plan".to_owned(),
+            paper: "A3".to_owned(),
+            orientation: cad_model::SheetOrientation::Landscape,
+            scale_denominator: 100,
+        };
+        assert!(matches!(
+            create_project(&request),
+            Err(EditError::InvalidEntity(_))
+        ));
+        request.folder_name = "safe".to_owned();
+        create_project(&request).expect("first create");
+        assert!(matches!(
+            create_project(&request),
+            Err(EditError::RevisionConflict)
+        ));
+    }
 
     #[test]
     fn source_transaction_rejects_jww_interop_files() {
@@ -4592,34 +5637,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn translates_every_entity_family() {
-        for source in [
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0,0],"p2":[1,1]}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0,0],[1,1]],"closed":false}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"circle","layer":"0-1","center":[0,0],"radius":2}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"text","layer":"0-1","style":"note","at":[0,0],"rotation_deg":0,"value":"A"}"#,
-        ] {
-            let entity: Entity = serde_json::from_str(source).expect("entity");
-            let moved = translate_entity(&entity, [5.0, -2.0]).expect("translate");
-            let bbox = cad_model::entity_bbox(&moved).expect("bbox");
-            assert!(bbox.max[0] >= 5.0);
-        }
-    }
-
-    #[test]
-    fn line_intersection_is_reported() {
-        let left = SnapSegment {
-            start: [0.0, 0.0],
-            end: [10.0, 10.0],
-        };
-        let right = SnapSegment {
-            start: [0.0, 10.0],
-            end: [10.0, 0.0],
-        };
-        assert_eq!(segment_intersection(left, right), Some([5.0, 5.0]));
-    }
-
-    #[test]
     fn applies_atomic_translate_and_preserves_other_raw_lines() {
         let temp = test_project(false);
         let project = cad_model::load_project(temp.path()).expect("project");
@@ -4714,30 +5731,6 @@ mod tests {
                 .all(|(index, _)| index > 0 && output.as_bytes()[index - 1] == b'\r')
         );
         assert_eq!(output.matches("\r\n").count(), output.lines().count() - 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_edit_preserves_unix_permission_bits() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = test_project(false);
-        let path = entities_path(temp.path(), "plan");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("set mode");
-
-        apply_test_edit(
-            temp.path(),
-            EditOperation::Translate {
-                entity_id: "ent_01JZ0000000000000000000000".to_owned(),
-                delta: [1.0, 0.0],
-                duplicate: false,
-            },
-        );
-
-        assert_eq!(
-            fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
-            0o640
-        );
     }
 
     #[test]
@@ -4871,7 +5864,7 @@ mod tests {
         fs::create_dir_all(temp.path().join("blocks/door")).expect("block directory");
         fs::write(
             temp.path().join("blocks/door/definition.toml"),
-            "schema_version = \"0.2\"\nname = \"Door\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"Door\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("definition");
         fs::write(temp.path().join("blocks/door/entities.ndjson"), "").expect("block entities");
@@ -4901,7 +5894,7 @@ mod tests {
         let stale_layout = layout_revision(temp.path(), "plan").expect("layout revision");
         fs::write(
             temp.path().join("drawings/plan/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/50\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/50\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("external layout update");
         let layout_result = apply_edit(
@@ -4921,14 +5914,14 @@ mod tests {
         let definition = temp.path().join("blocks/door/definition.toml");
         fs::write(
             &definition,
-            "schema_version = \"0.2\"\nname = \"Door\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"Door\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("definition");
         fs::write(temp.path().join("blocks/door/entities.ndjson"), "").expect("entities");
         let stale_block = block_definition_revision(temp.path(), "door").expect("block revision");
         fs::write(
             &definition,
-            "schema_version = \"0.2\"\nname = \"External\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"External\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("external block update");
         let block_result = apply_edit(
@@ -4946,7 +5939,7 @@ mod tests {
     }
 
     #[test]
-    fn snap_index_finds_endpoint_midpoint_and_intersection() {
+    fn snap_index_finds_point_and_segment_snap_modes() {
         let temp = test_project(false);
         let project = cad_model::load_project(temp.path()).expect("project");
         let index = SnapIndex::build(&project, "plan").expect("index");
@@ -4965,9 +5958,78 @@ mod tests {
         assert_eq!(
             index
                 .query([5.0, 0.0], 1.0, &[SnapKind::Intersection])
+                .map(|value| value.point),
+            Some([5.0, 0.0])
+        );
+        assert_eq!(
+            index
+                .query([3.0, 0.2], 1.0, &[SnapKind::Nearest])
+                .map(|value| value.point),
+            Some([3.0, 0.0])
+        );
+        assert_eq!(
+            index
+                .query_with_reference(
+                    [3.0, 0.2],
+                    1.0,
+                    &[SnapKind::Perpendicular],
+                    Some([3.0, 4.0]),
+                )
+                .map(|value| value.point),
+            Some([3.0, 0.0])
+        );
+        assert_eq!(
+            index
+                .query([0.05, 0.0], 1.0, &[SnapKind::Endpoint, SnapKind::Nearest],)
+                .map(|value| value.kind),
+            Some(SnapKind::Endpoint)
+        );
+        assert_eq!(
+            index
+                .query(
+                    [5.05, 0.05],
+                    1.0,
+                    &[SnapKind::Intersection, SnapKind::Nearest],
+                )
                 .map(|value| value.kind),
             Some(SnapKind::Intersection)
         );
+        assert_eq!(
+            index
+                .query_with_reference(
+                    [3.0, 0.05],
+                    1.0,
+                    &[SnapKind::Perpendicular, SnapKind::Nearest],
+                    Some([3.0, 4.0]),
+                )
+                .map(|value| value.kind),
+            Some(SnapKind::Perpendicular)
+        );
+        assert_eq!(
+            index
+                .query([3.0, 0.05], 1.0, &[SnapKind::Nearest])
+                .map(|value| value.kind),
+            Some(SnapKind::Nearest)
+        );
+    }
+
+    #[test]
+    fn arc_angle_membership_preserves_direction_and_full_sweeps() {
+        assert!(angle_on_arc(0.0, 90.0, 0.0));
+        assert!(!angle_on_arc(180.0, 90.0, 0.0));
+        assert!(!angle_on_arc(270.0, 90.0, 0.0));
+
+        for quadrant in [0.0, 90.0, 180.0, 270.0] {
+            assert!(angle_on_arc(quadrant, 0.0, 360.0));
+            assert!(angle_on_arc(quadrant, 360.0, 0.0));
+        }
+
+        assert!(angle_on_arc(0.0, 350.0, 370.0));
+        assert!(!angle_on_arc(180.0, 350.0, 370.0));
+        assert!(angle_on_arc(0.0, 10.0, -10.0));
+        assert!(!angle_on_arc(180.0, 10.0, -10.0));
+        assert!(angle_on_arc(10.0, 10.0, 10.0));
+        assert!(!angle_on_arc(0.0, 10.0, 10.0));
     }
 
     #[test]
@@ -5078,7 +6140,13 @@ mod tests {
             .drawings[0]
             .entities[0]
             .entity;
-        assert!((entity_point(entity, "p1")[1] - 2.0).abs() < 1e-9);
+        assert!((entity_point(entity, "p1")[1]).abs() < 1e-9);
+        let project = cad_model::load_project(temp.path()).unwrap();
+        assert!(
+            (entity_point(&project.drawings[0].entities.last().unwrap().entity, "p1")[1] - 2.0)
+                .abs()
+                < 1e-9
+        );
 
         let temp = test_project(false);
         apply_test_edit(
@@ -5100,8 +6168,8 @@ mod tests {
         fs::write(
             entities_path(temp.path(), "plan"),
             concat!(
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,0.0],\"p2\":[2.0,0.0]}\n",
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[5.0,-5.0],\"p2\":[5.0,5.0]}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,0.0],\"p2\":[2.0,0.0]}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[5.0,-5.0],\"p2\":[5.0,5.0]}\n",
             ),
         )
         .expect("entities");
@@ -5110,7 +6178,7 @@ mod tests {
             EditOperation::Extend {
                 target_entity_id: "ent_01JZ0000000000000000000000".to_owned(),
                 boundary_entity_id: "ent_01JZ0000000000000000000001".to_owned(),
-                pick_point: [0.0, 0.0],
+                pick_point: [2.0, 0.0],
             },
         );
         let entity = &cad_model::load_project(temp.path())
@@ -5118,7 +6186,7 @@ mod tests {
             .drawings[0]
             .entities[0]
             .entity;
-        assert!((entity_point(entity, "p1")[0] - 5.0).abs() < 1e-9);
+        assert!((entity_point(entity, "p2")[0] - 5.0).abs() < 1e-9);
     }
 
     #[test]
@@ -5148,28 +6216,439 @@ mod tests {
     }
 
     #[test]
-    fn rotates_and_mirrors_every_supported_entity_family() {
-        let sources = [
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0,0],"p2":[1,0]}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0,0],[1,0],[1,1]],"closed":false}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"arc","layer":"0-1","center":[0,0],"radius":1,"start_deg":0,"end_deg":90}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"circle","layer":"0-1","center":[0,0],"radius":1}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"ellipse","layer":"0-1","center":[0,0],"radius_x":2,"radius_y":1,"rotation_deg":0,"start_deg":0,"end_deg":180}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","style":"note","at":[0,0],"rotation_deg":0,"mirror_y":false,"value":"A"}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","style":"dim","p1":[0,0],"p2":[1,0],"offset":1,"text_rotation_deg":0,"text_mirror_y":false,"value":null}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000007","type":"point","layer":"0-1","at":[0,0],"temporary":false,"marker_code":null,"rotation_deg":0,"scale":1}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000008","type":"solid","layer":"0-1","points":[[0,0],[1,0],[0,1]],"fill":"black"}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000009","type":"curve_solid","layer":"0-1","center":[0,0],"radius":1,"flatness":0.1,"rotation_deg":0,"start_deg":0,"end_deg":90,"solid_param":1,"encoding_code":1,"fill":"black"}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ000000000000000000000A","type":"block_ref","layer":"0-1","block":"B","at":[0,0],"rotation_deg":0,"scale":1}"#,
+    fn previews_endpoint_stretch_and_rectangle_without_writing() {
+        let temp = test_project(false);
+        let path = entities_path(temp.path(), "plan");
+        let before = fs::read(&path).unwrap();
+        let request = DrawingEditRequest {
+            drawing: "plan".into(),
+            expected_revision: revision(&before),
+            operation: EditOperation::Endpoint {
+                entity_id: "ent_01JZ0000000000000000000000".into(),
+                vertex_index: 1,
+                to: [20., 0.],
+            },
+        };
+        let preview = preview_edit(temp.path(), &request).unwrap();
+        assert_eq!(preview.entities[0]["p2"], serde_json::json!([20., 0.]));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!temp.path().join("build/.cad-history").exists());
+        apply_edit(temp.path(), &request).unwrap();
+        apply_test_edit(
+            temp.path(),
+            EditOperation::Stretch {
+                entity_ids: vec!["ent_01JZ0000000000000000000000".into()],
+                min: [19., -1.],
+                max: [21., 1.],
+                delta: [300., 0.],
+            },
+        );
+        let project = cad_model::load_project(temp.path()).unwrap();
+        assert_eq!(
+            entity_point(&project.drawings[0].entities[0].entity, "p1"),
+            [0., 0.]
+        );
+        assert_eq!(
+            entity_point(&project.drawings[0].entities[0].entity, "p2"),
+            [320., 0.]
+        );
+        apply_test_edit(
+            temp.path(),
+            EditOperation::Rectangle {
+                layer: "0-1".into(),
+                p1: [0., 0.],
+                p2: [100., 200.],
+            },
+        );
+        let project = cad_model::load_project(temp.path()).unwrap();
+        assert!(matches!(
+            project.drawings[0].entities.last().unwrap().entity,
+            Entity::Polyline { closed: true, .. }
+        ));
+    }
+
+    #[test]
+    fn preview_source_token_rejects_changed_rules() {
+        let temp = test_project(false);
+        let project = cad_model::load_project(temp.path()).unwrap();
+        let state = editor_state(&project, "plan").unwrap();
+        let operation = EditOperation::Endpoint {
+            entity_id: state.entities[0]["id"].as_str().unwrap().into(),
+            vertex_index: 1,
+            to: [20., 0.],
+        };
+        let preview = preview_edit(
+            temp.path(),
+            &DrawingEditRequest {
+                drawing: "plan".into(),
+                expected_revision: state.revision.clone(),
+                operation: operation.clone(),
+            },
+        )
+        .unwrap();
+        let path = temp.path().join("rules/layers.toml");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\n# external edit\n");
+        fs::write(path, bytes).unwrap();
+        let entities = fs::read(entities_path(temp.path(), "plan")).unwrap();
+        let result = apply_edit(
+            temp.path(),
+            &DrawingEditRequest {
+                drawing: "plan".into(),
+                expected_revision: state.revision,
+                operation: EditOperation::SourceChecked {
+                    operation: Box::new(operation),
+                    expected_files: preview.source_files,
+                },
+            },
+        );
+        assert!(matches!(result, Err(EditError::RevisionConflict)));
+        assert_eq!(
+            fs::read(entities_path(temp.path(), "plan")).unwrap(),
+            entities
+        );
+    }
+
+    #[test]
+    fn stretch_bounds_compose_nested_rotations_and_text_layout_extent() {
+        let temp = test_project(false);
+        let mut project = cad_model::load_project(temp.path()).unwrap();
+        let line = project.drawings[0].entities[0].entity.clone();
+        let block = |name: &str, entity: Entity| cad_model::BlockDefinition {
+            id: name.into(),
+            config: cad_model::BlockDefinitionConfig {
+                schema_version: cad_model::CURRENT_SCHEMA_VERSION.into(),
+                name: name.into(),
+                base_point: [0., 0.],
+            },
+            entities: vec![EntityRecord { line: 1, entity }],
+        };
+        project.blocks.insert("inner".into(), block("inner", line));
+        let mut inserted = Vec::new();
+        let mut raw = Vec::new();
+        apply_operation(
+            &EditOperation::InsertBlock {
+                block: "inner".into(),
+                layer: "0-1".into(),
+                at: [0., 0.],
+                rotation_deg: 0.,
+                scale: 1.,
+                mirror_x: true,
+                mirror_y: true,
+                entity_id: None,
+            },
+            &project,
+            &mut inserted,
+            &mut raw,
+        )
+        .unwrap();
+        assert!(matches!(
+            inserted[0],
+            Entity::BlockRef {
+                mirror_x: true,
+                mirror_y: true,
+                ..
+            }
+        ));
+        let reference = |name: &str| {
+            create_entity(serde_json::json!({"schema_version":cad_model::CURRENT_SCHEMA_VERSION,"type":"block_ref","layer":"0-1","block":name,"at":[0,0],"scale":1,"rotation_deg":45,"mirror_x":false,"mirror_y":false})).unwrap()
+        };
+        project
+            .blocks
+            .insert("outer".into(), block("outer", reference("inner")));
+        let bbox = geometry_edit::stretch_bbox(&project, &reference("outer"), &mut BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        assert!(bbox.max[0].abs() < 1e-8);
+        assert!((bbox.max[1] - 10.).abs() < 1e-8);
+        let text=create_entity(serde_json::json!({"schema_version":cad_model::CURRENT_SCHEMA_VERSION,"type":"text","layer":"0-1","style":"note","at":[0,0],"rotation_deg":0,"mirror_y":false,"value":"long text"})).unwrap();
+        assert!(
+            geometry_edit::stretch_bbox(&project, &text, &mut BTreeSet::new())
+                .unwrap()
+                .is_none()
+        );
+        project.styles.text_styles.insert(
+            "note".into(),
+            cad_model::TextStyleDef {
+                font_family: "sans-serif".into(),
+                height: 10.,
+                width: 5.,
+                spacing: 1.,
+                align: cad_model::TextAlign::Left,
+            },
+        );
+        let bbox = geometry_edit::stretch_bbox(&project, &text, &mut BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bbox.min, [0., 0.]);
+        assert_eq!(bbox.max, [53., 10.]);
+    }
+
+    #[test]
+    fn associated_dimension_follows_stretch_and_requires_resolution_on_delete() {
+        let temp = test_project(false);
+        let styles_path = temp.path().join("rules/styles.toml");
+        let mut styles = fs::read_to_string(&styles_path).unwrap();
+        styles.push_str("\n[text_styles.note]\nfont_family = \"sans-serif\"\nheight = 10\nwidth = 5\nspacing = 0\nalign = \"left\"\n[dimension_styles.dim]\ntext_style = \"note\"\narrow_size = 2\nextension_gap = 1\nprecision = 0\nunit = \"mm\"\n");
+        fs::write(styles_path, styles).unwrap();
+        let id = "ent_01JZ0000000000000000000000";
+        let created = apply_test_edit(
+            temp.path(),
+            EditOperation::Create {
+                entity: serde_json::json!({"schema_version":cad_model::CURRENT_SCHEMA_VERSION,"type":"dimension","layer":"0-1","style":"dim","p1":[0,0],"p2":[10,0],"offset":2,"text_rotation_deg":0,"text_mirror_y":false,"value":null,"measurement":{"kind":"aligned","first":{"kind":"entity","entity_id":id,"feature":"start"},"second":{"kind":"entity","entity_id":id,"feature":"end"}}}),
+            },
+        );
+        apply_test_edit(
+            temp.path(),
+            EditOperation::Stretch {
+                entity_ids: vec![id.into()],
+                min: [9., -1.],
+                max: [11., 1.],
+                delta: [300., 0.],
+            },
+        );
+        let project = cad_model::load_project(temp.path()).unwrap();
+        let d = &project.drawings[0]
+            .entities
+            .iter()
+            .find(|r| r.entity.id().as_str() == created.entity_ids[0])
+            .unwrap()
+            .entity;
+        let evaluation = cad_model::evaluate_dimension(&project, d).unwrap();
+        assert!((evaluation.measured - 310.0).abs() < 1e-9);
+        let state = editor_state(&project, "plan").unwrap();
+        let operation = EditOperation::Delete {
+            entity_id: id.into(),
+        };
+        let preview = preview_edit(
+            temp.path(),
+            &DrawingEditRequest {
+                drawing: "plan".into(),
+                expected_revision: state.revision.clone(),
+                operation: operation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.dimension_impacts, created.entity_ids);
+        let failed = apply_edit(
+            temp.path(),
+            &DrawingEditRequest {
+                drawing: "plan".into(),
+                expected_revision: state.revision,
+                operation: operation.clone(),
+            },
+        );
+        assert!(failed.is_err());
+        apply_test_edit(
+            temp.path(),
+            EditOperation::ResolveDimensions {
+                operation: Box::new(operation),
+                resolutions: vec![DimensionResolution {
+                    entity_id: created.entity_ids[0].clone(),
+                    action: DimensionResolutionAction::Detach,
+                }],
+            },
+        );
+        let project = cad_model::load_project(temp.path()).unwrap();
+        let mut d = project.drawings[0]
+            .entities
+            .iter()
+            .find(|r| r.entity.id().as_str() == created.entity_ids[0])
+            .unwrap()
+            .entity
+            .clone();
+        assert!(
+            cad_model::dimension_anchors_mut(&mut d)
+                .iter()
+                .all(|a| matches!(a, cad_model::DimensionAnchor::Fixed { .. }))
+        );
+    }
+
+    #[test]
+    fn fillet_chamfer_and_array_have_one_history_entry_per_operation() {
+        for (case, operation) in [
+            EditOperation::Fillet {
+                first_entity_id: "ent_01JZ0000000000000000000000".into(),
+                second_entity_id: "ent_01JZ0000000000000000000001".into(),
+                first_pick: [0., 0.],
+                second_pick: [5., 5.],
+                radius: 1.,
+            },
+            EditOperation::Chamfer {
+                first_entity_id: "ent_01JZ0000000000000000000000".into(),
+                second_entity_id: "ent_01JZ0000000000000000000001".into(),
+                first_pick: [0., 0.],
+                second_pick: [5., 5.],
+                first_distance: 1.,
+                second_distance: 2.,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = test_project(false);
+            let path = entities_path(temp.path(), "plan");
+            let before = fs::read(&path).unwrap();
+            let result = apply_test_edit(temp.path(), operation);
+            let project = cad_model::load_project(temp.path()).unwrap();
+            if case == 0 {
+                let arc = project.drawings[0]
+                    .entities
+                    .iter()
+                    .find_map(|r| {
+                        if let Entity::Arc { center, radius, .. } = &r.entity {
+                            Some((*center, *radius))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert!((arc.0[0] - 4.).abs() < 1e-9 && (arc.0[1] - 1.).abs() < 1e-9);
+                assert_eq!(arc.1, 1.);
+            } else {
+                assert!(project.drawings[0].entities.iter().any(|r| matches!(&r.entity, Entity::Line {p1,p2,..} if *p1 == [4.,0.] && *p2 == [5.,2.])));
+            }
+            assert_eq!(
+                list_drawing_history(temp.path(), "plan")
+                    .unwrap()
+                    .undo
+                    .len(),
+                1
+            );
+            undo_drawing_edit(
+                temp.path(),
+                &DrawingHistoryRequest {
+                    drawing: "plan".into(),
+                    expected_files: current_history_files(temp.path(), "plan").unwrap(),
+                },
+            )
+            .unwrap();
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert_eq!(result.entity_ids.len(), 3);
+            assert!(result.history_id.is_some());
+        }
+        let temp = test_project(false);
+        let before = fs::read(entities_path(temp.path(), "plan")).unwrap();
+        let result = apply_test_edit(
+            temp.path(),
+            EditOperation::RectangularArray {
+                entity_ids: vec!["ent_01JZ0000000000000000000000".into()],
+                rows: 2,
+                columns: 3,
+                row_spacing: 10.,
+                column_spacing: 20.,
+            },
+        );
+        assert_eq!(result.entity_ids.len(), 5);
+        assert_eq!(result.entity_ids.iter().collect::<BTreeSet<_>>().len(), 5);
+        let project = cad_model::load_project(temp.path()).unwrap();
+        assert!(project.drawings[0].entities.iter().any(
+            |r| matches!(&r.entity, Entity::Line {p1,p2,..} if *p1 == [40.,10.] && *p2 == [50.,10.])
+        ));
+        assert_eq!(
+            list_drawing_history(temp.path(), "plan")
+                .unwrap()
+                .undo
+                .len(),
+            1
+        );
+        undo_drawing_edit(
+            temp.path(),
+            &DrawingHistoryRequest {
+                drawing: "plan".into(),
+                expected_files: current_history_files(temp.path(), "plan").unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(entities_path(temp.path(), "plan")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn transformations_preserve_coordinates_angles_and_mirror_metadata() {
+        use serde_json::json;
+        let cases = [
+            (
+                json!({"type":"polyline","points":[[1,2],[3,4]],"closed":false}),
+                "/points/1",
+                json!([-4, 3]),
+                json!([-3, 4]),
+            ),
+            (
+                json!({"type":"arc","center":[1,2],"radius":5,"start_deg":0,"end_deg":90}),
+                "/center",
+                json!([-2, 1]),
+                json!([-1, 2]),
+            ),
+            (
+                json!({"type":"text","at":[1,2],"style":"note","rotation_deg":30,"value":"A"}),
+                "/at",
+                json!([-2, 1]),
+                json!([-1, 2]),
+            ),
+            (
+                json!({"type":"dimension","p1":[1,2],"p2":[3,2],"style":"dim","offset":1,"value":null,"text_rotation_deg":30}),
+                "/p1",
+                json!([-2, 1]),
+                json!([-1, 2]),
+            ),
         ];
-        for source in sources {
-            let entity: Entity = serde_json::from_str(source).expect("entity");
-            let rotated = rotate_entity(&entity, [0.0, 0.0], 90.0).expect("rotate");
-            let mirrored = mirror_entity(&entity, [0.0, 0.0], [0.0, 1.0]).expect("mirror");
-            validate_entity_geometry(&rotated).expect("rotated geometry");
-            validate_entity_geometry(&mirrored).expect("mirrored geometry");
-            assert_eq!(rotated.id().as_str(), entity.id().as_str());
-            assert_eq!(mirrored.id().as_str(), entity.id().as_str());
+        for (mut source, field, rotated_point, mirrored_point) in cases {
+            source["schema_version"] = json!(cad_model::CURRENT_SCHEMA_VERSION);
+            source["id"] = json!("ent_01JZ0000000000000000000000");
+            source["layer"] = json!("0-1");
+            let entity: Entity = serde_json::from_value(source).unwrap();
+            let rotated =
+                serde_json::to_value(rotate_entity(&entity, [0., 0.], 90.).unwrap()).unwrap();
+            let mirrored =
+                serde_json::to_value(mirror_entity(&entity, [0., 0.], [0., 1.]).unwrap()).unwrap();
+            for (actual, expected) in [(&rotated, &rotated_point), (&mirrored, &mirrored_point)] {
+                for axis in 0..2 {
+                    assert!(
+                        (actual.pointer(field).unwrap()[axis].as_f64().unwrap()
+                            - expected[axis].as_f64().unwrap())
+                        .abs()
+                            < 1e-9
+                    );
+                }
+                assert_eq!(actual["id"], entity.id().as_str());
+            }
+            let moved =
+                serde_json::to_value(translate_entity(&entity, [5., -2.]).unwrap()).unwrap();
+            let original = serde_json::to_value(&entity).unwrap();
+            let expected_move = if field == "/points/1" {
+                json!([8, 2])
+            } else {
+                json!([6, 0])
+            };
+            for axis in 0..2 {
+                assert_eq!(
+                    moved.pointer(field).unwrap()[axis].as_f64(),
+                    expected_move[axis].as_f64()
+                );
+            }
+            match entity {
+                Entity::Arc { .. } => {
+                    assert_eq!(rotated["start_deg"], 90.);
+                    assert_eq!(rotated["end_deg"], 180.);
+                    assert_eq!(mirrored["start_deg"], 180.);
+                    assert_eq!(mirrored["end_deg"], 90.);
+                    assert_eq!(moved["radius"], original["radius"]);
+                }
+                Entity::Text { .. } => {
+                    assert_eq!(rotated["rotation_deg"], 120.);
+                    assert_eq!(mirrored["rotation_deg"], 150.);
+                    assert_eq!(mirrored["mirror_y"], true);
+                }
+                Entity::Dimension { .. } => {
+                    assert_eq!(rotated["text_rotation_deg"], 120.);
+                    assert_eq!(mirrored["text_rotation_deg"], 150.);
+                    assert_eq!(mirrored["text_mirror_y"], true);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -5188,8 +6667,8 @@ mod tests {
         fs::write(
             entities_path(temp.path(), "plan"),
             concat!(
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"polyline\",\"layer\":\"0-1\",\"points\":[[0.0,0.0],[5.0,0.0],[5.0,5.0]],\"closed\":false}\n",
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[3.0,-5.0],\"p2\":[3.0,5.0]}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"polyline\",\"layer\":\"0-1\",\"points\":[[0.0,0.0],[5.0,0.0],[5.0,5.0]],\"closed\":false}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[3.0,-5.0],\"p2\":[3.0,5.0]}\n",
             ),
         )
         .expect("entities");
@@ -5210,8 +6689,8 @@ mod tests {
         fs::write(
             entities_path(temp.path(), "plan"),
             concat!(
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"polyline\",\"layer\":\"0-1\",\"points\":[[0.0,0.0],[2.0,0.0],[2.0,2.0]],\"closed\":false}\n",
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,5.0],\"p2\":[5.0,5.0]}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"polyline\",\"layer\":\"0-1\",\"points\":[[0.0,0.0],[2.0,0.0],[2.0,2.0]],\"closed\":false}\n",
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000001\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,5.0],\"p2\":[5.0,5.0]}\n",
             ),
         )
         .expect("entities");
@@ -5303,6 +6782,14 @@ mod tests {
                 delta: [1.0, 0.0],
                 duplicate: false,
             },
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("metadata after edit")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
         );
         undo_drawing_edit(
             temp.path(),
@@ -5455,51 +6942,41 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_uses_the_shared_history_lock() {
+    fn clear_history_holds_the_transaction_lock_and_next_edit_remains_undoable() {
         let temp = test_project(false);
-        apply_test_edit(
-            temp.path(),
-            EditOperation::Translate {
-                entity_id: "ent_01JZ0000000000000000000000".to_owned(),
-                delta: [1.0, 0.0],
-                duplicate: false,
-            },
+        let operation = EditOperation::Translate {
+            entity_id: "ent_01JZ0000000000000000000000".to_owned(),
+            delta: [1., 0.],
+            duplicate: false,
+        };
+        apply_test_edit(temp.path(), operation.clone());
+        let before = fs::read(entities_path(temp.path(), "plan")).unwrap();
+        clear_drawing_history_with(temp.path(), "plan", || {
+            assert!(matches!(
+                edit_lock().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        })
+        .unwrap();
+        let result = apply_test_edit(temp.path(), operation);
+        let history = list_drawing_history(temp.path(), "plan").unwrap();
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(
+            Some(&history.undo[0].history_id),
+            result.history_id.as_ref()
         );
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            with_history_lock(|| {
-                locked_tx.send(()).expect("lock signal");
-                release_rx.recv().expect("release signal");
-                Ok(())
-            })
-        });
-        locked_rx.recv().expect("shared lock should be held");
-
-        let project_path = temp.path().to_path_buf();
-        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let clearer = std::thread::spawn(move || {
-            attempted_tx.send(()).expect("attempt signal");
-            let result = clear_drawing_history(&project_path, "plan");
-            finished_tx.send(()).expect("finish signal");
-            result
-        });
-        attempted_rx.recv().expect("clear should be attempted");
-        assert!(matches!(
-            finished_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-
-        release_tx.send(()).expect("release shared lock");
-        holder
-            .join()
-            .expect("holder thread")
-            .expect("holder result");
-        clearer.join().expect("clear thread").expect("clear result");
-        finished_rx
-            .recv()
-            .expect("clear should finish after release");
+        undo_drawing_edit(
+            temp.path(),
+            &DrawingHistoryRequest {
+                drawing: "plan".to_owned(),
+                expected_files: history.current_files,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(entities_path(temp.path(), "plan")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -5655,78 +7132,42 @@ mod tests {
     }
 
     #[test]
-    fn history_prunes_to_the_latest_one_hundred_generations() {
+    fn history_prunes_the_oldest_entry_at_the_limit() {
         let temp = test_project(false);
-        for _ in 0..105 {
-            apply_test_edit(
-                temp.path(),
-                EditOperation::Translate {
-                    entity_id: "ent_01JZ0000000000000000000000".to_owned(),
-                    delta: [1.0, 0.0],
-                    duplicate: false,
-                },
-            );
+        let root = temp.path().join("build/.cad-history");
+        let ids = (0..HISTORY_LIMIT)
+            .map(|i| format!("fixture_{i}"))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            fs::create_dir_all(root.join("entries").join(id)).unwrap();
         }
-        let state = list_drawing_history(temp.path(), "plan").expect("history state");
-        assert_eq!(state.undo.len(), 100);
-        assert!(state.redo.is_empty());
-    }
-
-    #[test]
-    fn manifest_history_restores_multiple_files_as_one_transaction() {
-        let temp = test_project(false);
-        let comment_path = temp.path().join("comments/plan.ndjson");
-        fs::create_dir_all(comment_path.parent().expect("comments parent")).expect("comments dir");
-        fs::write(&comment_path, b"before\r\n").expect("comments");
-        let before_entities =
-            read_history_file(temp.path(), "drawings/plan/entities.ndjson").expect("entity input");
-        let before_comments =
-            read_history_file(temp.path(), "comments/plan.ndjson").expect("comment input");
-        let mut stage = stage_history_transaction(
-            temp.path(),
-            "plan",
-            "drawing",
-            "comment.create",
-            &[],
-            &[before_entities.clone(), before_comments.clone()],
-        )
-        .expect("history stage");
-        let after_entities = before_entities.clone();
-        let after_comments = HistoryFileInput {
-            relative_path: "comments/plan.ndjson".to_owned(),
-            exists: true,
-            bytes: b"after\r\n".to_vec(),
-            permissions: before_comments.permissions.clone(),
-        };
-        stage
-            .prepare_after(&[after_entities, after_comments.clone()])
-            .expect("after snapshots");
-        fs::write(&comment_path, &after_comments.bytes).expect("publish comment");
-        let history_id = commit_history_stage(&mut stage).expect("commit history");
-        let current = vec![
-            HistoryFileRevision {
-                relative_path: before_entities.relative_path,
-                revision: revision(&before_entities.bytes),
-                exists: true,
-            },
-            HistoryFileRevision {
-                relative_path: after_comments.relative_path,
-                revision: revision(&after_comments.bytes),
-                exists: true,
-            },
-        ];
-        let result = undo_drawing_edit(
-            temp.path(),
-            &DrawingHistoryRequest {
-                drawing: "plan".to_owned(),
-                expected_files: current,
+        write_history_index(
+            &root,
+            &HistoryIndex {
+                undo: ids.clone(),
+                redo: Vec::new(),
+                limit: HISTORY_LIMIT,
             },
         )
-        .expect("undo manifest");
-        assert_eq!(result.history_id, Some(history_id));
-        assert_eq!(
-            fs::read(comment_path).expect("restored comment"),
-            b"before\r\n"
+        .unwrap();
+        let result = apply_test_edit(
+            temp.path(),
+            EditOperation::Translate {
+                entity_id: "ent_01JZ0000000000000000000000".to_owned(),
+                delta: [1.0, 0.0],
+                duplicate: false,
+            },
+        );
+        let index = read_history_index(&root).unwrap();
+        assert_eq!(index.undo.len(), HISTORY_LIMIT);
+        assert_eq!(&index.undo[..HISTORY_LIMIT - 1], &ids[1..]);
+        assert_eq!(index.undo.last(), result.history_id.as_ref());
+        assert!(index.redo.is_empty());
+        assert!(!root.join("entries").join(&ids[0]).exists());
+        assert!(
+            root.join("entries")
+                .join(index.undo.last().unwrap())
+                .exists()
         );
     }
 
@@ -5771,7 +7212,7 @@ mod tests {
         fs::create_dir_all(temp.path().join("drawings/plan")).expect("drawing");
         fs::write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"edit-test\"\n",
+            "schema_version = \"0.3\"\nname = \"edit-test\"\n",
         )
         .expect("project");
         fs::write(
@@ -5786,14 +7227,14 @@ mod tests {
         .expect("styles");
         fs::write(
             temp.path().join("drawings/plan/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/1\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/1\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts");
         fs::write(
             entities_path(temp.path(), "plan"),
             concat!(
-                "{\"schema_version\":\"0.2\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,0.0],\"p2\":[10.0,0.0]}\n",
-                "{ \"schema_version\": \"0.2\", \"id\": \"ent_01JZ0000000000000000000001\",  \"type\": \"line\", \"layer\": \"0-1\", \"p1\": [5.0,-5.0], \"p2\": [5.0,5.0] }\n"
+                "{\"schema_version\":\"0.3\",\"id\":\"ent_01JZ0000000000000000000000\",\"type\":\"line\",\"layer\":\"0-1\",\"p1\":[0.0,0.0],\"p2\":[10.0,0.0]}\n",
+                "{ \"schema_version\": \"0.3\", \"id\": \"ent_01JZ0000000000000000000001\",  \"type\": \"line\", \"layer\": \"0-1\", \"p1\": [5.0,-5.0], \"p2\": [5.0,5.0] }\n"
             ),
         )
         .expect("entities");

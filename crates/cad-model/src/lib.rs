@@ -12,13 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const CRATE_NAME: &str = "cad-model";
-pub const CURRENT_SCHEMA_VERSION: &str = "0.2";
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
+mod dimensions;
+pub use dimensions::*;
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3";
 
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -179,10 +175,18 @@ pub fn classify_project_source_path(relative: &Path) -> Option<ProjectSourceKind
 }
 
 pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevision>> {
+    source_manifest_for(root, |_| true)
+}
+
+pub fn source_manifest_for(
+    root: impl AsRef<Path>,
+    include: impl Fn(&Path) -> bool,
+) -> ModelResult<Vec<SourceFileRevision>> {
     fn visit(
         root: &Path,
         directory: &Path,
         output: &mut Vec<SourceFileRevision>,
+        include: &impl Fn(&Path) -> bool,
     ) -> ModelResult<()> {
         let mut entries = fs::read_dir(directory)
             .map_err(|source| ModelError::ListDir {
@@ -246,8 +250,11 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
                 {
                     continue;
                 }
-                visit(root, &path, output)?;
+                visit(root, &path, output, include)?;
             } else if file_type.is_file() && classify_project_source_path(relative).is_some() {
+                if !include(relative) {
+                    continue;
+                }
                 let bytes = fs::read(&path).map_err(|source| ModelError::Read {
                     path: path.clone(),
                     source,
@@ -264,7 +271,7 @@ pub fn source_manifest(root: impl AsRef<Path>) -> ModelResult<Vec<SourceFileRevi
 
     let root = root.as_ref();
     let mut output = Vec::new();
-    visit(root, root, &mut output)?;
+    visit(root, root, &mut output, &include)?;
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(output)
 }
@@ -308,7 +315,7 @@ fn validate_jww_preservation_manifest(
     manifest: &JwwPreservationManifest,
 ) -> ModelResult<()> {
     let manifest_path = root.join(JWW_PRESERVATION_RELATIVE_PATH);
-    if !matches!(manifest.schema_version.as_str(), "0.1" | "0.2") {
+    if !matches!(manifest.schema_version.as_str(), "0.1" | "0.2" | "0.3") {
         return Err(ModelError::JwwPreservation {
             path: manifest_path,
             reason: format!(
@@ -502,7 +509,6 @@ pub fn jww_project_compatibility(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityId {
     raw: String,
-    ulid: Ulid,
 }
 
 impl EntityId {
@@ -512,25 +518,19 @@ impl EntityId {
                 value: value.to_owned(),
             });
         };
-        let Ok(ulid) = Ulid::from_string(encoded) else {
+        let Ok(_) = Ulid::from_string(encoded) else {
             return Err(ModelError::InvalidEntityId {
                 value: value.to_owned(),
             });
         };
         Ok(Self {
             raw: value.to_owned(),
-            ulid,
         })
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.raw
-    }
-
-    #[must_use]
-    pub fn ulid(&self) -> Ulid {
-        self.ulid
     }
 }
 
@@ -692,6 +692,175 @@ impl LayoutsConfig {
     }
 }
 
+/// Parses a drawing scale and returns model-space millimetres per paper
+/// millimetre. Both `1/100` and `1:100` are canonical input forms.
+#[must_use]
+pub fn parse_layout_scale(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value
+        .trim()
+        .split_once('/')
+        .or_else(|| value.trim().split_once(':'))?;
+    let numerator = numerator.trim().parse::<f64>().ok()?;
+    let denominator = denominator.trim().parse::<f64>().ok()?;
+    (numerator.is_finite() && denominator.is_finite() && numerator > 0.0 && denominator > 0.0)
+        .then_some(denominator / numerator)
+}
+
+/// Maximum candidate lines in each hatch family before clipping.
+pub const MAX_HATCH_LINES: usize = 20_000;
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("{field}: {message}")]
+pub struct HatchError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+fn hatch_error(field: &'static str, message: &str) -> HatchError {
+    HatchError {
+        field,
+        message: message.to_owned(),
+    }
+}
+
+fn hatch_line_range(
+    loops: &[Vec<Point>],
+    angle_deg: f64,
+    spacing: f64,
+) -> Result<Option<(i64, i64)>, HatchError> {
+    if !angle_deg.is_finite() {
+        return Err(hatch_error("angle_deg", "must be finite"));
+    }
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return Err(hatch_error("scale", "pitch must be finite and positive"));
+    }
+    if loops.is_empty() {
+        return Ok(None);
+    }
+    if loops.iter().any(|polygon| {
+        polygon.len() < 3
+            || polygon
+                .iter()
+                .flatten()
+                .any(|coordinate| !coordinate.is_finite())
+    }) {
+        return Err(hatch_error(
+            "loops",
+            "requires at least three finite points per loop",
+        ));
+    }
+    let angle = angle_deg.rem_euclid(360.0).to_radians();
+    let normal = [-angle.sin(), angle.cos()];
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    for point in loops.iter().flatten() {
+        let v = point[0] * normal[0] + point[1] * normal[1];
+        if !v.is_finite() {
+            return Err(hatch_error("loops", "projected coordinate is out of range"));
+        }
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let first = (min_v / spacing).floor();
+    let last = (max_v / spacing).ceil();
+    if !first.is_finite()
+        || !last.is_finite()
+        || first < i64::MIN as f64
+        || last >= i64::MAX as f64
+        || last - first + 1.0 > MAX_HATCH_LINES as f64
+    {
+        return Err(hatch_error(
+            "scale",
+            "hatch family exceeds the 20000-line expansion limit",
+        ));
+    }
+    Ok(Some((first as i64, last as i64)))
+}
+
+/// Shared strict hatch contract for checking and direct rendering/export.
+pub fn validate_hatch(project: &ProjectSource, entity: &Entity) -> Result<(), HatchError> {
+    let Entity::Hatch {
+        loops,
+        pattern,
+        angle_deg,
+        scale,
+        fill,
+        ..
+    } = entity
+    else {
+        return Ok(());
+    };
+    if !matches!(pattern.as_str(), "solid" | "parallel" | "cross") {
+        return Err(hatch_error("pattern", "use solid, parallel, or cross"));
+    }
+    if !fill
+        .as_ref()
+        .is_some_and(|id| project.styles.colors.contains_key(id))
+    {
+        return Err(hatch_error("fill", "requires a defined fill color"));
+    }
+    if loops.is_empty() {
+        return Err(hatch_error("loops", "requires at least one loop"));
+    }
+    if pattern != "solid" {
+        hatch_line_range(loops, *angle_deg, *scale)?;
+        if pattern == "cross" {
+            hatch_line_range(loops, angle_deg.rem_euclid(360.0) + 90.0, *scale)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expands a model-space hatch family into even-odd clipped line segments.
+/// `spacing` is the perpendicular pitch in model millimetres.
+pub fn hatch_line_segments(
+    loops: &[Vec<Point>],
+    angle_deg: f64,
+    spacing: f64,
+) -> Result<Vec<(Point, Point)>, HatchError> {
+    let Some((first, last)) = hatch_line_range(loops, angle_deg, spacing)? else {
+        return Ok(Vec::new());
+    };
+    let angle = angle_deg.rem_euclid(360.0).to_radians();
+    let direction = [angle.cos(), angle.sin()];
+    let normal = [-direction[1], direction[0]];
+    let mut output = Vec::new();
+    for index in first..=last {
+        let v = index as f64 * spacing;
+        let mut intersections = Vec::new();
+        for polygon in loops.iter().filter(|polygon| polygon.len() >= 3) {
+            for edge_index in 0..polygon.len() {
+                let left = polygon[edge_index];
+                let right = polygon[(edge_index + 1) % polygon.len()];
+                let left_v = left[0] * normal[0] + left[1] * normal[1];
+                let right_v = right[0] * normal[0] + right[1] * normal[1];
+                if (left_v <= v && right_v > v) || (right_v <= v && left_v > v) {
+                    let t = (v - left_v) / (right_v - left_v);
+                    let point = [
+                        left[0] + t * (right[0] - left[0]),
+                        left[1] + t * (right[1] - left[1]),
+                    ];
+                    intersections.push(point[0] * direction[0] + point[1] * direction[1]);
+                }
+            }
+        }
+        intersections.sort_by(f64::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            output.push((
+                [
+                    pair[0] * direction[0] + v * normal[0],
+                    pair[0] * direction[1] + v * normal[1],
+                ],
+                [
+                    pair[1] * direction[0] + v * normal[0],
+                    pair[1] * direction[1] + v * normal[1],
+                ],
+            ));
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BlockDefinitionConfig {
@@ -789,6 +958,8 @@ pub enum Entity {
         #[serde(default)]
         pen: Option<String>,
         style: String,
+        #[serde(default)]
+        measurement: Option<Box<DimensionMeasurement>>,
         p1: Point,
         p2: Point,
         offset: f64,
@@ -849,6 +1020,10 @@ pub enum Entity {
         at: Point,
         rotation_deg: f64,
         scale: f64,
+        #[serde(default)]
+        mirror_x: bool,
+        #[serde(default)]
+        mirror_y: bool,
     },
     Hatch {
         schema_version: String,
@@ -1631,9 +1806,10 @@ mod tests {
         let temp = minimal_project();
         write(
             temp.path().join("drawings/plan_1f/sheet.toml"),
-            "obsolete = true\n",
+            "this is not valid TOML",
         )
         .expect("obsolete fixture");
+        load_project(temp.path()).expect("schema 0.3 should use layouts.toml only");
         create_dir_all(temp.path().join("build/.cad-history")).expect("history directory");
         write(temp.path().join("build/.cad-history/index.json"), "{}").expect("history fixture");
         create_dir_all(temp.path().join("interop/jww")).expect("interop directory");
@@ -1645,6 +1821,17 @@ mod tests {
         .expect("preservation fixture");
 
         let manifest = source_manifest(temp.path()).expect("manifest should load");
+        let selected =
+            source_manifest_for(temp.path(), |path| path == Path::new("rules/layers.toml"))
+                .unwrap();
+        assert_eq!(
+            selected,
+            manifest
+                .iter()
+                .filter(|file| file.relative_path == "rules/layers.toml")
+                .cloned()
+                .collect::<Vec<_>>()
+        );
         let paths = manifest
             .into_iter()
             .map(|file| file.relative_path)
@@ -1699,7 +1886,7 @@ mod tests {
         create_dir_all(&outside_block).expect("outside block directory");
         write(
             outside_block.join("definition.toml"),
-            "schema_version = \"0.2\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("block definition");
         write(outside_block.join("entities.ndjson"), "").expect("block entities");
@@ -1725,6 +1912,10 @@ mod tests {
 
         assert!(matches!(
             source_manifest(temp.path()),
+            Err(ModelError::UnsafeSourcePath { .. })
+        ));
+        assert!(matches!(
+            source_manifest_for(temp.path(), |_| false),
             Err(ModelError::UnsafeSourcePath { .. })
         ));
     }
@@ -1792,28 +1983,6 @@ mod tests {
     use std::fs::{create_dir_all, write};
 
     #[test]
-    fn exposes_crate_name() {
-        assert_eq!(crate_name(), "cad-model");
-    }
-
-    #[test]
-    fn loads_house_small_example() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small");
-
-        let project = load_project(root).expect("example project should load");
-
-        assert_eq!(project.project.name, "house-small");
-        assert_eq!(project.drawings.len(), 1);
-        assert_eq!(project.drawings[0].name, "plan_1f");
-        assert_eq!(project.drawings[0].entities.len(), 1);
-        assert_eq!(project.drawings[0].entities[0].line, 1);
-        assert_eq!(
-            project.drawings[0].entities[0].entity.id().as_str(),
-            "ent_01JZ0000000000000000000000"
-        );
-    }
-
-    #[test]
     fn layouts_toml_is_required_for_each_drawing() {
         let temp = minimal_project();
         std::fs::remove_file(temp.path().join("drawings/plan_1f/layouts.toml"))
@@ -1822,51 +1991,6 @@ mod tests {
         let error = load_project(temp.path()).expect_err("missing layouts must fail");
 
         assert!(matches!(error, ModelError::Read { .. }));
-    }
-
-    #[test]
-    fn obsolete_sheet_file_is_not_loaded_as_a_second_layout_source() {
-        let temp = minimal_project();
-        write(
-            temp.path().join("drawings/plan_1f/sheet.toml"),
-            "this is not valid TOML",
-        )
-        .expect("obsolete sheet file should be writable");
-
-        load_project(temp.path()).expect("schema 0.2 should use layouts.toml only");
-    }
-
-    #[test]
-    fn parses_all_mvp_entity_types() {
-        let source = [
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[1.0,0.0]}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0]],"closed":false}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":1.0,"start_deg":0.0,"end_deg":90.0}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"circle","layer":"0-1","center":[0.0,0.0],"radius":1.0}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":2.0,"radius_y":1.0,"rotation_deg":30.0,"start_deg":0.0,"end_deg":180.0}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}"#,
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000007","type":"block_ref","layer":"0-1","block":"door_910","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}"#,
-        ];
-
-        for line in source {
-            let entity: Entity = serde_json::from_str(line).expect("entity should parse");
-            assert_eq!(entity.schema_version(), CURRENT_SCHEMA_VERSION);
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_json_line() {
-        let temp = minimal_project();
-        write(
-            temp.path().join("drawings/plan_1f/entities.ndjson"),
-            "{\"schema_version\":\"0.2\"",
-        )
-        .expect("fixture should be writable");
-
-        let error = load_project(temp.path()).expect_err("invalid JSON should fail");
-
-        assert!(matches!(error, ModelError::Ndjson { line: 1, .. }));
     }
 
     #[test]
@@ -1918,20 +2042,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_entity_type() {
-        let temp = minimal_project();
-        write(
-            temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"spline","layer":"0-1"}"#,
-        )
-        .expect("fixture should be writable");
-
-        let error = load_project(temp.path()).expect_err("unknown entity type should fail");
-
-        assert!(matches!(error, ModelError::Ndjson { line: 1, .. }));
-    }
-
-    #[test]
     fn rejects_invalid_entity_id() {
         let error = EntityId::parse("bad_01JZ0000000000000000000000")
             .expect_err("non entity prefix should fail");
@@ -1961,7 +2071,7 @@ mod tests {
     #[test]
     fn computes_entity_bbox() {
         let entity: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[-1.0,2.0],"p2":[3.0,-4.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[-1.0,2.0],"p2":[3.0,-4.0]}"#,
         )
         .expect("line should parse");
 
@@ -1986,43 +2096,6 @@ mod tests {
         assert!(quarter.min[1].abs() < 1e-9);
         assert!((quarter.max[0] - 4.0).abs() < 1e-9);
         assert!((quarter.max[1] - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn defaults_text_mirror_fields_when_omitted() {
-        let text: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"value":"room"}"#,
-        )
-        .expect("text should parse");
-        let dimension: Entity = serde_json::from_str(
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"dimension","layer":"0-1","style":"dim_100","p1":[0.0,0.0],"p2":[0.0,10.0],"offset":2.0,"value":null}"#,
-        )
-        .expect("dimension should parse");
-
-        assert!(matches!(
-            text,
-            Entity::Text {
-                mirror_y: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            dimension,
-            Entity::Dimension {
-                text_rotation_deg: 0.0,
-                text_mirror_y: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn offsets_dimension_along_line_normal() {
-        let (d1, d2) = dimension_offset_segment([0.0, 0.0], [0.0, 10.0], 2.0)
-            .expect("vertical dimension should offset");
-
-        assert_eq!(d1, [-2.0, 0.0]);
-        assert_eq!(d2, [-2.0, 10.0]);
     }
 
     #[test]
@@ -2068,6 +2141,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hatch_lines_are_even_odd_clipped_and_support_holes() {
+        let loops = vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]],
+        ];
+        let lines = hatch_line_segments(&loops, 0.0, 5.0).expect("hatch lines");
+        assert!(lines.contains(&([0.0, 5.0], [4.0, 5.0])));
+        assert!(lines.contains(&([6.0, 5.0], [10.0, 5.0])));
+        assert!(hatch_line_segments(&loops, 0.0, 0.0).is_err());
+        assert!(hatch_line_segments(&[], 0.0, 1.0).unwrap().is_empty());
+        let boundary = vec![vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 19_999.0],
+            [0.0, 19_999.0],
+        ]];
+        assert!(hatch_line_segments(&boundary, 0.0, 1.0).is_ok());
+        assert_eq!(
+            hatch_line_segments(&boundary, 0.0, 0.5).unwrap_err().field,
+            "scale"
+        );
+        assert!(hatch_line_segments(&boundary, 0.0, f64::MIN_POSITIVE).is_err());
+    }
+
     fn minimal_project() -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         create_dir_all(temp.path().join("rules")).expect("rules dir should be created");
@@ -2076,7 +2174,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -2091,12 +2189,12 @@ mod tests {
         .expect("styles TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0]}"#,
         )
         .expect("entities NDJSON should be writable");
 

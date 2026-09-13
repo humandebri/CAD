@@ -54,6 +54,91 @@ test("layer workspace hides and restores visible geometry", async ({ page }) => 
   await expect(page.getByRole("button", { name: "Hide 0-1" })).toHaveCount(0);
 });
 
+test("Shift-click toggles selection without becoming a zero-area drag", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+  const first = page.locator('.drawing-stage [data-entity-id="ent_01JZ0000000000000000000000"]').first();
+  const clickLine = async (shift: boolean) => {
+    const point = await first.locator("line").evaluate((line) => {
+      const box = line.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    });
+    if (shift) await page.keyboard.down("Shift");
+    await page.mouse.click(point.x, point.y);
+    if (shift) await page.keyboard.up("Shift");
+  };
+
+  await clickLine(false);
+  await expect(first).toHaveClass(/is-selected/);
+  await clickLine(true);
+  await expect(first).not.toHaveClass(/is-selected/);
+  await page.waitForTimeout(300);
+  await clickLine(true);
+  await expect(first).toHaveClass(/is-selected/);
+  await expect(page.locator(".zoom-area-rect")).toHaveCount(0);
+});
+
+for (const crossing of [false]) {
+  test(`area selection excludes hidden layers and groups (${crossing ? "crossing" : "window"})`, async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: "Sheet" }).click();
+    const entity = page.locator('.drawing-stage [data-entity-id="ent_01JZ0000000000000000000000"]').first();
+    const selectArea = async () => {
+      await expect(page.locator(".drawing-stage svg")).toBeVisible();
+      const stage = page.locator(".drawing-stage");
+      await stage.scrollIntoViewIfNeeded();
+      const box = await stage.boundingBox();
+      if (box === null) throw new Error("missing drawing stage");
+      const left = box.x + 20;
+      const right = box.x + box.width - 20;
+      await page.keyboard.down("Shift");
+      await page.mouse.move(crossing ? right : left, box.y + 20);
+      await page.mouse.down();
+      await page.mouse.move(crossing ? left : right, box.y + box.height - 20, { steps: 4 });
+      await expect(page.locator(".zoom-area-rect")).toBeVisible();
+      await page.mouse.up();
+      await page.keyboard.up("Shift");
+      await expect(page.locator(".zoom-area-rect")).toHaveCount(0);
+    };
+    await selectArea();
+    await expect(entity).toHaveClass(/is-selected/);
+    await page.getByRole("button", { name: "Hide 0-1", exact: true }).click();
+    await selectArea();
+    await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText("Select an entity on the paper");
+    await expect(entity).not.toHaveClass(/is-selected/);
+    await page.getByRole("button", { name: "Show 0-1", exact: true }).click();
+    await selectArea();
+    await expect(entity).toHaveClass(/is-selected/);
+    const hideGroup = page.getByRole("button", { name: /^Hide group / });
+    await hideGroup.click();
+    await selectArea();
+    await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText("Select an entity on the paper");
+    await expect(entity).not.toHaveClass(/is-selected/);
+    await page.getByRole("button", { name: /^Show group / }).click();
+    await selectArea();
+    await expect(entity).toHaveClass(/is-selected/);
+  });
+}
+
+test("window excludes a partially intersected entity while crossing selects it", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sheet" }).click();
+  const entity = page.locator('.drawing-stage [data-entity-id="ent_01JZ0000000000000000000000"]').first();
+  const line = await entity.locator("line").boundingBox();
+  if (!line || line.width <= 0) throw new Error("expected a horizontal line");
+  const left = line.x - 3, right = line.x + line.width / 2;
+  for (const crossing of [false, true]) {
+    await page.keyboard.down("Shift");
+    await page.mouse.move(crossing ? right : left, line.y - 8);
+    await page.mouse.down();
+    await page.mouse.move(crossing ? left : right, line.y + 8, { steps: 4 });
+    await page.mouse.up();
+    await page.keyboard.up("Shift");
+    if (crossing) await expect(entity).toHaveClass(/is-selected/);
+    else await expect(entity).not.toHaveClass(/is-selected/);
+  }
+});
+
 test("wheel zooms beyond 800 percent and previous view restores the burst", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Sheet" }).click();

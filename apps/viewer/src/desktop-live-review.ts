@@ -198,9 +198,6 @@ export class LatestReviewQueue {
       }
     }
     this.running = false;
-    if (this.pending !== null) {
-      this.start();
-    }
   }
 }
 
@@ -214,16 +211,6 @@ export function mergeProjectStateFromReview(
   };
 }
 
-
-export function sheetSvgContainsEntity(sheetSvg: string, entityId: string): boolean {
-  if (entityId === "") {
-    return false;
-  }
-  return (
-    sheetSvg.includes(`data-entity-id="${entityId}"`) ||
-    sheetSvg.includes(`data-entity-id='${entityId}'`)
-  );
-}
 
 export function shouldPreserveView(previousContext: string | null, nextContext: string): boolean {
   return previousContext === nextContext;

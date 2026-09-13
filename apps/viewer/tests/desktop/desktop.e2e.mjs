@@ -1,19 +1,37 @@
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
 
 async function activate(element) {
-  await browser.execute((target) => setTimeout(() => target.click(), 0), element);
+  await browser.execute((target) => setTimeout(() => {
+    if (target instanceof SVGElement) target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    else target.click();
+  }, 0), element);
 }
 
 describe("CAD Review desktop", () => {
-  it("edits, comments, changes a layer, restores history, and exports PDF", async () => {
+  afterEach(async function () {
+    if (this.currentTest?.state === "failed") {
+      console.error("Desktop draft failure state", await browser.execute(() => ({
+        command: document.querySelector(".command-prompt")?.textContent,
+        input: document.querySelector("input[aria-label='Command or coordinate']")?.value,
+        panel: document.querySelector(".drafting-panel")?.textContent,
+        review: document.querySelector(".live-review-status")?.textContent,
+        message: document.querySelector(".editor-message")?.textContent,
+        points: document.querySelectorAll(".draft-overlay > circle").length,
+        focus: document.activeElement?.getAttribute("aria-label"),
+        blockMessage: document.querySelector(".block-edit-dialog [role='status']")?.textContent,
+        blockResolution: document.querySelector("section[aria-label='Resolve block dimension references']")?.textContent,
+      })));
+    }
+  });
+  it("edits, comments, and observes a native layer change", async () => {
     const projectPath = process.env.CAD_E2E_PROJECT_PATH;
     const pdfPath = process.env.CAD_E2E_PDF_PATH;
     assert(projectPath && pdfPath, "desktop E2E paths must be configured");
     const entitiesPath = `${projectPath}/drawings/plan_1f/entities.ndjson`;
-    const historyPath = `${projectPath}/build/.cad-history/index.json`;
     const initialEntities = readFileSync(entitiesPath, "utf8");
-    const readHistory = () => JSON.parse(readFileSync(historyPath, "utf8"));
 
     await $("h1=house-small").waitForDisplayed({ timeout: 30_000 });
     const sheet = await $("button=Sheet");
@@ -84,36 +102,158 @@ describe("CAD Review desktop", () => {
       { timeout: 10_000, timeoutMsg: "native watcher catch-up did not complete" },
     );
 
-    const historyBeforeUndo = readHistory();
-    const undo = await $("button[aria-label='Undo']");
-    await browser.waitUntil(
-      () => browser.execute(
-        () => !document.querySelector("button[aria-label='Undo']")?.hasAttribute("disabled"),
-      ),
-      { timeout: 10_000, timeoutMsg: "Undo did not become enabled" },
-    );
-    await activate(undo);
-    await browser.waitUntil(() => readHistory().redo.length > 0, {
-      timeout: 10_000,
-      timeoutMsg: "Undo did not update the history index",
-    });
-    const redo = await $("button[aria-label='Redo']");
-    await redo.waitForEnabled({ timeout: 10_000 });
-    await activate(redo);
-    await browser.waitUntil(
-      () => {
-        const history = readHistory();
-        return history.redo.length === 0
-          && history.undo.length === historyBeforeUndo.undo.length;
-      },
-      { timeout: 10_000, timeoutMsg: "Redo did not update the history index" },
-    );
 
+  });
+
+  it("persists a dimensioned room stretch, shared block content, history, and output", async function () {
+    this.timeout(240_000);
+    const projectPath = process.env.CAD_E2E_PROJECT_PATH;
+    const pdfPath = process.env.CAD_E2E_PDF_PATH;
+    assert(projectPath && pdfPath, "desktop E2E paths must be configured");
+    const entitiesPath = `${projectPath}/drawings/plan_1f/entities.ndjson`;
+    const source = () => readFileSync(entitiesPath, "utf8");
+    const entities = () => source().trim().split("\n").filter(Boolean).map(JSON.parse);
+    const command = async (text) => {
+      const input = await $("input[aria-label='Command or coordinate']");
+      await input.waitForEnabled({ timeout: 15_000 });
+      await browser.execute(element => element.focus(), input);
+      await input.setValue(text);
+      await browser.keys("Enter");
+      await browser.waitUntil(async () => (await input.getValue()) === "", { timeout: 10_000 });
+    };
+    const applyPreview = async () => {
+      const panel = await $("section[aria-label='Drafting parameters']");
+      await browser.waitUntil(async () => (await panel.getText()).includes("Preview ready"), {
+        timeout: 15_000, timeoutMsg: "geometry preview did not become ready",
+      });
+      await activate(await panel.$("button=Apply"));
+      await panel.waitForExist({ reverse: true, timeout: 15_000 });
+    };
+    const waitEntity = async (id) => {
+      await browser.waitUntil(() => browser.execute(
+        (entityId) => document.querySelector(`.drawing-stage [data-entity-id='${entityId}']`) !== null, id,
+      ), { timeout: 15_000, timeoutMsg: `entity ${id} was not rendered after saving` });
+    };
+    const waitDimension = async (id, label) => {
+      await browser.waitUntil(() => browser.execute(
+        (entityId, text) => Array.from(document.querySelectorAll(`.drawing-stage [data-entity-id='${entityId}']`))
+          .some(element => (element.textContent ?? "").includes(text)), id, label,
+      ), { timeout: 15_000, timeoutMsg: `dimension did not evaluate to ${label}` });
+    };
+    await activate(await $("button=Sheet"));
+    await browser.waitUntil(async () => !(await $(".live-review-status.is-refreshing").isExisting()), { timeout: 15_000 });
+    await activate(await $("button.layer-name[title='0-1']"));
+    await $(".layer-row.is-active button.layer-name[title='0-1']").waitForExist({ timeout: 10_000 });
+    await browser.waitUntil(async () => !(await $(".live-review-status.is-refreshing").isExisting()), { timeout: 15_000 });
+    const initialIds = new Set(entities().map(entity => entity.id));
+    await command("rectangle");
+    await $("input[aria-label='Width']").waitForExist({ timeout: 10_000 });
+    await $("input[aria-label='Width']").setValue("1000");
+    await $("input[aria-label='Height']").setValue("1000");
+    await command("20000,20000");
+    await activate(await (await $("section[aria-label='Drafting parameters']")).$("button=Apply"));
+    await applyPreview();
+    const rectangle = entities().find(entity => !initialIds.has(entity.id) && entity.type === "polyline");
+    assert(rectangle, "rectangle did not become a canonical polyline");
+    await waitEntity(rectangle.id);
+
+    const beforeDimensionIds = new Set(entities().map(entity => entity.id));
+    await command("dimension");
+    await command("20000,20000");
+    await command("21000,20000");
+    await command("20000,19800");
+    await applyPreview();
+    const dimension = entities().find(entity => !beforeDimensionIds.has(entity.id) && entity.type === "dimension");
+    assert(dimension, "dimension was not saved");
+    assert.equal(dimension.measurement.first.entity_id, rectangle.id);
+    assert.equal(dimension.measurement.second.entity_id, rectangle.id);
+    await waitDimension(dimension.id, "1000");
+    const beforeStretch = source();
+
+    await command("stretch");
+    for (const point of ["20999,19999", "21001,21001", "0,0", "300,0"]) await command(point);
+    await applyPreview();
+    const stretched = entities().find(entity => entity.id === rectangle.id);
+    assert(stretched.points.some(point => point[0] === 21300), "stretch did not move the right-hand vertices by 300");
+    assert(stretched.points.some(point => point[0] === 20000), "stretch moved vertices outside its rectangle");
+    await waitDimension(dimension.id, "1300");
+    const afterStretch = source();
+    await $("button[aria-label='Undo']").waitForEnabled({ timeout: 10_000 });
+    await activate(await $("button[aria-label='Undo']"));
+    await browser.waitUntil(() => source() === beforeStretch, { timeout: 10_000 });
+    await waitDimension(dimension.id, "1000");
+    await $("button[aria-label='Redo']").waitForEnabled({ timeout: 10_000 });
+    await activate(await $("button[aria-label='Redo']"));
+    await browser.waitUntil(() => source() === afterStretch, { timeout: 10_000 });
+    await waitDimension(dimension.id, "1300");
+
+    await command("select");
+    await activate(await $(`.drawing-stage [data-entity-id='${rectangle.id}']`));
+    await browser.execute((id) => document.querySelector(`.drawing-stage [data-entity-id='${id}']`)
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })), dimension.id);
+    await browser.waitUntil(() => browser.execute((ids) => ids.every(id => document.querySelector(`.drawing-stage [data-entity-id='${id}'].is-selected`)), [rectangle.id, dimension.id]), { timeout: 10_000 });
+    await command("create_block");
+    await $("input[aria-label='Block name']").setValue("E2E room");
+    await command("20000,20000");
+    await activate(await (await $("section[aria-label='Drafting parameters']")).$("button=Apply"));
+    await browser.waitUntil(() => !entities().some(entity => entity.id === rectangle.id), { timeout: 15_000 });
+    const reference = entities().find(entity => entity.type === "block_ref" && entity.block.startsWith("block_"));
+    assert(reference, "block reference was not saved");
+    const blockPath = `${projectPath}/blocks/${reference.block}/entities.ndjson`;
+    const blockBefore = readFileSync(blockPath, "utf8");
+    const blockEntities = blockBefore.trim().split("\n").map(JSON.parse);
+    const blockRectangle = blockEntities.find(entity => entity.type === "polyline");
+    const blockDimension = blockEntities.find(entity => entity.type === "dimension");
+    assert.equal(blockDimension.measurement.first.entity_id, blockRectangle.id);
+    assert.equal(blockDimension.measurement.second.entity_id, blockRectangle.id);
+    await waitEntity(reference.id);
+    await activate(await $(`.drawing-stage [data-entity-id='${reference.id}'] [data-block-child-id]`));
+    await browser.waitUntil(() => browser.execute(id => document.querySelector(`.drawing-stage [data-entity-id='${id}'].is-selected`) !== null, reference.id), { timeout: 10_000 });
+    await command("edit_block");
+    let dialog = await $("section[aria-label='Edit block contents']");
+    await dialog.waitForDisplayed({ timeout: 10_000 });
+    await activate(await dialog.$("button=Delete"));
+    const resolutions = await dialog.$("section[aria-label='Resolve block dimension references']");
+    await resolutions.waitForDisplayed();
+    await browser.execute(element => { element.value = "detach"; element.dispatchEvent(new Event("change", { bubbles: true })); }, await resolutions.$("select"));
+    await resolutions.$("button=Resolve in draft").waitForEnabled({ timeout: 10_000 });
+    await activate(await resolutions.$("button=Resolve in draft"));
+    await resolutions.waitForExist({ reverse: true, timeout: 10_000 });
+    assert.equal(readFileSync(blockPath, "utf8"), blockBefore, "dimension resolution modified source before Save");
+    await activate(await dialog.$("button=Cancel"));
+    await dialog.waitForExist({ reverse: true });
+    await command("edit_block");
+    dialog = await $("section[aria-label='Edit block contents']");
+    await dialog.waitForDisplayed({ timeout: 10_000 });
+    await dialog.$(".translate-controls input").setValue("5");
+    await activate(await dialog.$("button=Move"));
+    assert.equal(readFileSync(blockPath, "utf8"), blockBefore, "block preview modified canonical source before Save");
+    await activate(await dialog.$("button=Save contents"));
+    await dialog.waitForExist({ reverse: true, timeout: 15_000 });
+    assert.notEqual(readFileSync(blockPath, "utf8"), blockBefore);
+    await command("rectangle");
+    await command("23000,20000"); await command("24000,21000");
+    await applyPreview();
+    const circleBefore = source();
+    await command("circle"); await command("23500,20500"); await command("23700,20500");
+    await browser.waitUntil(() => source() !== circleBefore, { timeout: 15_000 });
+    await $("section[aria-label='Drafting parameters']").waitForExist({ reverse: true, timeout: 15_000 });
+    await command("hatch");
+    await activate(await $("section[aria-label='Drafting parameters'] input[type='checkbox']"));
+    await command("23100,20100");
+    await applyPreview();
+    assert(entities().some(entity => entity.type === "hatch" && entity.loops.length === 2), "region hatch lost its inner hole");
     await activate(await $("button[aria-label='Export PDF']"));
-    await browser.waitUntil(() => existsSync(pdfPath), {
-      timeout: 10_000,
-      timeoutMsg: "PDF was not published",
-    });
+    await browser.waitUntil(() => existsSync(pdfPath), { timeout: 15_000 });
     assert.equal(readFileSync(pdfPath).subarray(0, 5).toString(), "%PDF-");
+    const cadc = resolve(import.meta.dirname, "../../../../target/debug/cadc");
+    execFileSync("cargo", ["build", "-p", "cad-cli"], { cwd: resolve(import.meta.dirname, "../../../.."), stdio: "pipe" });
+    const jwwPath = `${pdfPath}.jww`, reportPath = `${jwwPath}.report.json`;
+    execFileSync(cadc, ["check", projectPath, "--drawing", "plan_1f", "--target", "jww-v600", "--format", "json", "--out", "-"], { stdio: "pipe" });
+    execFileSync(cadc, ["export-jww", projectPath, "--drawing", "plan_1f", "--out", jwwPath, "--report", reportPath], { stdio: "pipe" });
+    const report = JSON.parse(readFileSync(reportPath, "utf8"));
+    assert.equal(report.status, "exported");
+    assert(report.warnings.some(warning => warning.code === "dimension_geometry_expanded"));
+    assert(statSync(jwwPath).size > 0);
   });
 });

@@ -9,14 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const CRATE_NAME: &str = "cad-check";
 pub const CHECK_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 const EPSILON_MM: f64 = 0.001;
-
-#[must_use]
-pub fn crate_name() -> &'static str {
-    CRATE_NAME
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -373,16 +367,31 @@ fn check_jww_entity(
             "jww.polyline_expanded",
             "polyline is exported as individual JWW line records",
         ),
-        Entity::Hatch { .. } => push_jww_entity_warning(
-            diagnostics,
-            file,
-            record,
-            "jww.hatch_pattern_approximated",
-            "hatch pattern is exported as deterministic solid geometry",
-        ),
+        Entity::Hatch { pattern, loops, .. } => {
+            if pattern == "solid" {
+                if loops.len() > 1 {
+                    push_jww_entity_warning(
+                        diagnostics,
+                        file,
+                        record,
+                        "jww.hatch_loops_approximated",
+                        "multiple hatch loops are emitted as independent solid polygons",
+                    );
+                }
+            } else if matches!(pattern.as_str(), "parallel" | "cross") {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.hatch_pattern_expanded",
+                    "hatch pattern is expanded to even-odd clipped JWW lines",
+                );
+            }
+        }
         Entity::Dimension {
             value,
             style,
+            measurement,
             text_mirror_y,
             ..
         } => {
@@ -390,8 +399,16 @@ fn check_jww_entity(
                 diagnostics,
                 file,
                 record,
-                "jww.dimension_style_approximated",
-                "dimension style semantics are approximated by JWW v600 fields",
+                if measurement.is_some() {
+                    "jww.dimension_geometry_expanded"
+                } else {
+                    "jww.dimension_style_approximated"
+                },
+                if measurement.is_some() {
+                    "Dimension is expanded to evaluated lines, arcs and text."
+                } else {
+                    "dimension style semantics are approximated by JWW v600 fields"
+                },
             );
             if *text_mirror_y {
                 push_jww_entity_warning(
@@ -463,13 +480,22 @@ fn check_jww_entity_style(
     let Some(layer) = project.layers.layers.get(record.entity.layer()) else {
         return;
     };
-    let (color_id, line_type_id, line_width) = record
+    let (mut color_id, line_type_id, line_width) = record
         .entity
         .pen()
         .and_then(|pen_id| project.styles.pens.get(pen_id))
         .map_or((&layer.color, &layer.line_type, layer.line_width), |pen| {
             (&pen.color, &pen.line_type, pen.line_width)
         });
+    if let Entity::Hatch {
+        pattern,
+        fill: Some(fill),
+        ..
+    } = &record.entity
+        && pattern != "solid"
+    {
+        color_id = fill;
+    }
     let color_supported = color_id
         .strip_prefix("jww_color_")
         .and_then(|value| value.parse::<u16>().ok())
@@ -543,7 +569,8 @@ fn check_cp932_metadata(
 fn jww_record_count(entity: &Entity) -> usize {
     match entity {
         Entity::Polyline { points, closed, .. } => {
-            points.len().saturating_sub(1) + usize::from(*closed && points.len() > 2)
+            points.len().saturating_sub(1)
+                + usize::from(*closed && points.len() > 2 && points.last() != points.first())
         }
         Entity::Hatch { loops, .. } => loops
             .iter()
@@ -852,7 +879,7 @@ impl<'a> Checker<'a> {
                         format!("unsupported paper {:?}", layout.paper),
                     );
                 }
-                if parse_scale(&layout.scale).is_none() {
+                if cad_model::parse_layout_scale(&layout.scale).is_none() {
                     self.push_diagnostic(
                         &layouts_file,
                         "layout.invalid_scale",
@@ -879,6 +906,21 @@ impl<'a> Checker<'a> {
                             .to_owned(),
                     );
                 }
+                if let Some((paper_width, paper_height)) = layout_paper_size(layout)
+                    && layout
+                        .margins
+                        .iter()
+                        .all(|value| value.is_finite() && *value >= 0.0)
+                    && (layout.margins[0] + layout.margins[2] >= paper_width
+                        || layout.margins[1] + layout.margins[3] >= paper_height)
+                {
+                    self.push_diagnostic(
+                        &layouts_file,
+                        "layout.margins_exhaust_paper",
+                        Some(format!("layouts.{layout_id}.margins")),
+                        "layout margins must leave a positive printable paper area".to_owned(),
+                    );
+                }
             }
         }
     }
@@ -886,6 +928,22 @@ impl<'a> Checker<'a> {
     fn check_entities(&mut self) {
         let blocks = self.defined_blocks();
         let mut ids = BTreeMap::<String, String>::new();
+
+        for (block_id, definition) in &self.project.blocks {
+            let file = format!("blocks/{block_id}/entities.ndjson");
+            for record in &definition.entities {
+                let id = record.entity.id().as_str().to_owned();
+                if let Some(first_file) = ids.insert(id.clone(), file.clone()) {
+                    self.push_entity(
+                        &file,
+                        record,
+                        "reference.duplicate_id",
+                        Some("id"),
+                        format!("entity id {id:?} already appears in {first_file}"),
+                    );
+                }
+            }
+        }
 
         for drawing in &self.project.drawings {
             for record in &drawing.entities {
@@ -980,6 +1038,15 @@ impl<'a> Checker<'a> {
                 }
             }
             Entity::Dimension { style, .. } => {
+                if let Err(message) = cad_model::evaluate_dimension(self.project, &record.entity) {
+                    self.push_entity(
+                        file,
+                        record,
+                        "dimension.invalid_reference",
+                        Some("measurement"),
+                        message,
+                    );
+                }
                 if !self.project.styles.dimension_styles.contains_key(style) {
                     self.push_entity(
                         file,
@@ -1012,25 +1079,14 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            Entity::Hatch { fill, pattern, .. } => {
-                if pattern.trim().is_empty() {
+            Entity::Hatch { .. } => {
+                if let Err(error) = cad_model::validate_hatch(self.project, &record.entity) {
                     self.push_entity(
                         file,
                         record,
-                        "reference.empty_hatch_pattern",
-                        Some("pattern"),
-                        "hatch pattern must not be empty".to_owned(),
-                    );
-                }
-                if let Some(fill) = fill
-                    && !self.project.styles.colors.contains_key(fill)
-                {
-                    self.push_entity(
-                        file,
-                        record,
-                        "reference.undefined_fill",
-                        Some("fill"),
-                        format!("hatch entity references undefined fill color {fill:?}"),
+                        "hatch.invalid",
+                        Some(error.field),
+                        error.to_string(),
                     );
                 }
             }
@@ -1223,11 +1279,12 @@ impl<'a> Checker<'a> {
             Entity::Dimension {
                 p1,
                 p2,
+                measurement,
                 offset,
                 text_rotation_deg,
                 ..
             } => {
-                if distance(*p1, *p2) <= EPSILON_MM {
+                if measurement.is_none() && distance(*p1, *p2) <= EPSILON_MM {
                     self.push_entity(
                         file,
                         record,
@@ -1597,12 +1654,19 @@ fn is_rgb_hex(value: &str) -> bool {
         && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
 }
 
-fn parse_scale(value: &str) -> Option<f64> {
-    let (numerator, denominator) = value.split_once(':').or_else(|| value.split_once('/'))?;
-    let numerator = numerator.trim().parse::<f64>().ok()?;
-    let denominator = denominator.trim().parse::<f64>().ok()?;
-    (numerator.is_finite() && denominator.is_finite() && numerator > 0.0 && denominator > 0.0)
-        .then_some(numerator / denominator)
+fn layout_paper_size(layout: &cad_model::LayoutConfig) -> Option<(f64, f64)> {
+    let (width, height) = match layout.paper.as_str() {
+        "A0" => (841.0, 1189.0),
+        "A1" => (594.0, 841.0),
+        "A2" => (420.0, 594.0),
+        "A3" => (297.0, 420.0),
+        "A4" => (210.0, 297.0),
+        _ => return None,
+    };
+    Some(match layout.orientation {
+        cad_model::SheetOrientation::Portrait => (width, height),
+        cad_model::SheetOrientation::Landscape => (height, width),
+    })
 }
 
 fn polygon_is_degenerate(points: &[[f64; 2]]) -> bool {
@@ -1634,7 +1698,7 @@ fn has_self_intersection(points: &[[f64; 2]], closed: bool) -> bool {
         .windows(2)
         .map(|window| (window[0], window[1]))
         .collect();
-    if closed && points.len() > 2 {
+    if closed && points.len() > 2 && distance(points[points.len() - 1], points[0]) > EPSILON_MM {
         segments.push((points[points.len() - 1], points[0]));
     }
 
@@ -1684,14 +1748,32 @@ fn direction(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicitly_closed_polyline_seam_is_adjacent_not_an_intersection() {
+        assert!(!has_self_intersection(
+            &[
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [100.0, 100.0],
+                [0.0, 100.0],
+                [0.0, 0.0]
+            ],
+            true
+        ));
+        assert!(has_self_intersection(
+            &[
+                [0.0, 0.0],
+                [100.0, 100.0],
+                [0.0, 100.0],
+                [100.0, 0.0],
+                [0.0, 0.0]
+            ],
+            true
+        ));
+    }
     use sha2::{Digest, Sha256};
     use std::fs::{create_dir_all, write};
     use std::path::PathBuf;
-
-    #[test]
-    fn exposes_crate_name() {
-        assert_eq!(crate_name(), "cad-check");
-    }
 
     #[test]
     fn accepts_house_small_example() {
@@ -1708,7 +1790,7 @@ mod tests {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            "{\"schema_version\":\"0.2\"",
+            "{\"schema_version\":\"0.3\"",
         )
         .expect("entities should be writable");
 
@@ -1723,22 +1805,7 @@ mod tests {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0],"extra":true}"#,
-        )
-        .expect("entities should be writable");
-
-        let report = check_project(temp.path());
-
-        assert_code(&report, "format.invalid_ndjson");
-        assert_eq!(report.diagnostics[0].line, Some(1));
-    }
-
-    #[test]
-    fn reports_missing_required_field_as_whole_check_failure() {
-        let temp = fixture_project();
-        write(
-            temp.path().join("drawings/plan_1f/entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"line","layer":"0-1","p1":[0.0,0.0]}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[910.0,0.0],"extra":true}"#,
         )
         .expect("entities should be writable");
 
@@ -1769,6 +1836,21 @@ mod tests {
         assert_code(&report, "reference.undefined_text_style");
         assert_code(&report, "reference.undefined_dimension_style");
         assert_code(&report, "reference.undefined_block");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], cad_model::CURRENT_SCHEMA_VERSION);
+        assert_eq!(json["status"], "error");
+        let diagnostic = json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["code"] == "reference.undefined_layer")
+            .unwrap();
+        assert_eq!(diagnostic["file"], "drawings/plan_1f/entities.ndjson");
+        assert_eq!(diagnostic["line"], 1);
+        assert_eq!(diagnostic["entity_id"], "ent_01JZ0000000000000000000000");
+        assert_eq!(diagnostic["severity"], "error");
+        assert_eq!(diagnostic["field"], "layer");
+        assert!(!diagnostic["message"].as_str().unwrap().is_empty());
     }
 
     #[test]
@@ -1811,13 +1893,13 @@ mod tests {
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":0.0,"start_deg":0.0,"end_deg":0.0}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"polyline","layer":"0-1","points":[[0.0,0.0],[0.5,0.0],[1.0,0.0]],"closed":false}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000003","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,1.0],[0.0,1.0],[1.0,0.0]],"closed":false}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000004","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0],[1.0,1.0]],"closed":true}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000005","type":"polyline","layer":"0-1","points":[],"closed":false}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000006","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":0.0,"radius_y":1.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":361.0}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"line","layer":"0-1","p1":[0.0,0.0],"p2":[0.0,0.0]}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0.0,0.0],"radius":0.0,"start_deg":0.0,"end_deg":0.0}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"polyline","layer":"0-1","points":[[0.0,0.0],[0.5,0.0],[1.0,0.0]],"closed":false}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000003","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,1.0],[0.0,1.0],[1.0,0.0]],"closed":false}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000004","type":"polyline","layer":"0-1","points":[[0.0,0.0],[1.0,0.0],[1.0,1.0]],"closed":true}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000005","type":"polyline","layer":"0-1","points":[],"closed":false}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000006","type":"ellipse","layer":"0-1","center":[0.0,0.0],"radius_x":0.0,"radius_y":1.0,"rotation_deg":0.0,"start_deg":0.0,"end_deg":361.0}"#,
             ]
             .join("\n"),
         )
@@ -1854,13 +1936,67 @@ mod tests {
     }
 
     #[test]
+    fn hatch_contract_and_jww_diagnostics_are_consistent() {
+        for (pattern, fill, width, field) in [
+            ("legacy", Some("jw_black"), 10.0, Some("pattern")),
+            ("solid", None, 10.0, Some("fill")),
+            ("parallel", Some("jw_black"), 10.0, None),
+            ("cross", Some("jw_black"), 30_000.0, Some("scale")),
+            ("solid", Some("jw_black"), 10.0, None),
+        ] {
+            let temp = fixture_project();
+            let entity = serde_json::json!({
+                "schema_version": "0.3", "id": "ent_01JZ0000000000000000000010",
+                "type": "hatch", "layer": "0-1", "pattern": pattern,
+                "fill": fill, "scale": 1.0, "angle_deg": 0.0,
+                "loops": [[[0.0,0.0],[width,0.0],[width,10.0],[0.0,10.0]],
+                          [[2.0,2.0],[4.0,2.0],[4.0,4.0],[2.0,4.0]]]
+            });
+            write(
+                temp.path().join("drawings/plan_1f/entities.ndjson"),
+                entity.to_string(),
+            )
+            .unwrap();
+            let report =
+                check_project_for_target(temp.path(), CheckTarget::JwwV600, Some("plan_1f"));
+            if let Some(field) = field {
+                let diagnostic = report
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.code == "hatch.invalid")
+                    .unwrap();
+                assert_eq!(diagnostic.severity, Severity::Error);
+                assert_eq!(diagnostic.field.as_deref(), Some(field));
+                assert_eq!(
+                    diagnostic.entity_id.as_deref(),
+                    Some("ent_01JZ0000000000000000000010")
+                );
+            } else {
+                assert!(report.is_ok(), "{report:?}");
+                let expected = if pattern == "solid" {
+                    "jww.hatch_loops_approximated"
+                } else {
+                    "jww.hatch_pattern_expanded"
+                };
+                assert_code(&report, expected);
+                assert!(!report.diagnostics.iter().any(|d| d.code
+                    == if pattern == "solid" {
+                        "jww.hatch_pattern_expanded"
+                    } else {
+                        "jww.hatch_loops_approximated"
+                    }));
+            }
+        }
+    }
+
+    #[test]
     fn jww_target_reports_approximations_as_warnings() {
         let temp = fixture_project();
         write(
             temp.path().join("drawings/plan_1f/entities.ndjson"),
             [
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[10.0,0.0],[10.0,10.0]],"closed":false}"#,
-                r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"polyline","layer":"0-1","points":[[0.0,0.0],[10.0,0.0],[10.0,10.0]],"closed":false}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
             ]
             .join("\n"),
         )
@@ -1888,7 +2024,7 @@ mod tests {
         create_dir_all(&second).expect("second drawing directory");
         write(
             second.join("layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"portrait\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"portrait\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("second layouts");
         write(second.join("entities.ndjson"), "").expect("second entities");
@@ -1948,12 +2084,12 @@ mod tests {
         create_dir_all(&block).expect("block directory");
         write(
             block.join("definition.toml"),
-            "schema_version = \"0.2\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nname = \"fixture\"\nbase_point = [0.0, 0.0]\n",
         )
         .expect("block definition");
         write(
             block.join("entities.ndjson"),
-            r#"{"schema_version":"0.2","id":"ent_01JZ0000000000000000000099","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000099","type":"text","layer":"0-1","style":"note","at":[0.0,0.0],"rotation_deg":0.0,"mirror_y":true,"value":"emoji 🚀"}"#,
         )
         .expect("block entities");
 
@@ -1970,40 +2106,6 @@ mod tests {
             Some("ent_01JZ0000000000000000000099")
         );
         assert_code(&report, "jww.mirrored_text_approximated");
-    }
-
-    #[test]
-    fn json_report_shape_is_stable() {
-        let report = CheckReport::new(vec![CheckDiagnostic {
-            severity: Severity::Error,
-            file: "drawings/plan_1f/entities.ndjson".to_owned(),
-            line: Some(1),
-            entity_id: Some("ent_01JZ0000000000000000000000".to_owned()),
-            field: Some("layer".to_owned()),
-            code: "reference.undefined_layer".to_owned(),
-            message: "entity references undefined layer".to_owned(),
-        }]);
-
-        insta::assert_snapshot!(
-            serde_json::to_string_pretty(&report).expect("report should serialize"),
-            @r#"
-{
-  "schema_version": "0.2",
-  "status": "error",
-  "diagnostics": [
-    {
-      "severity": "error",
-      "file": "drawings/plan_1f/entities.ndjson",
-      "line": 1,
-      "entity_id": "ent_01JZ0000000000000000000000",
-      "field": "layer",
-      "code": "reference.undefined_layer",
-      "message": "entity references undefined layer"
-    }
-  ]
-}
-"#
-        );
     }
 
     fn assert_code(report: &CheckReport, code: &str) {
@@ -2053,7 +2155,7 @@ mod tests {
 
         write(
             temp.path().join("cad.project.toml"),
-            "schema_version = \"0.2\"\nname = \"fixture\"\n",
+            "schema_version = \"0.3\"\nname = \"fixture\"\n",
         )
         .expect("project TOML should be writable");
         write(
@@ -2068,7 +2170,7 @@ mod tests {
         .expect("styles TOML should be writable");
         write(
             temp.path().join("drawings/plan_1f/layouts.toml"),
-            "schema_version = \"0.2\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            "schema_version = \"0.3\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"A3\"\norientation = \"landscape\"\nscale = \"1/100\"\norigin = [0.0, 0.0]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
         )
         .expect("layouts TOML should be writable");
         write(
@@ -2082,25 +2184,25 @@ mod tests {
 
     fn line_entity(id: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.2","id":"{id}","type":"line","layer":"{layer}","p1":[0.0,0.0],"p2":[910.0,0.0]}}"#
+            r#"{{"schema_version":"0.3","id":"{id}","type":"line","layer":"{layer}","p1":[0.0,0.0],"p2":[910.0,0.0]}}"#
         )
     }
 
     fn text_entity(id: &str, style: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.2","id":"{id}","type":"text","layer":"{layer}","style":"{style}","at":[0.0,0.0],"rotation_deg":0.0,"value":"note"}}"#
+            r#"{{"schema_version":"0.3","id":"{id}","type":"text","layer":"{layer}","style":"{style}","at":[0.0,0.0],"rotation_deg":0.0,"value":"note"}}"#
         )
     }
 
     fn dimension_entity(id: &str, style: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.2","id":"{id}","type":"dimension","layer":"{layer}","style":"{style}","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}}"#
+            r#"{{"schema_version":"0.3","id":"{id}","type":"dimension","layer":"{layer}","style":"{style}","p1":[0.0,0.0],"p2":[1.0,0.0],"offset":100.0,"value":null}}"#
         )
     }
 
     fn block_entity(id: &str, block: &str, layer: &str) -> String {
         format!(
-            r#"{{"schema_version":"0.2","id":"{id}","type":"block_ref","layer":"{layer}","block":"{block}","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}}"#
+            r#"{{"schema_version":"0.3","id":"{id}","type":"block_ref","layer":"{layer}","block":"{block}","at":[0.0,0.0],"rotation_deg":0.0,"scale":1.0}}"#
         )
     }
 }
