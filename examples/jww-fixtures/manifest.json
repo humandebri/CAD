@@ -13,6 +13,32 @@
         "CDataTen": 4
       },
       "block_definition_count": 0
+    },
+    {
+      "path": "apartment-plan.jww",
+      "sha256": "af61b88ff342bd40af834caba10f2dd5c36bb3a3d5be0a2d74648318a47a4113",
+      "jww_version": 600,
+      "compatibility_state": "editable_lossless",
+      "record_classes": {
+        "CDataEnko": 215,
+        "CDataMoji": 56,
+        "CDataSen": 1394,
+        "CDataSolid": 79,
+        "CDataTen": 10
+      },
+      "block_definition_count": 0,
+      "source_path": "jww_samples/Ａマンション平面例.jww",
+      "source_commit": "4547d5d3d0226505ccb8626de8b21f09037cd088"
+    },
+    {
+      "path": "2blocks.jww",
+      "sha256": "cd04785694f87c2d7e30c0efdbac491034d2658ed27cc09626ae36b9cca5bd67",
+      "jww_version": 700,
+      "compatibility_state": "unsupported_version",
+      "record_classes": {},
+      "block_definition_count": null,
+      "source_path": "jww_samples/block_regressions/2blocks.jww",
+      "source_commit": "4547d5d3d0226505ccb8626de8b21f09037cd088"
     }
   ]
 }

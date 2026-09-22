@@ -4,7 +4,7 @@ Status: IN PROGRESS
 
 ## Contract
 
-- AI agents edit canonical schema 0.2 TOML and NDJSON directly. Generated,
+- AI agents edit canonical schema 0.3 TOML and NDJSON directly. Generated,
   history, transaction, recovery, and JWW provenance files are not source.
 - `cadc check --target cad` validates direct edits. `--target jww-v600` adds
   deterministic approximation and substitution diagnostics.
@@ -23,4 +23,8 @@ Status: IN PROGRESS
 - [x] Support one-to-many edited record replacement and report it.
 - [x] Publish a hashed fixture manifest with decoded record inventory.
 - [ ] Add licensed solid, dimension, block, hatch, and palette fixtures.
-- [ ] Pass the complete workspace and Desktop verification gates.
+- [x] Pass the complete workspace and Desktop verification gates (2026-09-22).
+
+The corpus now includes the licensed v600 apartment solid fixture and v700
+block preservation-only fixture. Native v600 dimension, block, and hatch
+coverage remains open; see `examples/jww-fixtures/README.md`.

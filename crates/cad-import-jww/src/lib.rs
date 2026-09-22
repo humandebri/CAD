@@ -1258,6 +1258,36 @@ fn known_marker_code(code: u32) -> bool {
     (1..=11).contains(&code) || code >= u32::MAX - 6
 }
 
+// JWW solids can store crossing corner order. Keep the raw codec/provenance
+// untouched, but use a simple perimeter in the canonical polygon, as the
+// upstream ezjww plotter does for these records.
+fn solid_boundary(points: [[f64; 2]; 4]) -> Vec<[f64; 2]> {
+    let orientation = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let crosses = |a, b, c, d| {
+        orientation(a, b, c) * orientation(a, b, d) < 0.0
+            && orientation(c, d, a) * orientation(c, d, b) < 0.0
+    };
+    let mut boundary = points.to_vec();
+    if crosses(points[0], points[1], points[2], points[3])
+        || crosses(points[1], points[2], points[3], points[0])
+    {
+        let center = [
+            points.iter().map(|p| p[0] / 4.0).sum::<f64>(),
+            points.iter().map(|p| p[1] / 4.0).sum::<f64>(),
+        ];
+        boundary.sort_by(|a, b| {
+            (a[1] - center[1])
+                .atan2(a[0] - center[0])
+                .total_cmp(&(b[1] - center[1]).atan2(b[0] - center[0]))
+        });
+        let first = boundary.iter().position(|p| *p == points[0]).unwrap();
+        boundary.rotate_left(first);
+    }
+    boundary
+}
+
 fn push_solid(context: &mut ConversionContext<'_>, solid: &Solid) -> ImportResult<()> {
     if !solid.points.iter().all(|point| point_is_finite(*point)) {
         context.warnings.push(geometry_skipped(
@@ -1266,6 +1296,14 @@ fn push_solid(context: &mut ConversionContext<'_>, solid: &Solid) -> ImportResul
             "solid contains a non-finite point",
         ));
         return Ok(());
+    }
+    let points = solid_boundary(solid.points);
+    if points.as_slice() != solid.points {
+        context.warnings.push(ImportWarning {
+            code: "solid_boundary_reordered".to_owned(),
+            message: "crossing JWW solid corners reordered into a simple canonical boundary; original record retained".to_owned(),
+            record_type: "CDataSolid".to_owned(),
+        });
     }
     remember_layer(
         context.document,
@@ -1286,6 +1324,7 @@ fn push_solid(context: &mut ConversionContext<'_>, solid: &Solid) -> ImportResul
         next_id(&mut context.id_index),
         &layer_id(solid.base),
         solid,
+        &points,
         &fill,
     ));
     Ok(())
@@ -1754,14 +1793,20 @@ fn entity_point_json(id: String, layer: &str, point: &Point) -> String {
     .to_string()
 }
 
-fn entity_solid_json(id: String, layer: &str, solid: &Solid, fill: &str) -> String {
+fn entity_solid_json(
+    id: String,
+    layer: &str,
+    solid: &Solid,
+    points: &[[f64; 2]],
+    fill: &str,
+) -> String {
     json!({
         "schema_version": CAD_SCHEMA_VERSION,
         "id": id,
         "type": "solid",
         "layer": layer,
         "pen": pen_id(solid.base),
-        "points": solid.points,
+        "points": points,
         "fill": fill,
     })
     .to_string()
@@ -2258,31 +2303,32 @@ mod tests {
             &fs::read(fixture_root.join("manifest.json")).expect("fixture manifest"),
         )
         .expect("valid fixture manifest");
-        let entry = &manifest["fixtures"][0];
-        let bytes = fs::read(fixture_root.join(entry["path"].as_str().expect("fixture path")))
-            .expect("fixture bytes");
-        assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
-            entry["sha256"].as_str().expect("fixture sha256")
-        );
+        for entry in manifest["fixtures"].as_array().expect("fixture inventory") {
+            let bytes = fs::read(fixture_root.join(entry["path"].as_str().expect("fixture path")))
+                .expect("fixture bytes");
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                entry["sha256"].as_str().expect("fixture sha256")
+            );
 
-        let inspection = cad_jww_codec::inspect_document(&bytes);
-        assert_eq!(
-            inspection.version,
-            entry["jww_version"].as_u64().map(|v| v as u32)
-        );
-        assert_eq!(
-            serde_json::to_value(inspection.state).expect("state"),
-            entry["compatibility_state"]
-        );
-        assert_eq!(
-            serde_json::to_value(&inspection.record_classes).expect("record inventory"),
-            entry["record_classes"]
-        );
-        assert_eq!(
-            inspection.block_definition_count,
-            entry["block_definition_count"].as_u64().map(|v| v as usize)
-        );
+            let inspection = cad_jww_codec::inspect_document(&bytes);
+            assert_eq!(
+                inspection.version,
+                entry["jww_version"].as_u64().map(|v| v as u32)
+            );
+            assert_eq!(
+                serde_json::to_value(inspection.state).expect("state"),
+                entry["compatibility_state"]
+            );
+            assert_eq!(
+                serde_json::to_value(&inspection.record_classes).expect("record inventory"),
+                entry["record_classes"]
+            );
+            assert_eq!(
+                inspection.block_definition_count,
+                entry["block_definition_count"].as_u64().map(|v| v as usize)
+            );
+        }
     }
 
     #[test]
@@ -2469,6 +2515,33 @@ mod tests {
         assert!(converted.warnings.iter().any(|warning| {
             warning.code == "unsupported_marker" && warning.record_type == "CDataTen"
         }));
+    }
+
+    #[test]
+    fn crossing_solid_corners_are_normalized_without_changing_simple_or_concave_boundaries() {
+        let rectangle = [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]];
+        let crossing = [rectangle[0], rectangle[2], rectangle[3], rectangle[1]];
+        assert_eq!(solid_boundary(crossing), rectangle);
+        let concave = [[0.0, 0.0], [10.0, 0.0], [2.0, 2.0], [0.0, 5.0]];
+        assert_eq!(solid_boundary(concave), concave);
+        let converted = convert_ok(&test_document(
+            vec![JwwEntity::Solid(Solid {
+                base: EntityBase::default(),
+                points: crossing,
+                color: Some(1),
+            })],
+            Vec::new(),
+        ));
+        assert!(
+            converted
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "solid_boundary_reordered")
+        );
+        assert_eq!(
+            entity_values(&converted.entities)[0]["points"],
+            serde_json::json!(rectangle)
+        );
     }
 
     #[test]

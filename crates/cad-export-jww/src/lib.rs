@@ -3027,6 +3027,112 @@ mod tests {
         assert_eq!(fs::read(exported).unwrap(), fs::read(fixture).unwrap());
     }
 
+    #[test]
+    fn manifest_fixtures_preserve_original_bytes_and_edited_solid_records() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/jww-fixtures");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        for entry in manifest["fixtures"].as_array().unwrap() {
+            let original = fs::read(root.join(entry["path"].as_str().unwrap())).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let imported = temp.path().join("imported");
+            let import = cad_import_jww::import_jww_file(
+                root.join(entry["path"].as_str().unwrap()),
+                &imported,
+            )
+            .unwrap();
+            let output = temp.path().join("original.jww");
+            if entry["compatibility_state"] != "editable_lossless" {
+                extract_original_jww(&imported, &output, false).unwrap();
+                assert_eq!(fs::read(&output).unwrap(), original);
+                continue;
+            }
+            let report = export_jww_file_auto_with_report(
+                &imported,
+                &import.drawing_name,
+                &output,
+                temp.path().join("original.report.json"),
+                AutoExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(report.status, ExportStatus::Exported, "{report:?}");
+            assert_eq!(fs::read(&output).unwrap(), original);
+            let before = cad_jww_codec::read_document(&original).unwrap();
+            let path = imported.join(format!("drawings/{}/entities.ndjson", import.drawing_name));
+            let mut values: Vec<serde_json::Value> = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let line = values
+                .iter_mut()
+                .find(|value| value["type"] == "line")
+                .unwrap();
+            let changed_id = line["id"].as_str().unwrap().to_owned();
+            for field in ["p1", "p2"] {
+                line[field][0] = serde_json::json!(line[field][0].as_f64().unwrap() + 1.0);
+            }
+            let expected = line.clone();
+            fs::write(
+                &path,
+                values
+                    .iter()
+                    .map(|v| format!("{}\n", serde_json::to_string(v).unwrap()))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let checked = cad_check::check_project(&imported);
+            assert_eq!(checked.status, cad_check::CheckStatus::Ok, "{checked:?}");
+            let edited = temp.path().join("edited.jww");
+            let report = export_jww_file_auto_with_report(
+                &imported,
+                &import.drawing_name,
+                &edited,
+                temp.path().join("edited.report.json"),
+                AutoExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                report.status,
+                ExportStatus::Exported,
+                "{report:?}, {changed_id}"
+            );
+            let after = cad_jww_codec::read_document(&fs::read(&edited).unwrap()).unwrap();
+            assert_eq!(before.header, after.header);
+            let solids = |document: &cad_jww_codec::DecodedDocument| {
+                document
+                    .entities
+                    .iter()
+                    .filter(|entity| {
+                        matches!(
+                            entity,
+                            cad_jww_codec::DecodedEntity::Solid(_)
+                                | cad_jww_codec::DecodedEntity::CircleSolid(_)
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                solids(&before),
+                solids(&after),
+                "editing a line must preserve all solid fields"
+            );
+            let reimported = temp.path().join("reimported");
+            cad_import_jww::import_jww_file(&edited, &reimported).unwrap();
+            let project = cad_model::load_project(&reimported).unwrap();
+            assert!(
+                project.drawings[0].entities.iter().any(|record| {
+                    let value = serde_json::to_value(&record.entity).unwrap();
+                    value["type"] == "line"
+                        && value["p1"] == expected["p1"]
+                        && value["p2"] == expected["p2"]
+                }),
+                "edited line geometry must survive re-import"
+            );
+        }
+    }
+
     fn write_minimal_line_fixture(root: &Path) -> PathBuf {
         let path = root.join("Test1.jww");
         let bytes = cad_jww_codec::write_document(&Document {
