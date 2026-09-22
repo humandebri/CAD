@@ -28,6 +28,8 @@ idle repeats the last successful drafting command, never deletion or export.
 The command bar also accepts `x,y`, `@dx,dy`, and `@distance<angle`.
 
 Dimensions can be fixed or reference geometry in the same drawing/block.
+Endpoints, polyline vertices and segment midpoints, curve midpoints, centers,
+and quadrants can follow their source geometry; other picked points remain fixed.
 Aligned, horizontal, vertical, chained, baseline, angular, radius, and diameter
 dimensions use the common model evaluator for checking and output. An edit
 that invalidates a reference stops for an explicit detach-or-delete decision;

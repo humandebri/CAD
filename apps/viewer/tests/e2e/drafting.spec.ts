@@ -125,3 +125,16 @@ test("changing dimension association discards the old preview and uses fresh anc
   await expect.poll(async () => (await writes(page)).length).toBe(1);
   expect((await writes(page))[0].args.request).toMatchObject({ operation: { kind: "source_checked", operation: { kind: "create", entity: { measurement: { first: { kind: "fixed" }, second: { kind: "fixed" } } } } } });
 });
+
+
+test("vertical dimension placement and midpoint association reach the edit request", async ({ page }) => {
+  await openDraftingHarness(page);
+  await command(page, "dimension");
+  const panel = page.getByRole("region", { name: "Drafting parameters" });
+  await panel.getByLabel("Dimension type", { exact: true }).selectOption("vertical");
+  for (const point of ["60,10", "60,110", "90,50"]) await command(page, point);
+  await expect(panel).toContainText("Preview ready");
+  await panel.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect.poll(async () => (await writes(page)).length).toBe(1);
+  expect((await writes(page))[0].args.request).toMatchObject({ operation: { operation: { entity: { offset: 30, measurement: { kind: "vertical", first: { kind: "entity", feature: "midpoint" } } } } } });
+});

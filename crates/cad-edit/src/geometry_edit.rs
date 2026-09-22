@@ -284,11 +284,34 @@ pub(super) fn perpendicular_curve_point(entity: &Entity, reference: Point) -> Op
         .then_some(candidate)
 }
 
-pub(super) fn remap_retained_vertices(
+fn collect_trim_targets(operation: &EditOperation, targets: &mut BTreeSet<String>) {
+    match operation {
+        EditOperation::Trim {
+            target_entity_id, ..
+        } => {
+            targets.insert(target_entity_id.clone());
+        }
+        EditOperation::Batch { operations } => {
+            for operation in operations {
+                collect_trim_targets(operation, targets);
+            }
+        }
+        EditOperation::SourceChecked { operation, .. }
+        | EditOperation::ResolveDimensions { operation, .. } => {
+            collect_trim_targets(operation, targets)
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn remap_retained_polyline_anchors(
     before: &[Entity],
     after: &mut [Entity],
     raw: &mut [RawLine],
+    operation: &EditOperation,
 ) -> EditResult<()> {
+    let mut trimmed = BTreeSet::new();
+    collect_trim_targets(operation, &mut trimmed);
     let original = before
         .iter()
         .cloned()
@@ -314,8 +337,18 @@ pub(super) fn remap_retained_vertices(
                 continue;
             }
             let (
-                Some(Entity::Polyline { points: old, .. }),
-                Some(Entity::Polyline { points: new, .. }),
+                Some(
+                    old_entity @ Entity::Polyline {
+                        points: old,
+                        closed: old_closed,
+                        ..
+                    },
+                ),
+                Some(Entity::Polyline {
+                    points: new,
+                    closed: new_closed,
+                    ..
+                }),
             ) = (
                 before.iter().find(|e| e.id() == &entity_id),
                 snapshot.iter().find(|e| e.id() == &entity_id),
@@ -323,6 +356,55 @@ pub(super) fn remap_retained_vertices(
             else {
                 continue;
             };
+            if feature == cad_model::DimensionFeature::Midpoint {
+                if old.len() == new.len()
+                    && old_closed == new_closed
+                    && !trimmed.contains(entity_id.as_str())
+                {
+                    continue;
+                }
+                let segments = path_segments(old_entity)?;
+                let mut candidates = Vec::new();
+                if let Some(&(start, end)) = index.and_then(|i| segments.get(i)) {
+                    let original = SnapSegment { start, end };
+                    for entity in &snapshot {
+                        if !matches!(entity, Entity::Polyline { .. })
+                            || (entity.id() != &entity_id
+                                && before.iter().any(|e| e.id() == entity.id()))
+                        {
+                            continue;
+                        }
+                        for (i, (a, b)) in path_segments(entity)?.into_iter().enumerate() {
+                            // A retained (possibly shortened or reversed) segment must lie
+                            // on the original segment, not merely share its midpoint.
+                            if distance_sq(a, b) > 1e-18
+                                && [a, b].into_iter().all(|point| {
+                                    distance_sq(point, nearest_point_on_segment(point, original))
+                                        <= 1e-18
+                                })
+                            {
+                                candidates.push((entity.id().clone(), i));
+                            }
+                        }
+                    }
+                }
+                let (entity_id, index) = if candidates.len() == 1 {
+                    candidates.remove(0)
+                } else {
+                    // The existing resolution flow handles deleted or ambiguous segments.
+                    (entity_id, usize::MAX)
+                };
+                let replacement = cad_model::DimensionAnchor::Entity {
+                    entity_id,
+                    feature,
+                    index: Some(index),
+                };
+                if *anchor != replacement {
+                    *anchor = replacement;
+                    changed = true;
+                }
+                continue;
+            }
             if old.len() == new.len() {
                 continue;
             }
@@ -385,25 +467,8 @@ pub(super) fn remap_trim_endpoints(
     raw: &mut [RawLine],
     operation: &EditOperation,
 ) -> EditResult<()> {
-    fn targets(op: &EditOperation, out: &mut BTreeSet<String>) {
-        match op {
-            EditOperation::Trim {
-                target_entity_id, ..
-            } => {
-                out.insert(target_entity_id.clone());
-            }
-            EditOperation::Batch { operations } => {
-                for op in operations {
-                    targets(op, out);
-                }
-            }
-            EditOperation::SourceChecked { operation, .. }
-            | EditOperation::ResolveDimensions { operation, .. } => targets(operation, out),
-            _ => {}
-        }
-    }
     let mut trimmed = BTreeSet::new();
-    targets(operation, &mut trimmed);
+    collect_trim_targets(operation, &mut trimmed);
     if trimmed.is_empty() {
         return Ok(());
     }

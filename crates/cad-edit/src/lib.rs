@@ -810,7 +810,12 @@ pub fn preview_edit(
     let warnings = geometry_edit::warnings(&project, &before, &request.operation);
     let result = apply_operation(&request.operation, &project, &mut entities, &mut raw)?;
     geometry_edit::remap_trim_endpoints(&before, &mut entities, &mut raw, &request.operation)?;
-    geometry_edit::remap_retained_vertices(&before, &mut entities, &mut raw)?;
+    geometry_edit::remap_retained_polyline_anchors(
+        &before,
+        &mut entities,
+        &mut raw,
+        &request.operation,
+    )?;
     let dimension_impacts = geometry_edit::dimension_impacts(&before, &entities);
     project.drawings[index].entities = entities
         .iter()
@@ -2030,9 +2035,12 @@ pub fn apply_edit(
         history_stage.abort();
         return Err(error);
     }
-    if let Err(error) =
-        geometry_edit::remap_retained_vertices(&before_entities, &mut entities, &mut raw_lines)
-    {
+    if let Err(error) = geometry_edit::remap_retained_polyline_anchors(
+        &before_entities,
+        &mut entities,
+        &mut raw_lines,
+        &request.operation,
+    ) {
         history_stage.abort();
         return Err(error);
     }

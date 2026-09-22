@@ -96,6 +96,7 @@ export function DraftingPanel(props: {
       {command === "dimension" && <>
         <label>Dimension<select aria-label="Dimension type" value={options.dimension} onChange={e => set("dimension", e.currentTarget.value)}>{["aligned", "horizontal", "vertical", "chain", "baseline", "angle", "radius", "diameter"].map(type => <option key={type}>{type}</option>)}</select></label>
         <label><input type="checkbox" checked={options.associate} onChange={e => set("associate", e.currentTarget.checked)} />Associate with geometry</label>
+        <small>Endpoints, vertices, midpoints, centers and quadrants follow geometry. Other points remain fixed.</small>
       </>}
       {command === "hatch" && <>
         <label>Pattern<select aria-label="Hatch pattern" value={options.pattern} onChange={e => set("pattern", e.currentTarget.value)}>{["solid", "parallel", "cross"].map(pattern => <option key={pattern}>{pattern}</option>)}</select></label>

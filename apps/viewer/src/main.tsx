@@ -64,6 +64,7 @@ import {
 } from "./artifacts";
 import { formatError } from "./app-errors";
 import { commandForKeyboardEvent, commandFromText, commandLabel, parseCoordinateInput, type CadCommand } from "./command-registry";
+import { dimensionAnchorAt, dimensionOffset } from "./drafting-dimensions";
 import { closestEntityId } from "./svg-selection";
 import { DraftingPanel, initialDraftingOptions, finiteDraftNumber, repeatableCommand, retuneDraftOperation } from "./drafting-panel";
 import {
@@ -2428,7 +2429,7 @@ function App() {
         setPendingOperation({ kind: "batch", operations: pairs.map(([a, b], index) => create(a, b, signedLineOffset(a, b, points[2]) + (type === "baseline" ? index * 10 : 0), { kind: "aligned", first: anchor(a), second: anchor(b) })) });
       } else if (points.length >= 3) {
         const measurement = type === "angle" ? { kind: "angle", vertex: anchor(points[0]), first: anchor(points[1]), second: anchor(points[2]) } : { kind: type, first: anchor(points[0]), second: anchor(points[1]) };
-        setPendingOperation(create(points[0], points[1], type === "angle" ? pointArrayDistance(points[0], points[1]) / 2 : signedLineOffset(points[0], points[1], points[2]), measurement));
+        setPendingOperation(create(points[0], points[1], type === "angle" ? pointArrayDistance(points[0], points[1]) / 2 : dimensionOffset(type, points[0], points[1], points[2]), measurement));
       }
       return true;
     }
@@ -3294,26 +3295,6 @@ function offsetSide(entity: EditorEntity | undefined, point: [number, number]): 
   return side;
 }
 
-function dimensionAnchorAt(artifacts: Artifacts, point: [number, number]): Record<string, unknown> {
-  for (const entity of artifacts.editor.entities) {
-    const layer = artifacts.layers.layers.find(layer => layer.id === entity.layer);
-    const group = artifacts.layers.groups.find(group => group.id === layer?.group);
-    if (!layer?.visible || group?.visible === false) continue;
-    for (const [index, vertex] of entityVertices(entity).entries()) {
-      if (pointArrayDistance(vertex, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature: entity.type === "line" ? index === 0 ? "start" : "end" : "vertex", ...(entity.type === "polyline" ? { index } : {}) };
-    }
-    const center = asCadPoint(entity.center);
-    if (center !== null && ["circle", "arc"].includes(entity.type)) {
-      if (pointArrayDistance(center, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature: "center" };
-      if (entity.type === "arc" && typeof entity.radius === "number") for (const feature of ["start", "end"] as const) {
-        const angle = Number(entity[`${feature}_deg`]) * Math.PI / 180;
-        const endpoint: [number, number] = [center[0] + entity.radius * Math.cos(angle), center[1] + entity.radius * Math.sin(angle)];
-        if (pointArrayDistance(endpoint, point) < 1e-7) return { kind: "entity", entity_id: entity.id, feature };
-      }
-    }
-  }
-  return { kind: "fixed", point };
-}
 
 function translateEditorEntity(entity: EditorEntity, delta: [number, number]): EditorEntity | null {
   const result = structuredClone(entity);

@@ -12,6 +12,8 @@ pub enum DimensionFeature {
     Center,
     Vertex,
     Radius,
+    Midpoint,
+    Quadrant,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -155,6 +157,64 @@ pub fn resolve_dimension_anchor(
             match (entity, feature) {
                 (Entity::Line { p1, .. }, DimensionFeature::Start) => *p1,
                 (Entity::Line { p2, .. }, DimensionFeature::End) => *p2,
+                (Entity::Line { p1, p2, .. }, DimensionFeature::Midpoint) => {
+                    [(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0]
+                }
+                (Entity::Polyline { points, closed, .. }, DimensionFeature::Midpoint) => {
+                    let i = index.ok_or("measurement: midpoint requires segment index")?;
+                    let a = points
+                        .get(i)
+                        .ok_or("measurement: segment index is out of range")?;
+                    let b = points
+                        .get(i + 1)
+                        .or_else(|| if *closed { points.first() } else { None })
+                        .ok_or("measurement: segment index is out of range")?;
+                    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
+                }
+                (
+                    Entity::Arc {
+                        center,
+                        radius,
+                        start_deg,
+                        end_deg,
+                        ..
+                    },
+                    DimensionFeature::Midpoint,
+                ) => radial(*center, *radius, (*start_deg + *end_deg) / 2.0),
+                (
+                    Entity::Circle { center, radius, .. } | Entity::Arc { center, radius, .. },
+                    DimensionFeature::Quadrant,
+                ) => {
+                    let (start, end) = match entity {
+                        Entity::Arc {
+                            start_deg, end_deg, ..
+                        } => (*start_deg, *end_deg),
+                        _ => (0.0, 360.0),
+                    };
+                    radial(*center, *radius, quadrant_angle(*index, start, end)?)
+                }
+                (Entity::Ellipse { center, .. }, DimensionFeature::Center) => *center,
+                (
+                    Entity::Ellipse {
+                        center,
+                        radius_x,
+                        radius_y,
+                        rotation_deg,
+                        start_deg,
+                        end_deg,
+                        ..
+                    },
+                    feature,
+                ) => {
+                    let angle = match feature {
+                        DimensionFeature::Start => *start_deg,
+                        DimensionFeature::End => *end_deg,
+                        DimensionFeature::Midpoint => (*start_deg + *end_deg) / 2.0,
+                        DimensionFeature::Quadrant => quadrant_angle(*index, *start_deg, *end_deg)?,
+                        _ => return Err("measurement: invalid ellipse feature".to_owned()),
+                    };
+                    crate::ellipse_point(*center, *radius_x, *radius_y, *rotation_deg, angle)
+                }
                 (Entity::Polyline { points, .. }, DimensionFeature::Vertex) => *points
                     .get(index.ok_or("measurement: vertex requires index")?)
                     .ok_or("measurement: vertex index is out of range")?,
@@ -197,6 +257,17 @@ pub fn resolve_dimension_anchor(
         return Err("measurement: non-finite point".to_owned());
     }
     Ok(point)
+}
+
+fn quadrant_angle(index: Option<usize>, start: f64, end: f64) -> Result<f64, String> {
+    let angle = index
+        .filter(|i| *i < 4)
+        .ok_or("measurement: quadrant index must be 0..3")? as f64
+        * 90.0;
+    if !start.is_finite() || !end.is_finite() || !crate::angle_is_on_sweep(angle, start, end) {
+        return Err("measurement: quadrant is outside the curve sweep".to_owned());
+    }
+    Ok(angle)
 }
 
 pub fn detach_dimension(project: &ProjectSource, entity: &mut Entity) -> Result<(), String> {
@@ -553,6 +624,134 @@ pub fn dimension_text_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn midpoint_and_quadrant_anchors_follow_source_geometry() {
+        let mut project = fixture(
+            serde_json::json!({"kind":"horizontal","first":{"kind":"entity","entity_id":"ent_01JZ0000000000000000000000","feature":"midpoint"},"second":{"kind":"fixed","point":[1000,0]}}),
+        );
+        let dimension = project.drawings[0].entities.last().unwrap().entity.clone();
+        let before = evaluate_dimension(&project, &dimension).unwrap().measured;
+        let Entity::Line { p2, .. } = &mut project.drawings[0].entities[0].entity else {
+            panic!()
+        };
+        p2[0] += 100.0;
+        assert_eq!(
+            evaluate_dimension(&project, &dimension).unwrap().measured,
+            before - 50.0
+        );
+        let id = project.drawings[0].entities[0].entity.id().clone();
+        project.drawings[0].entities[0].entity = serde_json::from_value(serde_json::json!({"schema_version":"0.3","id":id,"type":"circle","layer":"0-1","center":[10,20],"radius":30})).unwrap();
+        let anchor = DimensionAnchor::Entity {
+            entity_id: id,
+            feature: DimensionFeature::Quadrant,
+            index: Some(1),
+        };
+        let point = resolve_dimension_anchor(&anchor, &project.drawings[0].entities).unwrap();
+        assert!((point[0] - 10.0).abs() < 1e-9);
+        assert_eq!(point[1], 50.0);
+        let Entity::Circle { radius, .. } = &mut project.drawings[0].entities[0].entity else {
+            panic!()
+        };
+        *radius = 60.0;
+        assert_eq!(
+            resolve_dimension_anchor(&anchor, &project.drawings[0].entities).unwrap()[1],
+            80.0
+        );
+    }
+
+    #[test]
+    fn segment_and_curve_midpoints_resolve_and_reject_invalid_indices() {
+        let mut project = fixture(
+            serde_json::json!({"kind":"aligned","first":{"kind":"fixed","point":[0,0]},"second":{"kind":"fixed","point":[10,0]}}),
+        );
+        let id = project.drawings[0].entities[0].entity.id().clone();
+        for (geometry, feature, index, expected) in [
+            (
+                serde_json::json!({"type":"polyline","points":[[0,0],[100,0],[100,100]],"closed":true}),
+                DimensionFeature::Midpoint,
+                Some(2),
+                [50.0, 50.0],
+            ),
+            (
+                serde_json::json!({"type":"arc","center":[10,20],"radius":30,"start_deg":0,"end_deg":180}),
+                DimensionFeature::Midpoint,
+                None,
+                [10.0, 50.0],
+            ),
+            (
+                serde_json::json!({"type":"ellipse","center":[10,20],"radius_x":30,"radius_y":15,"rotation_deg":90,"start_deg":0,"end_deg":180}),
+                DimensionFeature::Midpoint,
+                None,
+                [-5.0, 20.0],
+            ),
+        ] {
+            let mut geometry = geometry;
+            geometry["schema_version"] = serde_json::json!("0.3");
+            geometry["id"] = serde_json::json!(id);
+            geometry["layer"] = serde_json::json!("0-1");
+            project.drawings[0].entities[0].entity = serde_json::from_value(geometry).unwrap();
+            let anchor = DimensionAnchor::Entity {
+                entity_id: id.clone(),
+                feature,
+                index,
+            };
+            let point = resolve_dimension_anchor(&anchor, &project.drawings[0].entities).unwrap();
+            assert!(distance(point, expected) < 1e-9);
+        }
+        let invalid = DimensionAnchor::Entity {
+            entity_id: id,
+            feature: DimensionFeature::Quadrant,
+            index: Some(4),
+        };
+        assert!(resolve_dimension_anchor(&invalid, &project.drawings[0].entities).is_err());
+    }
+
+    #[test]
+    fn quadrants_respect_signed_wrapped_and_full_curve_sweeps() {
+        for ellipse in [false, true] {
+            let mut entity = serde_json::json!({
+                "schema_version":"0.3","id":"ent_01JZ0000000000000000000000",
+                "layer":"0-1","center":[10,20],"start_deg":0,"end_deg":90
+            });
+            if ellipse {
+                entity["type"] = serde_json::json!("ellipse");
+                entity["radius_x"] = serde_json::json!(30);
+                entity["radius_y"] = serde_json::json!(15);
+                entity["rotation_deg"] = serde_json::json!(37);
+            } else {
+                entity["type"] = serde_json::json!("arc");
+                entity["radius"] = serde_json::json!(30);
+            }
+            for (start, end, present) in [
+                (0.0, 90.0, [true, true, false, false]),
+                (90.0, 0.0, [true, true, false, false]),
+                (260.0, 380.0, [true, false, false, true]),
+                (20.0, -100.0, [true, false, false, true]),
+                (30.0, 390.0, [true; 4]),
+                (30.0, -330.0, [true; 4]),
+            ] {
+                entity["start_deg"] = serde_json::json!(start);
+                entity["end_deg"] = serde_json::json!(end);
+                let records = [EntityRecord {
+                    line: 1,
+                    entity: serde_json::from_value(entity.clone()).unwrap(),
+                }];
+                for (index, expected) in present.into_iter().enumerate() {
+                    let anchor = DimensionAnchor::Entity {
+                        entity_id: records[0].entity.id().clone(),
+                        feature: DimensionFeature::Quadrant,
+                        index: Some(index),
+                    };
+                    assert_eq!(
+                        resolve_dimension_anchor(&anchor, &records).is_ok(),
+                        expected,
+                        "ellipse={ellipse}, sweep={start}..{end}, quadrant={index}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn cloning_remaps_entity_refs_and_moves_only_fixed_anchors() {
