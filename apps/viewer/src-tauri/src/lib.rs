@@ -837,6 +837,13 @@ fn extract_original_jww(
 }
 
 #[tauri::command]
+fn preview_drawing_pdf(project_path: String, drawing: String) -> Result<Vec<u8>, String> {
+    recover_project_sources(Path::new(&project_path))?;
+    cad_render_pdf::preview_drawing_pdf(&project_path, &drawing, None, &[])
+        .map_err(|error| format!("failed to preview PDF: {error}"))
+}
+
+#[tauri::command]
 fn export_drawing_pdf(
     project_path: String,
     drawing: String,
@@ -1232,6 +1239,7 @@ pub fn run() {
             export_jww_preserving,
             extract_original_jww,
             export_drawing_pdf,
+            preview_drawing_pdf,
             update_layer_rules,
             create_comment,
             update_comment_status,
@@ -3242,6 +3250,14 @@ mod tests {
             expected_files,
         )
         .expect("PDF export should succeed");
+        let preview =
+            preview_drawing_pdf(path_string(&project), "plan_1f".to_owned()).expect("preview");
+        assert_eq!(
+            preview,
+            fs::read(&output).unwrap(),
+            "preview and export must use identical PDF bytes"
+        );
+
         assert!(
             fs::read(&output)
                 .expect("PDF should be readable")

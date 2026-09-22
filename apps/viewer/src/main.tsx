@@ -65,6 +65,7 @@ import {
 import { formatError } from "./app-errors";
 import { commandForKeyboardEvent, commandFromText, commandLabel, parseCoordinateInput, type CadCommand } from "./command-registry";
 import { dimensionAnchorAt, dimensionOffset } from "./drafting-dimensions";
+import { PrintPreview } from "./print-preview";
 import { newBlockEntity, BLOCK_ENTITY_TYPES } from "./block-entities";
 import { closestEntityId } from "./svg-selection";
 import { DraftingPanel, initialDraftingOptions, finiteDraftNumber, repeatableCommand, retuneDraftOperation } from "./drafting-panel";
@@ -393,6 +394,7 @@ function App() {
   }, [isDesktop]);
 
   const sourceSvg = viewMode === "sheet" ? artifacts?.sheetSvg : artifacts?.diffSvg;
+  const showingDrawing = editorMode !== "print_preview";
   const activeSvg = viewMode === "sheet" && editPreview?.svg ? editPreview.svg : sourceSvg;
   const activeBaseViewBox = useMemo(() => parseSvgViewBox(sourceSvg), [sourceSvg]);
   const viewContext = `${projectState?.project_path ?? (isDesktop ? "desktop" : "web")}:${artifacts?.currentDrawing ?? "drawing"}:${viewMode}`;
@@ -480,9 +482,9 @@ function App() {
           return;
         }
         if (command === "layout" || command === "print_preview") {
-          setEditorMode(command);
+          selectEditorMode(command);
           setViewMode("sheet");
-          setEditMessage(command === "layout" ? "Active layout is shown in the paper frame" : "Print preview uses the active layout");
+          setEditMessage(command === "layout" ? "Active layout is shown in the paper frame" : "Print preview uses the PDF output and active layout");
           return;
         }
       }
@@ -570,7 +572,7 @@ function App() {
       return;
     }
     svg.setAttribute("viewBox", formatViewBox(currentViewBox));
-  }, [activeBaseViewBox, baseViewBox, currentViewBox]);
+  }, [activeBaseViewBox, baseViewBox, currentViewBox, showingDrawing]);
 
   useEffect(() => {
     document
@@ -584,7 +586,7 @@ function App() {
         .querySelectorAll(`.drawing-stage [data-entity-id="${entityId}"]`)
         .forEach((element) => element.classList.add("is-selected"));
     });
-  }, [activeSvg, selectedEntityIds]);
+  }, [activeSvg, selectedEntityIds, showingDrawing]);
 
   useEffect(() => {
     lastCommentAnchorRef.current = null;
@@ -598,7 +600,7 @@ function App() {
         if (Number.isFinite(width) && width > 0) element.style.setProperty("--screen-stroke-width", `${width}px`);
       });
     }
-  }, [activeSvg, artifacts?.layers]);
+  }, [activeSvg, artifacts?.layers, showingDrawing]);
 
   useEffect(() => {
     if (!isDesktop || projectState === null || loadState !== "ready") {
@@ -2596,8 +2598,7 @@ function App() {
       } else if (command === "edit_block") {
         editSelectedBlock();
       } else if (command === "layout" || command === "print_preview") {
-        setCadCommand(command);
-        setEditorMode(command);
+        selectEditorMode(command);
         setViewMode("sheet");
       } else {
         selectEditorMode(command as EditorMode);
@@ -2828,8 +2829,7 @@ function App() {
               aria-label="Print Preview"
               title="Print Preview"
               onClick={() => {
-                setCadCommand("print_preview");
-                setEditorMode("print_preview");
+                selectEditorMode("print_preview");
                 setViewMode("sheet");
                 setEditMessage("Print preview uses the active layout");
               }}
@@ -2855,14 +2855,20 @@ function App() {
           <button
             type="button"
             class={viewMode === "sheet" ? "tab is-active" : "tab"}
-            onClick={() => setViewMode("sheet")}
+            onClick={() => {
+              if (!showingDrawing) selectEditorMode("select");
+              setViewMode("sheet");
+            }}
           >
             Sheet
           </button>
           <button
             type="button"
             class={viewMode === "diff" ? "tab is-active" : "tab"}
-            onClick={() => setViewMode("diff")}
+            onClick={() => {
+              if (!showingDrawing) selectEditorMode("select");
+              setViewMode("diff");
+            }}
           >
             Diff
           </button>
@@ -3019,7 +3025,8 @@ function App() {
           )}
           {loadState === "loading" && <div class="empty-state">Loading generated artifacts</div>}
           {loadState === "error" && <div class="empty-state is-error">{errorMessage}</div>}
-          {loadState === "ready" && activeSvg !== undefined && (
+          {loadState === "ready" && editorMode === "print_preview" && projectState !== null && artifacts !== null && <PrintPreview projectPath={projectState.project_path} drawing={artifacts.currentDrawing} revision={artifacts} />}
+          {loadState === "ready" && editorMode !== "print_preview" && activeSvg !== undefined && (
             <div
               ref={drawingStageRef}
               class={

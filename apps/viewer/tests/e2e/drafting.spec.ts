@@ -1,8 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // Browser-only tests assert the UI/IPC contract. Real source persistence is covered by Desktop E2E.
-async function openDraftingHarness(page: Page, block = false) {
-  await page.addInitScript(({ block }) => {
+async function openDraftingHarness(page: Page, block = false, pdfBytes: number[] = []) {
+  await page.addInitScript(({ block, pdfBytes }) => {
     const host = window as unknown as Record<string, unknown>;
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
     host.__CAD_TEST_CALLS__ = calls;
@@ -24,6 +27,7 @@ async function openDraftingHarness(page: Page, block = false) {
         if (command === "list_drawing_history") return { drawing: "plan", undo: [], redo: [], limit: 100, current_files: [] };
         if (command === "write_ai_context") return { status: "ready", markdown_path: "/test-project/build/context.md" };
         if (command === "query_snap") return null;
+        if (command === "preview_drawing_pdf") return pdfBytes;
         if (command === "load_block_contents") return { block: "door", name: "Door", revision: "block-before", entities: args.entities ?? [{ ...entity, type: "line" }], svg };
         if (command === "apply_block_contents") return {};
         if (command === "plugin:event|listen") return 1;
@@ -33,7 +37,7 @@ async function openDraftingHarness(page: Page, block = false) {
         return null;
       },
     };
-  }, { block });
+  }, { block, pdfBytes });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "drafting-test" })).toBeVisible();
   await page.getByRole("button", { name: "Sheet", exact: true }).click();
@@ -140,6 +144,43 @@ test("vertical dimension placement and midpoint association reach the edit reque
   await panel.getByRole("button", { name: "Apply", exact: true }).click();
   await expect.poll(async () => (await writes(page)).length).toBe(1);
   expect((await writes(page))[0].args.request).toMatchObject({ operation: { operation: { entity: { offset: 30, measurement: { kind: "vertical", first: { kind: "entity", feature: "midpoint" } } } } } });
+});
+
+test("print preview requests PDF output rather than showing the editing sheet", async ({ page }) => {
+  const root = resolve(import.meta.dirname, "../../../..");
+  const output = test.info().outputPath("preview.pdf");
+  execFileSync(resolve(root, "target/debug/cadc"), ["export-pdf", resolve(root, "examples/cad-acceptance"), "--drawing", "acceptance", "--out", output]);
+  await openDraftingHarness(page, false, Array.from(readFileSync(output)));
+  await page.locator(".drawing-stage [data-entity-id]").first().dispatchEvent("click");
+  await expect(page.locator(".drawing-stage .is-selected")).toHaveCount(1);
+  const drawingSvg = page.locator(".drawing-stage svg").first();
+  await page.getByRole("button", { name: "Reset view", exact: true }).click();
+  await expect(drawingSvg).toHaveAttribute("viewBox", "0 -150 200 200");
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect(drawingSvg).toHaveAttribute("viewBox", "20 -130 160 160");
+  const zoomedViewBox = await drawingSvg.getAttribute("viewBox");
+  await command(page, "print_preview");
+  await expect(page.getByRole("region", { name: "PDF print preview" })).toHaveAttribute("data-rendered", "true");
+  await expect(page.getByRole("img", { name: "Printed drawing" })).toBeVisible();
+  expect(await page.locator(".print-preview canvas").evaluate((canvas: HTMLCanvasElement) => {
+    const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
+    return pixels.some((value, index) => index % 4 !== 3 && value < 200);
+  })).toBe(true);
+  await expect(page.locator(".drawing-stage")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("region", { name: "PDF print preview" })).toHaveCount(0);
+  await expect(page.locator(".drawing-stage")).toBeVisible();
+  await expect(drawingSvg).toHaveAttribute("viewBox", zoomedViewBox!);
+  await expect(page.locator(".drawing-stage .is-selected")).toHaveCount(1);
+  await expect(page.locator(".drawing-stage [data-layer]")).toHaveAttribute("data-layer-visible", "true");
+  for (const tab of ["Sheet", "Diff"]) {
+    await command(page, "print_preview");
+    await expect(page.getByRole("region", { name: "PDF print preview" })).toBeVisible();
+    await page.getByRole("button", { name: tab, exact: true }).click();
+    await expect(page.getByRole("region", { name: "PDF print preview" })).toHaveCount(0);
+    await expect(page.locator(".drawing-stage")).toBeVisible();
+    await expect(page.getByRole("button", { name: tab, exact: true })).toHaveClass(/is-active/);
+  }
 });
 
 test("block contents can stage circles, text and hatch before saving", async ({ page }) => {

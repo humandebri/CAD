@@ -20,6 +20,7 @@
     "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-dialog": "2.7.1",
     "lucide-preact": "^1.23.0",
+    "pdfjs-dist": "6.3.289",
     "preact": "10.29.5"
   },
   "devDependencies": {

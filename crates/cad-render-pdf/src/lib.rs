@@ -59,14 +59,30 @@ pub fn export_drawing_pdf(
     output_path: impl AsRef<Path>,
     options: PdfExportOptions,
 ) -> PdfResult<()> {
+    let bytes = preview_drawing_pdf(
+        project_path,
+        drawing_name,
+        layout_name,
+        &options.expected_files,
+    )?;
+    publish(output_path.as_ref(), &bytes, options.overwrite)
+}
+
+/// Render the same checked source snapshot as export without publishing a file.
+pub fn preview_drawing_pdf(
+    project_path: impl AsRef<Path>,
+    drawing_name: &str,
+    layout_name: Option<&str>,
+    expected_files: &[PdfFileRevision],
+) -> PdfResult<Vec<u8>> {
     let root = project_path.as_ref();
     let initial_manifest = cad_model::source_manifest(root)
         .map_err(|error| PdfError::CheckFailed(error.to_string()))?;
     let project =
         cad_model::load_project(root).map_err(|error| PdfError::CheckFailed(error.to_string()))?;
-    validate_expected_files(root, &options.expected_files)?;
+    validate_expected_files(root, expected_files)?;
     let bytes = render_drawing_pdf(&project, drawing_name, layout_name)?;
-    validate_expected_files(root, &options.expected_files)?;
+    validate_expected_files(root, expected_files)?;
     let final_manifest = cad_model::source_manifest(root)
         .map_err(|error| PdfError::CheckFailed(error.to_string()))?;
     if initial_manifest != final_manifest {
@@ -74,7 +90,7 @@ pub fn export_drawing_pdf(
             "revision_conflict: project source changed during PDF export".to_owned(),
         ));
     }
-    publish(output_path.as_ref(), &bytes, options.overwrite)
+    Ok(bytes)
 }
 
 fn validate_expected_files(root: &Path, expected: &[PdfFileRevision]) -> PdfResult<()> {

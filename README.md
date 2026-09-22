@@ -198,6 +198,11 @@ was first created. Earlier generations are retained, including generations creat
 before content reuse was introduced. Incomplete or mismatched generations are
 rejected without replacing the current manifest.
 
+Print Preview renders the same checked PDF bytes as export, including printable
+layers, print colors, clipping, margins, and embedded fonts. It creates no output
+file and refreshes when the reviewed source changes. PDF.js draws the generated
+page on canvas, including in the macOS WebKit desktop app.
+
 PDF can also be exported without the desktop app:
 
 ```bash

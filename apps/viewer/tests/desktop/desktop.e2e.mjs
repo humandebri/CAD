@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -19,6 +19,8 @@ describe("CAD Review desktop", () => {
         panel: document.querySelector(".drafting-panel")?.textContent,
         review: document.querySelector(".live-review-status")?.textContent,
         message: document.querySelector(".editor-message")?.textContent,
+        printPreview: document.querySelector(".print-preview")?.textContent,
+        printWidth: document.querySelector(".print-preview")?.getBoundingClientRect().width,
         points: document.querySelectorAll(".draft-overlay > circle").length,
         focus: document.activeElement?.getAttribute("aria-label"),
         blockMessage: document.querySelector(".block-edit-dialog [role='status']")?.textContent,
@@ -258,6 +260,20 @@ describe("CAD Review desktop", () => {
     await command("23100,20100");
     await applyPreview();
     assert(entities().some(entity => entity.type === "hatch" && entity.loops.length === 2), "region hatch lost its inner hole");
+    await command("print_preview");
+    const preview = await $("section[aria-label='PDF print preview']");
+    await preview.waitForDisplayed({ timeout: 15_000 });
+    await browser.waitUntil(async () => (await preview.getAttribute("data-rendered")) === "true", { timeout: 15_000 });
+    assert(await browser.execute(() => {
+      const canvas = document.querySelector(".print-preview canvas");
+      if (!canvas || canvas.width === 0 || canvas.height === 0) return false;
+      const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      return pixels.some((value, index) => index % 4 !== 3 && value < 200);
+    }), "print preview must contain visible drawing ink");
+    const screenshotDir = resolve(import.meta.dirname, "../../test-results");
+    mkdirSync(screenshotDir, { recursive: true });
+    await browser.saveScreenshot(resolve(screenshotDir, "desktop-print-preview.png"));
+    await command("select");
     await activate(await $("button[aria-label='Export PDF']"));
     await browser.waitUntil(() => existsSync(pdfPath), { timeout: 15_000 });
     assert.equal(readFileSync(pdfPath).subarray(0, 5).toString(), "%PDF-");
