@@ -47,7 +47,8 @@ perform the drift check in each plan before editing. Execute in the order below.
 Plans 001-005 are complete. Plans 006-009 retain follow-up corpus work. Plan 010
 replaces the application-specific gate with hashed file-level conformance.
 
-- O(n²) geometry checker optimization remains deferred. Native watcher
+- Geometry self-intersection checks now use an R-tree to prune candidate pairs;
+  overlapping envelopes can still require quadratic work. Native watcher
   selection, Git HEAD caching, canonical PDF drawing styles, embedded/subset
   OFL Japanese fonts, and external PDF parsing in CI are complete.
 - External application checks are optional evidence, not a release gate.

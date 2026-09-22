@@ -387,6 +387,7 @@ dependencies = [
  "blake3",
  "cad-model",
  "encoding_rs",
+ "rstar 0.13.0",
  "serde",
  "serde_json",
  "sha2",

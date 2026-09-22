@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cad-model.workspace = true
+rstar.workspace = true
 encoding_rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

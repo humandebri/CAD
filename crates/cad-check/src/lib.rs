@@ -1702,9 +1702,35 @@ fn has_self_intersection(points: &[[f64; 2]], closed: bool) -> bool {
         segments.push((points[points.len() - 1], points[0]));
     }
 
-    for left_index in 0..segments.len() {
-        for right_index in (left_index + 1)..segments.len() {
-            if segments_are_adjacent(left_index, right_index, segments.len(), closed) {
+    // Invalid coordinates are diagnosed separately; never feed them to the spatial index.
+    if points.iter().flatten().any(|value| !value.is_finite()) {
+        return false;
+    }
+    use rstar::{
+        RTree, RTreeObject,
+        primitives::{GeomWithData, Rectangle},
+    };
+    let index = RTree::bulk_load(
+        segments
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| {
+                GeomWithData::new(
+                    Rectangle::from_corners(
+                        [a[0].min(b[0]) - EPSILON_MM, a[1].min(b[1]) - EPSILON_MM],
+                        [a[0].max(b[0]) + EPSILON_MM, a[1].max(b[1]) + EPSILON_MM],
+                    ),
+                    i,
+                )
+            })
+            .collect(),
+    );
+    for left in index.iter() {
+        for right in index.locate_in_envelope_intersecting(left.envelope()) {
+            let (left_index, right_index) = (left.data, right.data);
+            if right_index <= left_index
+                || segments_are_adjacent(left_index, right_index, segments.len(), closed)
+            {
                 continue;
             }
             if segments_intersect(segments[left_index], segments[right_index]) {
@@ -1748,6 +1774,54 @@ fn direction(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spatial_intersection_matches_pairwise_reference() {
+        let mut seed = 37_u64;
+        for closed in [false, true] {
+            for _ in 0..300 {
+                let points: Vec<_> = (0..12)
+                    .map(|_| {
+                        let mut coordinate = || {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            ((seed >> 32) % 100) as f64
+                        };
+                        [coordinate(), coordinate()]
+                    })
+                    .collect();
+                let mut segments: Vec<_> = points.windows(2).map(|p| (p[0], p[1])).collect();
+                if closed && distance(points[0], *points.last().unwrap()) > EPSILON_MM {
+                    segments.push((*points.last().unwrap(), points[0]));
+                }
+                let expected = (0..segments.len()).any(|a| {
+                    ((a + 1)..segments.len()).any(|b| {
+                        !segments_are_adjacent(a, b, segments.len(), closed)
+                            && segments_intersect(segments[a], segments[b])
+                    })
+                });
+                assert_eq!(has_self_intersection(&points, closed), expected);
+            }
+        }
+        // Collinear touching and near-touching must retain the existing tolerance.
+        for gap in [0.0, EPSILON_MM / 2.0, EPSILON_MM * 2.0] {
+            let points = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [5.0, gap]];
+            assert_eq!(
+                has_self_intersection(&points, false),
+                segments_intersect((points[0], points[1]), (points[2], points[3]))
+            );
+        }
+    }
+
+    #[test]
+    fn large_nonintersecting_boundary_uses_spatial_pruning() {
+        let points: Vec<_> = (0..20_000)
+            .map(|i| {
+                let angle = i as f64 * std::f64::consts::TAU / 20_000.0;
+                [100_000.0 * angle.cos(), 100_000.0 * angle.sin()]
+            })
+            .collect();
+        assert!(!has_self_intersection(&points, true));
+    }
+
     #[test]
     fn explicitly_closed_polyline_seam_is_adjacent_not_an_intersection() {
         assert!(!has_self_intersection(

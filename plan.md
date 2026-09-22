@@ -86,7 +86,8 @@ release gateとする。外部アプリケーション確認は任意の追加�
 
 ## 次のリリースゲート
 
-- checker の大規模 polyline/hatch self-intersection を空間 index で高速化する。
+- checker の polyline/hatch self-intersection は空間 index による候補絞り込みを実装済み。
+  2万頂点の境界と総当たり判定との一致を回帰テストする。
 - PDFのOFL日本語font deterministic subset埋め込みと外部
   parser/rasterizer CI gateは完了。
 - JWW fixture corpusへsolid、dimension、block、hatch、paletteを追加し、hash、
