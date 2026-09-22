@@ -25,4 +25,17 @@ test("parses command-bar commands and CAD coordinates", () => {
   expect(polar?.[1]).toBeCloseTo(12);
   expect(parseCoordinateInput("@5,2", null)).toBeNull();
   expect(parseCoordinateInput("bad", [0, 0])).toBeNull();
+  for (const input of [",", "10,", " ,20", "@,20", "@ <90", "@10< "]) {
+    expect(parseCoordinateInput(input, [0, 0])).toBeNull();
+  }
+});
+
+test("preserves system shortcuts and composing input", () => {
+  expect(commandForKeyboardEvent({ key: "z", ctrlKey: true, isComposing: true } as KeyboardEvent)).toBeNull();
+  expect(commandForKeyboardEvent({ key: "z", altKey: true, shiftKey: true } as KeyboardEvent)).toBeNull();
+  for (const modifier of ["metaKey", "ctrlKey", "altKey", "isComposing"]) {
+    for (const key of ["a", "c", "v", "Delete"]) {
+      expect(commandForKeyboardEvent({ key, [modifier]: true } as unknown as KeyboardEvent)).toBeNull();
+    }
+  }
 });

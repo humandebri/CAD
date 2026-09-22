@@ -37,7 +37,8 @@ external dangling references are checker errors, never silently repaired.
 Dimension-driven geometry and references into a placed block are not supported.
 
 Block creation captures selected geometry at a chosen base point. Its contents
-can be staged in the block editor, saved for all placements, or duplicated as
+can be staged in the block editor (including new lines, polylines, circles, arcs,
+ellipses, text, points, and hatches), saved for all placements, or duplicated as
 an independent definition. Placement offers rotation, positive uniform scale,
 and reflection. Hatch vertices are completed with Enter, or use enclosed-region
 pickup; gaps are not healed. Curved hatch boundaries become polygon loops within

@@ -1,16 +1,17 @@
 import { expect, test, type Page } from "@playwright/test";
 
 // Browser-only tests assert the UI/IPC contract. Real source persistence is covered by Desktop E2E.
-async function openDraftingHarness(page: Page) {
-  await page.addInitScript(() => {
+async function openDraftingHarness(page: Page, block = false) {
+  await page.addInitScript(({ block }) => {
     const host = window as unknown as Record<string, unknown>;
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
     host.__CAD_TEST_CALLS__ = calls;
     const entity = { schema_version: "0.3", id: "ent_01JZ0000000000000000000000", type: "line", layer: "0-1", p1: [10, 10], p2: [110, 10] };
+    if (block) Object.assign(entity, { type: "block_ref", block: "door", at: [0, 0], rotation_deg: 0, scale: 1 });
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -150 200 200"><g data-entity-id="ent_01JZ0000000000000000000000" data-layer="0-1" data-bbox="10,10,110,10"><line x1="10" y1="-10" x2="110" y2="-10" stroke="black" stroke-width="2"/></g></svg>';
     const review = { project_name: "drafting-test", drawing_names: ["plan"], current_drawing: "plan", sheet_svg: svg, diff_svg: svg, check: { schema_version: "0.3", status: "ok", diagnostics: [] }, diff: { schema_version: "0.3", status: "ok", changes: [], warnings: [], configuration_changes: [] }, comments: [], comments_revision: "comments", diff_unavailable: null,
       layers: { revision: "layers", active_layer: "0-1", groups: [{ id: "default", name: "Default", visible: true, locked: false, order: 0, scale_denominator: 100 }], layers: [{ id: "0-1", name: "Lines", group: "default", visible: true, locked: false, printable: true, color: "black", line_type: "solid", line_width: 0.25, order: 0, used_entities: 1 }] },
-      editor: { drawing: "plan", revision: "before", entities: [entity], text_styles: ["note"], dimension_styles: ["dim"], pens: [], fills: ["black"] }, blocks: [], layouts: [] };
+      editor: { drawing: "plan", revision: "before", entities: [entity], text_styles: ["note"], dimension_styles: ["dim"], pens: [], fills: ["black"] }, blocks: [{ id: "door", name: "Door", entity_count: 1 }], layouts: [] };
     let callback = 0;
     host.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
@@ -23,6 +24,8 @@ async function openDraftingHarness(page: Page) {
         if (command === "list_drawing_history") return { drawing: "plan", undo: [], redo: [], limit: 100, current_files: [] };
         if (command === "write_ai_context") return { status: "ready", markdown_path: "/test-project/build/context.md" };
         if (command === "query_snap") return null;
+        if (command === "load_block_contents") return { block: "door", name: "Door", revision: "block-before", entities: args.entities ?? [{ ...entity, type: "line" }], svg };
+        if (command === "apply_block_contents") return {};
         if (command === "plugin:event|listen") return 1;
         if (command === "preview_drawing_edit") return { drawing: "plan", expected_revision: "before", entities: [entity], entity_ids: [entity.id], warnings: [], dimension_impacts: [], source_files: [], svg };
         if (command === "apply_drawing_edit") return { drawing: "plan", revision: "before", entity_ids: [entity.id], operation: "rectangle", history_id: "history" };
@@ -30,7 +33,7 @@ async function openDraftingHarness(page: Page) {
         return null;
       },
     };
-  });
+  }, { block });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "drafting-test" })).toBeVisible();
   await page.getByRole("button", { name: "Sheet", exact: true }).click();
@@ -137,4 +140,23 @@ test("vertical dimension placement and midpoint association reach the edit reque
   await panel.getByRole("button", { name: "Apply", exact: true }).click();
   await expect.poll(async () => (await writes(page)).length).toBe(1);
   expect((await writes(page))[0].args.request).toMatchObject({ operation: { operation: { entity: { offset: 30, measurement: { kind: "vertical", first: { kind: "entity", feature: "midpoint" } } } } } });
+});
+
+test("block contents can stage circles, text and hatch before saving", async ({ page }) => {
+  await openDraftingHarness(page, true);
+  await page.locator("[data-entity-id]").first().dispatchEvent("click");
+  await command(page, "edit_block");
+  const dialog = page.getByRole("dialog", { name: "Edit block contents" });
+  await expect(dialog).toBeVisible();
+  for (const type of ["circle", "text", "hatch"]) {
+    await dialog.getByLabel("New block entity type").selectOption(type);
+    await dialog.getByRole("button", { name: `Add ${type}`, exact: true }).click();
+    await expect(dialog.getByRole("heading", { name: `${type} properties`, exact: true })).toBeVisible();
+  }
+  await dialog.getByRole("button", { name: "Save contents", exact: true }).click();
+  const calls = await page.evaluate(() => ((window as unknown as Record<string, unknown>).__CAD_TEST_CALLS__ as Array<{ command: string; args: Record<string, unknown> }>).filter(call => call.command === "apply_block_contents"));
+  expect(calls).toHaveLength(1);
+  const request = calls[0].args.request as { operation: { entities: Array<{ type: string; id: string }> } };
+  expect(request.operation.entities.map(entity => entity.type)).toEqual(["line", "circle", "text", "hatch"]);
+  expect(new Set(request.operation.entities.map(entity => entity.id)).size).toBe(4);
 });

@@ -33,12 +33,14 @@ export const CAD_COMMAND_SHORTCUTS: Record<string, CadCommand> = {
 };
 
 export function commandForKeyboardEvent(event: KeyboardEvent): CadCommand | null {
+  if (event.isComposing) return null;
   if (event.key === "Escape") return "select";
   if (event.key === "Enter") return null;
   const key = event.key.toLowerCase();
-  if (key === "z" && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+  if (key === "z" && !event.altKey && (event.ctrlKey || event.metaKey || event.shiftKey)) {
     return event.shiftKey ? "redo" : "undo";
   }
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
   return CAD_COMMAND_SHORTCUTS[key] ?? null;
 }
 
@@ -62,6 +64,7 @@ export function parseCoordinateInput(
   const text = value.trim();
   const polar = /^@([^<]+)<(.+)$/.exec(text);
   if (polar !== null && base !== null) {
+    if (!polar[1].trim() || !polar[2].trim()) return null;
     const distance = Number(polar[1]);
     const angle = Number(polar[2]);
     if (Number.isFinite(distance) && distance >= 0 && Number.isFinite(angle)) {
@@ -71,7 +74,9 @@ export function parseCoordinateInput(
     return null;
   }
   const relative = text.startsWith("@");
-  const coordinates = (relative ? text.slice(1) : text).split(",").map(Number);
+  const parts = (relative ? text.slice(1) : text).split(",");
+  if (parts.some(part => !part.trim())) return null;
+  const coordinates = parts.map(Number);
   if (coordinates.length !== 2 || coordinates.some((coordinate) => !Number.isFinite(coordinate))) {
     return null;
   }

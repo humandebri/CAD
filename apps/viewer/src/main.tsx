@@ -65,6 +65,7 @@ import {
 import { formatError } from "./app-errors";
 import { commandForKeyboardEvent, commandFromText, commandLabel, parseCoordinateInput, type CadCommand } from "./command-registry";
 import { dimensionAnchorAt, dimensionOffset } from "./drafting-dimensions";
+import { newBlockEntity, BLOCK_ENTITY_TYPES } from "./block-entities";
 import { closestEntityId } from "./svg-selection";
 import { DraftingPanel, initialDraftingOptions, finiteDraftNumber, repeatableCommand, retuneDraftOperation } from "./drafting-panel";
 import {
@@ -221,6 +222,7 @@ function App() {
   const [dimensionResolutions, setDimensionResolutions] = useState<Record<string, "delete" | "detach">>({});
   const [blockEditing, setBlockEditing] = useState<{ block: string; name: string; revision: string; drawingRevision: string; entities: EditorEntity[]; svg: string } | null>(null);
   const [blockEntityIndex, setBlockEntityIndex] = useState(0);
+  const [blockAddType, setBlockAddType] = useState<string>("line");
   const [blockEditMessage, setBlockEditMessage] = useState("");
   const [blockDeletion, setBlockDeletion] = useState<{ id: string; dimensions: string[]; resolutions: Record<string, "delete" | "detach"> } | null>(null);
   const [blockThumbnail, setBlockThumbnail] = useState("");
@@ -438,6 +440,8 @@ function App() {
 
   useEffect(() => {
     function cancelActiveOperation(event: KeyboardEvent) {
+      if (event.isComposing) return;
+      if (blockEditing !== null && event.key !== "Escape") return;
       const inputFocused = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement;
       if (inputFocused && event.key !== "Escape") {
         if (event.key === "Enter" && event.target instanceof Element && event.target.closest(".drafting-panel") !== null && !(event.target instanceof HTMLTextAreaElement)) {
@@ -524,7 +528,7 @@ function App() {
     }
     window.addEventListener("keydown", cancelActiveOperation);
     return () => window.removeEventListener("keydown", cancelActiveOperation);
-  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState, draftingOptions, draftParameterError]);
+  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState, draftingOptions, draftParameterError, blockEditing]);
 
   useEffect(() => {
     const sequence = ++previewSequence.current;
@@ -2630,14 +2634,16 @@ function App() {
         <h2>Edit block: {blockEditing.name}</h2>
         <p>Changes are staged until Save contents. All references to this definition will update together.</p>
         <div class="block-content-preview" dangerouslySetInnerHTML={{ __html: blockEditing.svg }} />
+        <label>Add geometry<select aria-label="New block entity type" value={blockAddType} onChange={event => setBlockAddType(event.currentTarget.value)}>{BLOCK_ENTITY_TYPES.map(type => <option key={type}>{type}</option>)}</select></label>
         <button type="button" disabled={isEditSaving} onClick={() => {
           const layer = activeLayerEditable();
           if (layer === null) return;
-          const entity: EditorEntity = { schema_version: "0.3", id: newDraftEntityId(), type: "line", layer, pen: null, p1: [0, 0], p2: [100, 0] };
+          const entity = newBlockEntity(blockAddType, newDraftEntityId(), layer, artifacts.editor);
+          if (entity === null) { setBlockEditMessage("Define a style or fill before adding this entity"); return; }
           stageBlockEntities([...blockEditing.entities, entity]);
           setBlockEntityIndex(blockEditing.entities.length);
-          setBlockEditMessage("New line staged. Set its coordinates below, then Save contents.");
-        }}>Add line</button>
+          setBlockEditMessage(`New ${blockAddType} staged. Set its properties below, then Save contents.`);
+        }}>Add {blockAddType}</button>
         <label>Entity<select aria-label="Block entity" value={blockEntityIndex} onChange={event => setBlockEntityIndex(Number(event.currentTarget.value))}>{blockEditing.entities.map((entity, index) => <option key={entity.id} value={index}>{entity.type} — {entity.id}</option>)}</select></label>
         {blockEditing.entities[blockEntityIndex] !== undefined && <EntityPropertyEditor entity={blockEditing.entities[blockEntityIndex]} layers={artifacts.layers} pens={artifacts.editor.pens} message={blockEditMessage} onReplace={replaceBlockEntity} onTranslate={(delta, duplicate) => {
           const entity = blockEditing.entities[blockEntityIndex];

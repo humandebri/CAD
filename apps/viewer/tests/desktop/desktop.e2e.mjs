@@ -207,8 +207,12 @@ describe("CAD Review desktop", () => {
     assert.equal(blockDimension.measurement.first.entity_id, blockRectangle.id);
     assert.equal(blockDimension.measurement.second.entity_id, blockRectangle.id);
     await waitEntity(reference.id);
-    await activate(await $(`.drawing-stage [data-entity-id='${reference.id}'] [data-block-child-id]`));
-    await browser.waitUntil(() => browser.execute(id => document.querySelector(`.drawing-stage [data-entity-id='${id}'].is-selected`) !== null, reference.id), { timeout: 10_000 });
+    // Live review can replace the SVG after block creation; select the current node.
+    await browser.waitUntil(async () => {
+      const selected = await browser.execute(id => document.querySelector(`.drawing-stage [data-entity-id='${id}'].is-selected`) !== null, reference.id);
+      if (!selected) await activate(await $(`.drawing-stage [data-entity-id='${reference.id}']`));
+      return selected;
+    }, { timeout: 10_000 });
     await command("edit_block");
     let dialog = await $("section[aria-label='Edit block contents']");
     await dialog.waitForDisplayed({ timeout: 10_000 });
@@ -228,9 +232,20 @@ describe("CAD Review desktop", () => {
     await dialog.$(".translate-controls input").setValue("5");
     await activate(await dialog.$("button=Move"));
     assert.equal(readFileSync(blockPath, "utf8"), blockBefore, "block preview modified canonical source before Save");
+    for (const type of ["circle", "text", "hatch"]) {
+      const select = await dialog.$("select[aria-label='New block entity type']");
+      await browser.execute((element, value) => { element.value = value; element.dispatchEvent(new Event("change", { bubbles: true })); }, select, type);
+      const add = await dialog.$(`button=Add ${type}`);
+      await add.waitForDisplayed();
+      await activate(add);
+      await dialog.$(`h3=${type} properties`).waitForDisplayed();
+    }
     await activate(await dialog.$("button=Save contents"));
     await dialog.waitForExist({ reverse: true, timeout: 15_000 });
     assert.notEqual(readFileSync(blockPath, "utf8"), blockBefore);
+    const savedContents = readFileSync(blockPath, "utf8").trim().split("\n").map(JSON.parse);
+    for (const type of ["circle", "text", "hatch"]) assert(savedContents.some(entity => entity.type === type), `${type} was not saved in block`);
+
     await command("rectangle");
     await command("23000,20000"); await command("24000,21000");
     await applyPreview();
