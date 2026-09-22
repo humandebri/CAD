@@ -298,6 +298,8 @@ function App() {
     pdfExportGuard,
   ]);
 
+  // Every review can change history, including layout/block-only edits and
+  // watcher catch-up with unchanged drawing, comment, and layer revisions.
   useEffect(() => {
     const sequence = ++historySequenceRef.current;
     if (!isDesktop || projectState === null || artifacts === null) {
@@ -322,14 +324,7 @@ function App() {
           setHistoryMessage(formatError(error, "failed to load edit history"));
         }
       });
-  }, [
-    isDesktop,
-    projectState?.project_path,
-    artifacts?.currentDrawing,
-    artifacts?.editor.revision,
-    artifacts?.commentsRevision,
-    artifacts?.layers.revision,
-  ]);
+  }, [isDesktop, projectState?.project_path, artifacts]);
 
   useEffect(() => {
     setSelectedEntityIds((current) => {

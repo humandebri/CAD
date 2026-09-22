@@ -638,8 +638,10 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             at,
             rotation_deg,
             scale,
+            mirror_x,
+            mirror_y,
             ..
-        } => format!("block_ref:{block}:{at:?}:{rotation_deg}:{scale}"),
+        } => format!("block_ref:{block}:{at:?}:{rotation_deg}:{scale}:{mirror_x}:{mirror_y}"),
         Entity::Hatch {
             loops,
             pattern,
@@ -1429,6 +1431,56 @@ fn normalize_zero(value: f64) -> f64 {
 mod tests {
     use super::*;
     use std::fs::{create_dir_all, write};
+
+    #[test]
+    fn block_reflections_are_reported_as_geometry_changes() {
+        let fixture = fixture_project(BaseFixture::Base);
+        let mut base = cad_model::load_project(fixture.path()).unwrap();
+        base.blocks.insert(
+            "part".to_owned(),
+            cad_model::BlockDefinition {
+                id: "part".to_owned(),
+                config: cad_model::BlockDefinitionConfig {
+                    schema_version: cad_model::CURRENT_SCHEMA_VERSION.to_owned(),
+                    name: "Part".to_owned(),
+                    base_point: [0.0, 0.0],
+                },
+                entities: vec![base.drawings[0].entities[0].clone()],
+            },
+        );
+        base.drawings[0].entities = vec![EntityRecord {
+            line: 1,
+            entity: serde_json::from_value(serde_json::json!({
+                "schema_version": cad_model::CURRENT_SCHEMA_VERSION,
+                "id": "ent_01JZ0000000000000000000005",
+                "type": "block_ref", "layer": "0-1", "block": "part",
+                "at": [1000, 1000], "rotation_deg": 30, "scale": 2,
+                "mirror_x": false, "mirror_y": false
+            }))
+            .unwrap(),
+        }];
+        assert_eq!(
+            diff_projects(&base, &base).changes[0].kind,
+            ChangeKind::Unchanged
+        );
+        for (x, y) in [(true, false), (false, true), (true, true)] {
+            let mut head = base.clone();
+            let Entity::BlockRef {
+                mirror_x, mirror_y, ..
+            } = &mut head.drawings[0].entities[0].entity
+            else {
+                unreachable!()
+            };
+            *mirror_x = x;
+            *mirror_y = y;
+            let report = diff_projects(&base, &head);
+            assert_eq!(report.changes[0].kind, ChangeKind::Modified);
+            assert_eq!(
+                report.changes[0].reasons,
+                vec![ChangeReason::GeometryChanged]
+            );
+        }
+    }
 
     #[test]
     fn measurement_change_is_reported_when_legacy_dimension_fields_are_unchanged() {

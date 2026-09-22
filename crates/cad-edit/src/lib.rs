@@ -936,6 +936,19 @@ pub fn editor_state(project: &ProjectSource, drawing: &str) -> EditResult<Editor
         path: path.clone(),
         source,
     })?;
+    // The revision must describe the entities we return, not a newer external edit.
+    let text = std::str::from_utf8(&bytes).map_err(|_| EditError::RevisionConflict)?;
+    let current_entities = text
+        .lines()
+        .map(serde_json::from_str::<Entity>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| EditError::RevisionConflict)?;
+    if !current_entities
+        .iter()
+        .eq(drawing_source.entities.iter().map(|record| &record.entity))
+    {
+        return Err(EditError::RevisionConflict);
+    }
     Ok(EditorDrawingState {
         drawing: drawing.to_owned(),
         revision: revision(&bytes),
@@ -2905,7 +2918,19 @@ fn rotate_entity(entity: &Entity, center: Point, angle_deg: f64) -> EditResult<E
         let y = point[1] - center[1];
         [center[0] + x * cos - y * sin, center[1] + x * sin + y * cos]
     });
-    add_angle_fields(&mut value, angle_deg);
+    if let Some(object) = value.as_object_mut() {
+        // Circular arc angles are in world space; ellipse/curve-solid angles
+        // are local parameters and rotate together with their axis.
+        let fields: &[&str] = match entity {
+            Entity::Arc { .. } => &["start_deg", "end_deg"],
+            _ => &["rotation_deg", "text_rotation_deg"],
+        };
+        for &key in fields {
+            if let Some(number) = object.get(key).and_then(Value::as_f64) {
+                object.insert(key.to_owned(), Value::from(number + angle_deg));
+            }
+        }
+    }
     serde_json::from_value(value).map_err(|error| EditError::InvalidEntity(error.to_string()))
 }
 
@@ -2942,16 +2967,6 @@ fn mirror_entity(entity: &Entity, axis_start: Point, axis_end: Point) -> EditRes
         }
     }
     serde_json::from_value(value).map_err(|error| EditError::InvalidEntity(error.to_string()))
-}
-
-fn add_angle_fields(value: &mut Value, angle_deg: f64) {
-    if let Some(object) = value.as_object_mut() {
-        for key in ["rotation_deg", "text_rotation_deg", "start_deg", "end_deg"] {
-            if let Some(number) = object.get(key).and_then(Value::as_f64) {
-                object.insert(key.to_owned(), Value::from(number + angle_deg));
-            }
-        }
-    }
 }
 
 fn offset_entity(entity: &Entity, distance: f64) -> EditResult<Entity> {
@@ -5637,6 +5652,54 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn editor_state_rejects_entities_changed_after_project_load() {
+        let temp = test_project(false);
+        let project = cad_model::load_project(temp.path()).unwrap();
+        let before = editor_state(&project, "plan").unwrap();
+        apply_test_edit(
+            temp.path(),
+            EditOperation::Translate {
+                entity_id: before.entities[0]["id"].as_str().unwrap().to_owned(),
+                delta: [1000.0, 0.0],
+                duplicate: false,
+            },
+        );
+
+        assert!(matches!(
+            editor_state(&project, "plan"),
+            Err(EditError::RevisionConflict)
+        ));
+        let fresh = cad_model::load_project(temp.path()).unwrap();
+        let state = editor_state(&fresh, "plan").unwrap();
+        assert_eq!(state.entities[0]["p1"], serde_json::json!([1000.0, 0.0]));
+        assert_ne!(state.revision, before.revision);
+    }
+
+    #[test]
+    fn editor_state_tracks_exact_bytes_after_format_only_changes() {
+        let temp = test_project(false);
+        let project = cad_model::load_project(temp.path()).unwrap();
+        let before = editor_state(&project, "plan").unwrap();
+        let path = entities_path(temp.path(), "plan");
+        let reformatted = fs::read_to_string(&path)
+            .unwrap()
+            .trim_end_matches('\n')
+            .replace('\n', "\r\n");
+        fs::write(&path, &reformatted).unwrap();
+
+        let after = editor_state(&project, "plan").unwrap();
+        assert_eq!(after.entities, before.entities);
+        assert_ne!(after.revision, before.revision);
+        assert_eq!(after.revision, revision(reformatted.as_bytes()));
+
+        fs::write(&path, "incomplete external edit").unwrap();
+        assert!(matches!(
+            editor_state(&project, "plan"),
+            Err(EditError::RevisionConflict)
+        ));
+    }
+
+    #[test]
     fn applies_atomic_translate_and_preserves_other_raw_lines() {
         let temp = test_project(false);
         let project = cad_model::load_project(temp.path()).expect("project");
@@ -6648,6 +6711,38 @@ mod tests {
                     assert_eq!(mirrored["text_mirror_y"], true);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn rotating_elliptical_geometry_keeps_the_local_parameter_sweep() {
+        for geometry in [
+            serde_json::json!({"type":"ellipse","radius_x":100,"radius_y":50}),
+            serde_json::json!({"type":"curve_solid","radius":100,"flatness":0.5,"solid_param":0,"encoding_code":101,"fill":"black"}),
+        ] {
+            for (start, end) in [(0.0, 90.0), (90.0, 0.0), (0.0, 360.0)] {
+                let mut source = geometry.clone();
+                source["layer"] = serde_json::json!("0-1");
+                source["center"] = serde_json::json!([10, 20]);
+                source["rotation_deg"] = serde_json::json!(0);
+                source["start_deg"] = serde_json::json!(start);
+                source["end_deg"] = serde_json::json!(end);
+                let entity = create_entity(source).unwrap();
+                let rotated = rotate_entity(&entity, [0.0, 0.0], 90.0).unwrap();
+                let value = serde_json::to_value(&rotated).unwrap();
+                assert_eq!(rotated.id(), entity.id());
+                assert_eq!(value["start_deg"], start);
+                assert_eq!(value["end_deg"], end);
+                let center = entity_point(&rotated, "center");
+                let rotation = value["rotation_deg"].as_f64().unwrap();
+                for parameter in [start, (start + end) / 2.0, end] {
+                    let original =
+                        cad_model::ellipse_point([10.0, 20.0], 100.0, 50.0, 0.0, parameter);
+                    let actual = cad_model::ellipse_point(center, 100.0, 50.0, rotation, parameter);
+                    assert!((actual[0] + original[1]).abs() < 1e-9);
+                    assert!((actual[1] - original[0]).abs() < 1e-9);
+                }
             }
         }
     }

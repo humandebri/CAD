@@ -1370,9 +1370,21 @@ fn run_review_for_drawing_with_cache(
     requested_drawing: Option<&str>,
     head_cache: &HeadSnapshotCache,
 ) -> Result<ReviewArtifacts, String> {
+    run_review_for_drawing_with_hook(project_path, requested_drawing, head_cache, || {})
+}
+
+fn run_review_for_drawing_with_hook(
+    project_path: &Path,
+    requested_drawing: Option<&str>,
+    head_cache: &HeadSnapshotCache,
+    after_load: impl FnOnce(),
+) -> Result<ReviewArtifacts, String> {
     recover_project_sources(project_path)?;
+    let source_files =
+        cad_model::source_manifest(project_path).map_err(|error| error.to_string())?;
     let head = cad_model::load_project(project_path)
         .map_err(|error| format!("failed to load project: {error}"))?;
+    after_load();
     let drawing_name = requested_drawing
         .map(str::to_owned)
         .or_else(|| head.drawings.first().map(|drawing| drawing.name.clone()))
@@ -1458,7 +1470,7 @@ fn run_review_for_drawing_with_cache(
         })
         .unwrap_or_default();
 
-    Ok(ReviewArtifacts {
+    let artifacts = ReviewArtifacts {
         project_name: head.project.name.clone(),
         drawing_names: head
             .drawings
@@ -1477,7 +1489,12 @@ fn run_review_for_drawing_with_cache(
         editor,
         blocks,
         layouts,
-    })
+    };
+    if cad_model::source_manifest(project_path).map_err(|error| error.to_string())? != source_files
+    {
+        return Err("revision_conflict: project source changed during review".to_owned());
+    }
+    Ok(artifacts)
 }
 
 fn is_project_wide_diagnostic(diagnostic: &cad_check::CheckDiagnostic) -> bool {
@@ -2312,6 +2329,28 @@ mod tests {
         assert!(artifacts.diff.is_none());
         assert!(artifacts.diff_svg.is_none());
         assert!(artifacts.diff_unavailable.is_some());
+    }
+
+    #[test]
+    fn review_rejects_source_changes_after_loading_the_project() {
+        for relative in ["rules/layers.toml", "drawings/plan_1f/layouts.toml"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), false);
+            let error = run_review_for_drawing_with_hook(
+                temp.path(),
+                Some("plan_1f"),
+                &HeadSnapshotCache::default(),
+                || {
+                    let path = temp.path().join(relative);
+                    let mut source = fs::read_to_string(&path).unwrap();
+                    source.push_str("\n# external update during review\n");
+                    fs::write(path, source).unwrap();
+                },
+            )
+            .expect_err("a review must not mix source revisions");
+            assert!(error.contains("revision_conflict"), "{relative}: {error}");
+            assert!(run_review_for_path(temp.path()).is_ok());
+        }
     }
 
     #[test]
