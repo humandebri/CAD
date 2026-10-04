@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Acquire drawing attributes</title></head><body><main style="padding:24px"><h1>Acquire drawing attributes</h1><div id="controls"></div><output id="result" aria-live="polite" style="overflow-wrap:anywhere">Source unchanged.</output></main><script type="module">
+import {render,h} from 'preact';
+import {CreationAttributesPanel,acquireCreationAttributes} from '/src/creation-attributes.tsx';
+import {DraftingPanel,initialDraftingOptions} from '/src/drafting-panel.tsx';
+import '/src/styles.css';
+let acquired=null,options={...initialDraftingOptions};
+const editor={pens:['outline'],text_styles:['note'],dimension_styles:['dim'],fills:['black']},layers={layers:[{id:'0-1'},{id:'0-2'}]};
+const source={schema_version:'0.3',id:'text-source',type:'text',layer:'0-2',pen:'outline',style:'note',at:[9000,8000],value:'original'};
+const mount=()=>render(h('div',{},[
+  h(CreationAttributesPanel,{source:location.search.includes('empty')?null:source,acquired,disabled:false,onAcquire:()=>{acquired=acquireCreationAttributes(source,editor,layers);options={...options,pen:acquired.pen||'',style:acquired.textStyle||''};mount();},onClear:()=>{acquired=null;options={...options,pen:'',style:''};mount();}}),
+  h(DraftingPanel,{command:'rectangle',options,artifacts:{editor},message:'Base point: 100,200. Review a new rectangle.',busy:false,onChange:updated=>{options=updated;mount();},onApply:()=>document.querySelector('#result').textContent=JSON.stringify({kind:'rectangle',layer:acquired?.layer||'0-1',pen:options.pen||null,p1:[100,200],p2:[100+Number(options.width),200+Number(options.height)]}),onCancel:()=>document.querySelector('#result').textContent='Draft cancelled.'}),
+]),document.querySelector('#controls'));
+mount();
+</script></body></html>

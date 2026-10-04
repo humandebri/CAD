@@ -8,14 +8,18 @@ use cad_model::{
     TextStyleDef, entity_bbox,
 };
 use svg::Document;
+use svg::Node;
 use svg::node::element::path::Data;
 use svg::node::element::{
-    Circle, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Rectangle, Text,
+    Circle, ClipPath, Definitions, Ellipse as SvgEllipse, Group, Line, Path, Polyline, Rectangle,
+    Text,
 };
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RenderError {
+    #[error("invalid sheet viewport: {0}")]
+    InvalidViewport(String),
     #[error("dimension {entity_id}: {message}")]
     InvalidDimension { entity_id: String, message: String },
     #[error("entity {entity_id}: {source}")]
@@ -110,8 +114,74 @@ pub fn render_drawing_svg(project: &ProjectSource, drawing_name: &str) -> Render
             );
         }
     }
-    for record in &drawing.entities {
-        root = root.add(render_entity(project, record, viewport.scale)?);
+    let layout = drawing
+        .layouts
+        .active()
+        .ok_or(RenderError::MissingActiveLayout)?;
+    if layout.viewports.is_empty() {
+        for record in &drawing.entities {
+            root = root.add(render_entity(project, record, viewport.scale)?);
+        }
+    } else {
+        cad_model::validate_layout_viewports(project, layout)
+            .map_err(RenderError::InvalidViewport)?;
+        for (index, view) in layout.viewports.iter().enumerate() {
+            let source = project
+                .drawings
+                .iter()
+                .find(|d| d.name == view.drawing)
+                .expect("validated viewport drawing");
+            let scale =
+                cad_model::parse_layout_scale(&view.scale).expect("validated viewport scale");
+            let factor = viewport.scale / scale;
+            let at = [
+                layout.origin[0] + view.at_mm[0] * viewport.scale,
+                layout.origin[1] + view.at_mm[1] * viewport.scale,
+            ];
+            let clip_id = format!("cad-sheet-viewport-{index}");
+            let rect = Rectangle::new()
+                .set("x", at[0])
+                .set("y", svg_y(at[1] + view.size_mm[1] * viewport.scale))
+                .set("width", view.size_mm[0] * viewport.scale)
+                .set("height", view.size_mm[1] * viewport.scale);
+            root = root.add(
+                Definitions::new().add(
+                    ClipPath::new()
+                        .set("id", clip_id.clone())
+                        .set("clipPathUnits", "userSpaceOnUse")
+                        .add(rect),
+                ),
+            );
+            let mut geometry = Group::new().set(
+                "transform",
+                format!(
+                    "translate({} {}) scale({factor})",
+                    at[0] - view.origin[0] * factor,
+                    svg_y(at[1] - view.origin[1] * factor)
+                ),
+            );
+            for record in &source.entities {
+                if !view.layers.is_empty()
+                    && !view
+                        .layers
+                        .iter()
+                        .any(|layer| layer == record.entity.layer())
+                {
+                    continue;
+                }
+                let mut entity = render_entity(project, record, scale)?;
+                sheet_metadata(&mut entity);
+                geometry = geometry.add(entity);
+            }
+            root = root.add(
+                Group::new()
+                    .set("data-sheet-viewport", view.name.clone())
+                    .set("data-source-drawing", view.drawing.clone())
+                    .set("data-viewport-scale", view.scale.clone())
+                    .set("clip-path", format!("url(#{clip_id})"))
+                    .add(geometry),
+            );
+        }
     }
 
     let document = Document::new()
@@ -125,6 +195,23 @@ pub fn render_drawing_svg(project: &ProjectSource, drawing_name: &str) -> Render
         .add(root);
 
     Ok(document.to_string())
+}
+
+fn sheet_metadata(node: &mut dyn Node) {
+    if let Some(attributes) = node.get_attributes_mut() {
+        if let Some(id) = attributes.remove("data-entity-id") {
+            attributes.insert("data-source-entity-id".into(), id);
+            attributes.remove("id");
+        }
+        if let Some(bbox) = attributes.remove("data-bbox") {
+            attributes.insert("data-source-bbox".into(), bbox);
+        }
+    }
+    if let Some(children) = node.get_children_mut() {
+        for child in children {
+            sheet_metadata(child.as_mut());
+        }
+    }
 }
 
 fn render_entity(
@@ -301,6 +388,7 @@ fn render_entity_with_depth(
             at,
             rotation_deg,
             mirror_y,
+            writing_mode,
             value,
             ..
         } => {
@@ -310,14 +398,32 @@ fn render_entity_with_depth(
                     style: style.clone(),
                 }
             })?;
-            group = group.add(text_node(
-                at,
-                *rotation_deg,
-                *mirror_y,
-                value,
-                text_style,
-                &stroke.color,
-            ));
+            if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                let mut glyph_style = text_style.clone();
+                glyph_style.align = TextAlign::Left;
+                group = group.set("data-writing-mode", "vertical_upright");
+                for (position, character) in
+                    cad_model::upright_text_glyphs(*at, *rotation_deg, *mirror_y, value, text_style)
+                {
+                    group = group.add(text_node(
+                        &position,
+                        *rotation_deg,
+                        *mirror_y,
+                        &character.to_string(),
+                        &glyph_style,
+                        &stroke.color,
+                    ));
+                }
+            } else {
+                group = group.add(text_node(
+                    at,
+                    *rotation_deg,
+                    *mirror_y,
+                    value,
+                    text_style,
+                    &stroke.color,
+                ));
+            }
         }
         Entity::Dimension {
             measurement: Some(_),
@@ -1157,7 +1263,11 @@ impl Viewport {
                 layout.origin[1] + (paper_height_mm * scale),
             ],
         };
-        let content_bbox = drawing_content_bbox(project, drawing)?;
+        let content_bbox = if layout.viewports.is_empty() {
+            drawing_content_bbox(project, drawing)?
+        } else {
+            None
+        };
         let content_bbox = content_bbox.map_or(fallback, |bbox| union_bbox(fallback, bbox));
         let view_box = bbox_view_box(content_bbox);
         Ok(Self {
@@ -1191,7 +1301,8 @@ fn drawing_content_bbox(
         })
 }
 
-fn render_entity_bbox(project: &ProjectSource, entity: &Entity) -> Option<BBox> {
+/// Bounds of evaluated geometry, including reference dimensions and block placements.
+pub fn render_entity_bbox(project: &ProjectSource, entity: &Entity) -> Option<BBox> {
     render_entity_bbox_with_depth(project, entity, 0)
 }
 
@@ -1206,10 +1317,20 @@ fn render_entity_bbox_with_depth(
             at,
             rotation_deg,
             mirror_y,
+            writing_mode,
             value,
             ..
         } => {
             let text_style = project.styles.text_styles.get(style)?;
+            if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                return cad_model::upright_text_bbox(
+                    *at,
+                    *rotation_deg,
+                    *mirror_y,
+                    value,
+                    text_style,
+                );
+            }
             text_bbox(
                 at,
                 *rotation_deg,
@@ -1389,6 +1510,92 @@ fn paper_size_mm(paper: &str) -> RenderResult<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upright_annotations_render_per_glyph_and_bound_the_actual_columns() {
+        let temp = fixture_project();
+        let mut project = cad_model::load_project(temp.path()).unwrap();
+        let entity = Entity::Text {
+            schema_version: "0.3".into(),
+            id: cad_model::EntityId::parse("ent_01JZ0000000000000000000002").unwrap(),
+            layer: "0-1".into(),
+            pen: None,
+            style: "note".into(),
+            at: [1000., 2000.],
+            rotation_deg: 0.,
+            mirror_y: false,
+            writing_mode: cad_model::TextWritingMode::VerticalUpright,
+            value: "室名\nA2".into(),
+        };
+        assert_eq!(
+            render_entity_bbox(&project, &entity),
+            Some(BBox {
+                min: [875., 1500.],
+                max: [1125., 2000.]
+            })
+        );
+        project.drawings[0].entities = vec![EntityRecord { line: 1, entity }];
+        let svg = render_project_svg(&project).unwrap();
+        assert!(svg.contains("data-writing-mode=\"vertical_upright\""));
+        assert_eq!(svg.matches("<text ").count(), 4);
+        assert!(svg.contains("x=\"1000\" y=\"-1750\""), "{svg}");
+        assert!(svg.contains("x=\"875\" y=\"-1500\""), "{svg}");
+    }
+    #[test]
+    fn sheet_viewports_have_independent_scales_clips_and_noninteractive_source_metadata() {
+        let mut project = cad_model::load_project(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small"),
+        )
+        .unwrap();
+        if let Entity::Line { p1, p2, .. } = &mut project.drawings[0].entities[0].entity {
+            *p1 = [1000., 2000.];
+            *p2 = [2000., 2000.];
+        } else {
+            panic!()
+        }
+        let views = vec![
+            cad_model::LayoutViewport {
+                name: "Plan".into(),
+                drawing: "plan_1f".into(),
+                origin: [1000., 2000.],
+                at_mm: [10., 10.],
+                size_mm: [100., 100.],
+                scale: "1/100".into(),
+                layers: vec![],
+            },
+            cad_model::LayoutViewport {
+                name: "Detail".into(),
+                drawing: "plan_1f".into(),
+                origin: [1000., 2000.],
+                at_mm: [150., 10.],
+                size_mm: [100., 100.],
+                scale: "1/20".into(),
+                layers: vec![],
+            },
+        ];
+        project.drawings[0]
+            .layouts
+            .layouts
+            .get_mut("default")
+            .unwrap()
+            .viewports = views;
+        let svg = render_drawing_svg(&project, "plan_1f").unwrap();
+        assert!(svg.contains("translate(0 1000) scale(1)"));
+        assert!(svg.contains("translate(10000 9000) scale(5)"));
+        assert_eq!(svg.matches("data-source-entity-id=").count(), 2);
+        assert!(!svg.contains("data-entity-id="));
+        assert!(!svg.contains("data-bbox="));
+        assert!(svg.contains("clip-path=\"url(#cad-sheet-viewport-1)\""));
+        assert!(svg.contains("stroke-width=\"25\""));
+        assert!(svg.contains("stroke-width=\"5\""));
+        project.drawings[0]
+            .layouts
+            .layouts
+            .get_mut("default")
+            .unwrap()
+            .viewports[0]
+            .at_mm = [400., 0.];
+        assert!(render_drawing_svg(&project, "plan_1f").is_err());
+    }
 
     #[test]
     fn paper_pen_width_is_scaled_to_model_units_but_not_component_size() {

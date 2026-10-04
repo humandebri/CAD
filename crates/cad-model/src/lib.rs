@@ -14,6 +14,10 @@ use ulid::Ulid;
 
 mod dimensions;
 pub use dimensions::*;
+mod comment_versions;
+pub use comment_versions::*;
+mod text_layout;
+pub use text_layout::*;
 pub const CURRENT_SCHEMA_VERSION: &str = "0.3";
 
 #[derive(Debug, Error)]
@@ -671,6 +675,109 @@ pub struct LayoutConfig {
     pub margins: [f64; 4],
     #[serde(default)]
     pub plot_area: Option<[f64; 4]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewports: Vec<LayoutViewport>,
+}
+
+/// A clipped view of model geometry, placed in millimetres from the sheet's lower left.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutViewport {
+    pub name: String,
+    pub drawing: String,
+    pub origin: Point,
+    pub at_mm: Point,
+    pub size_mm: Point,
+    pub scale: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+}
+
+pub fn validate_layout_viewports(
+    project: &ProjectSource,
+    layout: &LayoutConfig,
+) -> Result<(), String> {
+    let (short, long) = match layout.paper.as_str() {
+        "A0" => (841., 1189.),
+        "A1" => (594., 841.),
+        "A2" => (420., 594.),
+        "A3" => (297., 420.),
+        "A4" => (210., 297.),
+        _ => return Err("Unsupported viewport sheet paper".into()),
+    };
+    let (width, height) = match layout.orientation {
+        SheetOrientation::Portrait => (short, long),
+        SheetOrientation::Landscape => (long, short),
+    };
+    if layout.viewports.len() > 32 {
+        return Err("A sheet supports at most 32 viewports".into());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let sheet_scale = parse_layout_scale(&layout.scale).ok_or("Invalid viewport sheet scale")?;
+    if !(width * sheet_scale).is_finite() || !(height * sheet_scale).is_finite() {
+        return Err("Viewport sheet extent overflows".into());
+    }
+    for view in &layout.viewports {
+        if view.name.trim().is_empty() || view.name.len() > 256 || !names.insert(&view.name) {
+            return Err("Viewport names must be nonempty, unique and at most 256 bytes".into());
+        }
+        if !project
+            .drawings
+            .iter()
+            .any(|drawing| drawing.name == view.drawing)
+        {
+            return Err(format!(
+                "Viewport {:?} references missing drawing {:?}",
+                view.name, view.drawing
+            ));
+        }
+        if parse_layout_scale(&view.scale).is_none() {
+            return Err(format!("Viewport {:?} has invalid scale", view.name));
+        }
+        if view.origin.iter().any(|v| !v.is_finite() || v.abs() > 1e9)
+            || view.at_mm.iter().any(|v| !v.is_finite() || *v < 0.)
+            || view.size_mm.iter().any(|v| !v.is_finite() || *v <= 0.)
+            || view.at_mm[0] + view.size_mm[0] > width
+            || view.at_mm[1] + view.size_mm[1] > height
+        {
+            return Err(format!(
+                "Viewport {:?} needs a finite origin and a positive rectangle within the paper",
+                view.name
+            ));
+        }
+        let scale = parse_layout_scale(&view.scale).unwrap();
+        let factor = sheet_scale / scale;
+        let at = [
+            layout.origin[0] + view.at_mm[0] * sheet_scale,
+            layout.origin[1] + view.at_mm[1] * sheet_scale,
+        ];
+        if !factor.is_finite()
+            || factor <= 0.
+            || (0..2).any(|i| !(at[i] - view.origin[i] * factor).is_finite())
+        {
+            return Err("Viewport display transform overflows".into());
+        }
+        if view.size_mm.iter().any(|size| !(*size * scale).is_finite()) {
+            return Err("Viewport model extent overflows".into());
+        }
+        if view
+            .layers
+            .iter()
+            .any(|layer| !project.layers.layers.contains_key(layer))
+            || view
+                .layers
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != view.layers.len()
+        {
+            return Err(format!(
+                "Viewport {:?} has missing or repeated layers",
+                view.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -949,6 +1056,8 @@ pub enum Entity {
         rotation_deg: f64,
         #[serde(default)]
         mirror_y: bool,
+        #[serde(default, skip_serializing_if = "TextWritingMode::is_horizontal")]
+        writing_mode: TextWritingMode,
         value: String,
     },
     Dimension {

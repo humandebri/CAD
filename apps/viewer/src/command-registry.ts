@@ -1,7 +1,7 @@
 export const CAD_COMMANDS = [
   "select", "line", "polyline", "circle", "arc", "text", "dimension", "point",
   "endpoint", "stretch", "rectangle", "fillet", "chamfer", "rectangular_array", "create_block",
-  "move", "copy", "delete", "trim", "extend", "offset", "rotate", "mirror",
+  "move", "copy", "delete", "trim", "extend", "offset", "rotate", "scale", "mirror",
   "insert_block", "edit_block", "hatch", "layout", "print_preview", "undo", "redo",
 ] as const;
 

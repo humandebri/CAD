@@ -5,6 +5,9 @@ members = [
     "crates/cad-render-svg",
     "crates/cad-render-pdf",
     "crates/cad-diff",
+    "crates/cad-git",
+    "crates/cad-toolkit",
+    "crates/cad-exchange",
     "crates/cad-jww-codec",
     "crates/cad-import-jww",
     "crates/cad-export-jww",
@@ -26,12 +29,16 @@ cad-check = { path = "crates/cad-check" }
 cad-render-svg = { path = "crates/cad-render-svg" }
 cad-render-pdf = { path = "crates/cad-render-pdf" }
 cad-diff = { path = "crates/cad-diff" }
+cad-git = { path = "crates/cad-git" }
+cad-toolkit = { path = "crates/cad-toolkit" }
+cad-exchange = { path = "crates/cad-exchange" }
+dxf = "0.6.1"
 cad-jww-codec = { path = "crates/cad-jww-codec" }
 cad-import-jww = { path = "crates/cad-import-jww" }
 cad-export-jww = { path = "crates/cad-export-jww" }
 cad-edit = { path = "crates/cad-edit" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 toml = "1"
 toml_edit = "0.25"

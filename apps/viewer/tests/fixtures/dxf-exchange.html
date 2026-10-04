@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>DXF exchange</title></head>
+<body><main><h1>DXF exchange</h1><button id="open">Open exchange</button><div id="controls"></div><output id="result" style="overflow-wrap: anywhere"></output></main>
+<script type="module">
+import { render, h } from "preact";
+import { DxfExchangeDialog } from "/src/dxf-exchange-dialog.tsx";
+import "/src/styles.css";
+const importing = location.search.includes("import");
+const blocked = location.search.includes("blocked");
+const mount = () => render(h(DxfExchangeDialog, {
+  mode: importing ? "import" : "export", drawings: ["plan", "detail"], currentDrawing: "plan",
+  onChooseInput: async () => "/fixture/part.dxf",
+  onChooseOutput: async () => importing ? "/fixture/new-project" : "/fixture/output.dxf",
+  onClose: () => render(null, document.querySelector("#controls")),
+  onSubmit: async values => {
+    document.querySelector("#result").textContent = JSON.stringify(values);
+    return {operation: importing ? "import_dxf" : "export_dxf", status: blocked ? "blocked" : "ready", output_path:values.output, report_path:values.report, exchange:{status:blocked ? "blocked":"ready", units:"mm", warnings:[{code:"layout_modelspace",message:"Page layouts and reference relationships are not preserved."}],blockers:blocked ? [{code:"unsupported_record",message:"Unsupported DXF record retained in the report."}] : []}};
+  },
+}), document.querySelector("#controls"));
+document.querySelector("#open").onclick = mount;
+document.querySelector("#open").focus();
+mount();
+</script></body></html>

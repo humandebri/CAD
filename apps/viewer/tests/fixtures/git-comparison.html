@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Git comparison controls</title></head>
+<body><main style="padding: 24px"><h1>Git comparison</h1><div id="controls"></div><output aria-live="polite" id="result">Choose revisions to compare.</output></main>
+<script type="module">
+import { render, h } from "preact";
+import { GitComparisonControls } from "/src/git-comparison.tsx";
+import "/src/styles.css";
+render(h(GitComparisonControls, { disabled: false, onApply: value => {
+  document.querySelector("#result").textContent = `${value.base} → ${value.head}`;
+}}), document.querySelector("#controls"));
+</script></body></html>

@@ -18,15 +18,23 @@ export type SvgSanitizer = (svgText: string) => string;
 
 const invokeReview: InvokeReview = (command, args) => tauriInvoke<DesktopReviewArtifacts>(command, args);
 
+export type GitComparison = { base: string; head: string };
+
 export async function loadReviewSnapshotFromDesktop(
   projectPath: string,
   sanitizeSvg: SvgSanitizer,
   invokeCommand: InvokeReview = invokeReview,
   drawingName?: string,
+  comparison?: GitComparison,
 ): Promise<DesktopReviewSnapshot> {
+  const args: Record<string, unknown> = drawingName === undefined ? { projectPath } : { projectPath, drawingName };
+  if (comparison !== undefined) {
+    args.baseRevision = comparison.base;
+    args.headRevision = comparison.head;
+  }
   const review = await invokeCommand(
     "run_review",
-    drawingName === undefined ? { projectPath } : { projectPath, drawingName },
+    args,
   );
   return {
     projectName: review.project_name,
@@ -46,6 +54,7 @@ export async function loadReviewSnapshotFromDesktop(
       editor: review.editor,
       blocks: review.blocks ?? [],
       layouts: review.layouts ?? [],
+      comparison: review.comparison ?? undefined,
     },
   };
 }

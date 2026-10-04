@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use thiserror::Error;
 
+mod jws;
+pub use jws::{DecodedSymbol, SymbolHeader, read_symbol};
+
 pub const JWW_SIGNATURE: &[u8; 8] = b"JwwData.";
 pub const EXPORT_VERSION: u32 = 600;
 #[derive(Debug, Error)]
@@ -32,6 +35,12 @@ pub enum CodecError {
     InvalidTextEncoding,
     #[error("duplicate JWW block definition number {0}")]
     DuplicateBlockDefinition(u32),
+    #[error("invalid JWS header: {0}")]
+    InvalidSymbolHeader(&'static str),
+    #[error("JWS version {0} has not been validated")]
+    UnsupportedSymbolVersion(u32),
+    #[error("JWS has {0} unconsumed bytes; their boundaries are unknown")]
+    SymbolTrailingBytes(usize),
 }
 
 pub type CodecResult<T> = Result<T, CodecError>;

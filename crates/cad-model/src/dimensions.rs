@@ -598,6 +598,7 @@ pub fn dimension_primitives(
         at: text_at,
         rotation_deg: *text_rotation_deg,
         mirror_y: *text_mirror_y,
+        writing_mode: crate::TextWritingMode::Horizontal,
         value: evaluated.label,
     });
     Ok(primitives)

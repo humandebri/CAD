@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -31,6 +31,12 @@ try {
   for (const scenario of ["edits, comments, and observes", "persists a dimensioned room"]) {
     rmSync(projectPath, { recursive: true, force: true });
     cpSync(resolve(workspaceRoot, "examples/house-small"), projectPath, { recursive: true });
+    appendFileSync(resolve(projectPath, "rules/styles.toml"), '\n[text_styles.title]\nfont_family = "Hiragino Sans"\nheight = 350\nwidth = 175\nspacing = 0\nalign = "left"\n');
+    appendFileSync(resolve(projectPath, "rules/styles.toml"), '\n[pens.picked_outline]\ncolor="jw_black"\nline_type="solid"\nline_width=0.4\n');
+    run("cargo", ["run", "-p", "cad-cli", "--", "check", projectPath, "--target", "cad", "--format", "json", "--out", "-"]);
+    for (const args of [["init"], ["config", "user.name", "CAD desktop test"], ["config", "user.email", "cad@example.invalid"], ["add", "."], ["commit", "-m", "baseline"]]) {
+      run("git", ["-C", projectPath, ...args]);
+    }
     rmSync(pdfPath, { force: true });
     run("pnpm", ["exec", "wdio", "run", "wdio.desktop.conf.mjs", "--mochaOpts.grep", scenario]);
   }

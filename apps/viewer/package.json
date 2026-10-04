@@ -24,6 +24,7 @@
     "preact": "10.29.5"
   },
   "devDependencies": {
+    "@mizchi/vlmkit": "0.23.0",
     "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "2.11.4",
     "@wdio/cli": "9.29.1",

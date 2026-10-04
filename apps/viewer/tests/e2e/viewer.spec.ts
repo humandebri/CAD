@@ -38,6 +38,27 @@ test("reviews generated artifacts", async ({ page }) => {
   await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText(
     "Phase 0 sample comment",
   );
+  await expect(page.getByRole("complementary", { name: "Selected entity" })).toContainText(
+    "Original version unrecorded",
+  );
+});
+
+test("narrow command bar remains within the viewport and toggles snapping", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto("/");
+  await expect(page.locator(".drawing-stage svg")).toBeVisible();
+  const snap = page.getByRole("button", { name: "F3 SNAP" });
+  await snap.scrollIntoViewIfNeeded();
+  await expect(snap).toHaveClass(/is-active/);
+  await snap.click();
+  await expect(snap).not.toHaveClass(/is-active/);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
+  const footer = await page.locator(".command-bar").boundingBox();
+  for (const control of [snap, page.getByRole("button", { name: "F8 ORTHO" }), page.getByRole("textbox", { name: "Command or coordinate" })]) {
+    const box = await control.boundingBox();
+    expect(box!.x).toBeGreaterThanOrEqual(footer!.x);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(footer!.x + footer!.width);
+  }
 });
 
 test("layer workspace hides and restores visible geometry", async ({ page }) => {

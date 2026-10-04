@@ -68,6 +68,11 @@ test("loads desktop artifacts through run_review invoke", async () => {
   expect(snapshot.artifacts.diffSvg).toBe("");
   expect(snapshot.artifacts.diff.changes).toHaveLength(1);
   expect(snapshot.artifacts.comments).toHaveLength(1);
+  calls.length = 0;
+  await loadReviewSnapshotFromDesktop("/tmp/project", (svg) => svg, invoke, "plan_1f", { base: "HEAD~1", head: "index" });
+  expect(calls).toEqual([{ command: "run_review", args: {
+    projectPath: "/tmp/project", drawingName: "plan_1f", baseRevision: "HEAD~1", headRevision: "index",
+  } }]);
 });
 
 test("marks diff unavailable when desktop command has no diff report", async () => {

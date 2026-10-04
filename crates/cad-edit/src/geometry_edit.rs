@@ -1045,14 +1045,14 @@ pub(super) fn apply(
                 "stretch",
             )
         }
-        EditOperation::Rectangle { layer, p1, p2 } => {
+        EditOperation::Rectangle { layer, pen, p1, p2 } => {
             finite(&[*p1, *p2])?;
             if p1[0] == p2[0] || p1[1] == p2[1] {
                 return Err(invalid("rectangle width and height must be nonzero"));
             }
             apply_operation(
                 &EditOperation::Create {
-                    entity: serde_json::json!({"schema_version":cad_model::CURRENT_SCHEMA_VERSION,"type":"polyline","layer":layer,"points":[p1,[p2[0],p1[1]],p2,[p1[0],p2[1]],p1],"closed":true}),
+                    entity: serde_json::json!({"schema_version":cad_model::CURRENT_SCHEMA_VERSION,"type":"polyline","layer":layer,"pen":pen,"points":[p1,[p2[0],p1[1]],p2,[p1[0],p2[1]],p1],"closed":true}),
                 },
                 project,
                 entities,

@@ -800,6 +800,7 @@ fn convert_preserved_entities<'a>(
         }
         let before_records = output.len();
         let before_warnings = context.warnings.len();
+        let original = provenance.entities.get(&key).map(|(_, record)| record);
         convert_entity(
             project,
             entity,
@@ -809,8 +810,12 @@ fn convert_preserved_entities<'a>(
             context,
         );
         let generated = output.len() - before_records;
+        if original.is_some_and(
+            |record| matches!(record, Record::Text {base, ..} if base.flag & 0x0020 != 0),
+        ) {
+            context.approximate(Some(entity), "native_vertical_text_replaced", "Changed native vertical text uses canonical annotation glyph placement; the original font-dependent vertical flag is cleared.");
+        }
         let new_warnings = context.warnings.split_off(before_warnings);
-        let original = provenance.entities.get(&key).map(|(_, record)| record);
         let unsupported_warning = new_warnings.iter().find(|warning| {
             warning.code != "dimension_style_approximated"
                 && !(warning.code == "font_substituted"
@@ -1074,6 +1079,13 @@ fn prepare_loaded_project(
         .find(|drawing| drawing.name == drawing_name)
         .ok_or_else(|| ExportError::DrawingNotFound(drawing_name.to_owned()))?;
     let mut context = ExportContext::new(output_path, options);
+    if drawing
+        .layouts
+        .active()
+        .is_some_and(|layout| !layout.viewports.is_empty())
+    {
+        context.block(None,"sheet_viewports_unsupported","Sheet viewport clipping and placement have no validated JWW mapping; export SVG/PDF or select a model layout");
+    }
     let check = cad_check::check_loaded_project(project);
     for diagnostic in check
         .diagnostics
@@ -1473,6 +1485,7 @@ fn convert_entity(
             at,
             rotation_deg,
             mirror_y,
+            writing_mode,
             value,
             ..
         } => {
@@ -1494,15 +1507,39 @@ fn convert_entity(
                 );
                 return;
             };
-            records.push(text_record(
-                base,
-                *at,
-                *rotation_deg,
-                value,
-                style,
-                context,
-                Some(entity),
-            ));
+            if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                context.approximate(Some(entity), "upright_text_expanded", "Upright annotation columns are expanded to positioned horizontal single-character records; vertical font substitutions and text editing semantics are not preserved.");
+                if context.options.strict_approximations {
+                    return;
+                }
+                let mut glyph_style = style.clone();
+                glyph_style.align = cad_model::TextAlign::Left;
+                let mut glyph_base = base;
+                glyph_base.flag &= !0x0020;
+                for (position, character) in
+                    cad_model::upright_text_glyphs(*at, *rotation_deg, false, value, style)
+                {
+                    records.push(text_record(
+                        glyph_base,
+                        position,
+                        *rotation_deg,
+                        &character.to_string(),
+                        &glyph_style,
+                        context,
+                        Some(entity),
+                    ));
+                }
+            } else {
+                records.push(text_record(
+                    base,
+                    *at,
+                    *rotation_deg,
+                    value,
+                    style,
+                    context,
+                    Some(entity),
+                ));
+            }
         }
         Entity::Dimension {
             measurement: Some(_),
@@ -2560,6 +2597,140 @@ fn publish(output: &Path, bytes: &[u8], overwrite: bool) -> ExportResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_vertical_text_keeps_exact_bytes_until_edited_and_reports_regeneration() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("native_vertical.jww");
+        let bytes = cad_jww_codec::write_document(&Document {
+            records: vec![Record::Text {
+                base: Base {
+                    flag: 0x0020,
+                    ..Default::default()
+                },
+                start: [0., 0.],
+                end: [10., 0.],
+                text_type: 1,
+                size_x: 2.5,
+                size_y: 2.5,
+                spacing: 0.,
+                angle_deg: 0.,
+                font: "MS Gothic".into(),
+                value: "室名".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        fs::write(&input, &bytes).unwrap();
+        let imported = temp.path().join("imported");
+        let report = cad_import_jww::import_jww_file(&input, &imported).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "native_vertical_text_unmapped")
+        );
+        let exact = temp.path().join("exact.jww");
+        let report = export_jww_file_auto(
+            &imported,
+            "native_vertical",
+            &exact,
+            AutoExportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.mode, ExportMode::PreservedExact);
+        assert_eq!(fs::read(exact).unwrap(), bytes);
+        let path = imported.join("drawings/native_vertical/entities.ndjson");
+        let mut value: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        value["writing_mode"] = serde_json::json!("vertical_upright");
+        fs::write(path, format!("{value}\n")).unwrap();
+        assert!(cad_check::check_project(&imported).is_ok());
+        let edited = temp.path().join("edited.jww");
+        let report = export_jww_file_auto(
+            &imported,
+            "native_vertical",
+            &edited,
+            AutoExportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.status, ExportStatus::Exported, "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "native_vertical_text_replaced")
+        );
+        let document = cad_jww_codec::read_document(&fs::read(edited).unwrap()).unwrap();
+        assert_eq!(document.entities.len(), 2);
+        assert!(document.entities.iter().all(|entity|matches!(entity,cad_jww_codec::DecodedEntity::Text(text) if text.base.flag&0x0020==0)));
+    }
+    #[test]
+    fn upright_annotations_expand_deterministically_and_strict_keeps_a_blocked_report() {
+        let mut source = cad_model::load_project(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance"),
+        )
+        .unwrap();
+        let style = source.styles.text_styles.keys().next().unwrap().clone();
+        let metrics = source.styles.text_styles.get_mut(&style).unwrap();
+        metrics.height = 10.;
+        metrics.width = 5.;
+        metrics.spacing = 2.;
+        metrics.align = cad_model::TextAlign::Left;
+        metrics.font_family = "MS Gothic".into();
+        source.blocks.clear();
+        source.drawings[0].entities=vec![cad_model::EntityRecord {line:1,entity:serde_json::from_value(serde_json::json!({"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":style,"at":[100,200],"rotation_deg":0,"value":"室名\nA2","writing_mode":"vertical_upright"})).unwrap()}];
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("text.jww");
+        let name = &source.drawings[0].name;
+        let report = export_fixture(&source, name, &output, ExportOptions::default()).unwrap();
+        assert_eq!(report.status, ExportStatus::Exported);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "upright_text_expanded")
+        );
+        let document = cad_jww_codec::read_document(&fs::read(output).unwrap()).unwrap();
+        let text = document
+            .entities
+            .iter()
+            .map(|entity| match entity {
+                cad_jww_codec::DecodedEntity::Text(text) => text,
+                _ => panic!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text.iter()
+                .map(|text| (text.start, text.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ([100., 190.], "室"),
+                ([100., 178.], "名"),
+                ([93., 190.], "A"),
+                ([93., 178.], "2")
+            ]
+        );
+        assert!(text.iter().all(|text| text.base.flag & 0x0020 == 0));
+        let blocked = temp.path().join("strict.jww");
+        let report = export_fixture(
+            &source,
+            name,
+            &blocked,
+            ExportOptions {
+                strict_approximations: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.status, ExportStatus::Blocked);
+        assert!(!blocked.exists());
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|warning| warning.code == "upright_text_expanded")
+        );
+    }
 
     fn export_fixture(
         project: &ProjectSource,

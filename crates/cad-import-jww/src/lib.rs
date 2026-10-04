@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use ulid::Ulid;
 
+mod symbol;
+pub use symbol::{SymbolImportReport, prepare_symbol_import};
+
 const CAD_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 const IMPORT_EPSILON_MM: f64 = 0.001;
 const BLOCK_SCALE_EPSILON: f64 = 1.0e-12;
@@ -236,94 +239,15 @@ fn write_project(
     document: &JwwDocument,
     options: ImportOptions,
 ) -> ImportResult<ImportReport> {
-    let project_name = sanitize_name(
-        input_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("jww_import"),
-    );
-    let drawing_name = project_name.clone();
-    let mut converted =
+    let converted =
         convert_entities_with_mode(document, ConversionLimits::default(), options.block_mode)?;
-    if converted.entities.is_empty() {
-        return Err(ImportError::EmptyImport);
-    }
-    fs::create_dir_all(write_dir.join("rules")).map_err(|source| ImportError::Write {
-        path: write_dir.join("rules"),
-        source,
-    })?;
-    fs::create_dir_all(write_dir.join("drawings").join(&drawing_name)).map_err(|source| {
-        ImportError::Write {
-            path: write_dir.join("drawings").join(&drawing_name),
-            source,
-        }
-    })?;
-    fs::create_dir_all(write_dir.join("build")).map_err(|source| ImportError::Write {
-        path: write_dir.join("build"),
-        source,
-    })?;
-    if options.block_mode == BlockMode::Preserve && !converted.blocks.is_empty() {
-        fs::create_dir_all(write_dir.join("blocks")).map_err(|source| ImportError::Write {
-            path: write_dir.join("blocks"),
-            source,
-        })?;
-        for block in &converted.blocks {
-            let block_dir = write_dir.join("blocks").join(&block.id);
-            fs::create_dir_all(&block_dir).map_err(|source| ImportError::Write {
-                path: block_dir.clone(),
-                source,
-            })?;
-            write_text(
-                &block_dir.join("definition.toml"),
-                &format!(
-                    "schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = {:?}\nbase_point = [0.0, 0.0]\n",
-                    block.name
-                ),
-            )?;
-            write_text(
-                &block_dir.join("entities.ndjson"),
-                &(block.entities.join("\n") + "\n"),
-            )?;
-        }
-    }
-
-    let content_bbox = entity_extents(&converted.entities)?;
-    let origin = sheet_origin(content_bbox);
-    let paper = sheet_paper(document, &mut converted.warnings);
-    let orientation = sheet_orientation(content_bbox);
-    let (scale, scale_warning) = sheet_scale(document, &converted);
-    if let Some(warning) = scale_warning {
-        converted.warnings.push(warning);
-    }
-    write_text(
-        &write_dir.join("cad.project.toml"),
-        &format!("schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = \"{project_name}\"\n"),
-    )?;
-    write_text(
-        &write_dir.join("rules/layers.toml"),
-        &layers_toml(&converted, document),
-    )?;
-    write_text(
-        &write_dir.join("rules/styles.toml"),
-        &styles_toml(&converted),
-    )?;
-    write_text(
-        &write_dir
-            .join("drawings")
-            .join(&drawing_name)
-            .join("layouts.toml"),
-        &format!(
-            "schema_version = \"{CAD_SCHEMA_VERSION}\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"{paper}\"\norientation = \"{orientation}\"\nscale = \"{scale}\"\norigin = [{}, {}]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
-            format_mm(origin[0]),
-            format_mm(origin[1])
-        ),
-    )?;
-    write_text(
-        &write_dir
-            .join("drawings")
-            .join(&drawing_name)
-            .join("entities.ndjson"),
-        &(converted.entities.join("\n") + "\n"),
+    let (project_name, drawing_name, converted) = write_canonical_project(
+        input_path,
+        write_dir,
+        document,
+        converted,
+        options.block_mode,
+        1000.0,
     )?;
     let provenance = build_record_provenance(document, &converted, &drawing_name)?;
     write_jww_preservation(
@@ -360,6 +284,104 @@ fn write_project(
         &format!("{}\n", serde_json::to_string_pretty(&report)?),
     )?;
     Ok(report)
+}
+
+fn write_canonical_project(
+    input_path: &Path,
+    write_dir: &Path,
+    document: &JwwDocument,
+    mut converted: ConvertedProject,
+    block_mode: BlockMode,
+    sheet_margin_mm: f64,
+) -> ImportResult<(String, String, ConvertedProject)> {
+    let project_name = sanitize_name(
+        input_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("jww_import"),
+    );
+    let drawing_name = project_name.clone();
+    if converted.entities.is_empty() {
+        return Err(ImportError::EmptyImport);
+    }
+    fs::create_dir_all(write_dir.join("rules")).map_err(|source| ImportError::Write {
+        path: write_dir.join("rules"),
+        source,
+    })?;
+    fs::create_dir_all(write_dir.join("drawings").join(&drawing_name)).map_err(|source| {
+        ImportError::Write {
+            path: write_dir.join("drawings").join(&drawing_name),
+            source,
+        }
+    })?;
+    fs::create_dir_all(write_dir.join("build")).map_err(|source| ImportError::Write {
+        path: write_dir.join("build"),
+        source,
+    })?;
+    if block_mode == BlockMode::Preserve && !converted.blocks.is_empty() {
+        fs::create_dir_all(write_dir.join("blocks")).map_err(|source| ImportError::Write {
+            path: write_dir.join("blocks"),
+            source,
+        })?;
+        for block in &converted.blocks {
+            let block_dir = write_dir.join("blocks").join(&block.id);
+            fs::create_dir_all(&block_dir).map_err(|source| ImportError::Write {
+                path: block_dir.clone(),
+                source,
+            })?;
+            write_text(
+                &block_dir.join("definition.toml"),
+                &format!(
+                    "schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = {:?}\nbase_point = [0.0, 0.0]\n",
+                    block.name
+                ),
+            )?;
+            write_text(
+                &block_dir.join("entities.ndjson"),
+                &(block.entities.join("\n") + "\n"),
+            )?;
+        }
+    }
+
+    let content_bbox = entity_extents(&converted.entities)?;
+    let origin = sheet_origin(content_bbox, sheet_margin_mm);
+    let paper = sheet_paper(document, &mut converted.warnings);
+    let orientation = sheet_orientation(content_bbox);
+    let (scale, scale_warning) = sheet_scale(document, &converted);
+    if let Some(warning) = scale_warning {
+        converted.warnings.push(warning);
+    }
+    write_text(
+        &write_dir.join("cad.project.toml"),
+        &format!("schema_version = \"{CAD_SCHEMA_VERSION}\"\nname = \"{project_name}\"\n"),
+    )?;
+    write_text(
+        &write_dir.join("rules/layers.toml"),
+        &layers_toml(&converted, document),
+    )?;
+    write_text(
+        &write_dir.join("rules/styles.toml"),
+        &styles_toml(&converted),
+    )?;
+    write_text(
+        &write_dir
+            .join("drawings")
+            .join(&drawing_name)
+            .join("layouts.toml"),
+        &format!(
+            "schema_version = \"{CAD_SCHEMA_VERSION}\"\nactive_layout = \"default\"\n\n[layouts.default]\nname = \"default\"\npaper = \"{paper}\"\norientation = \"{orientation}\"\nscale = \"{scale}\"\norigin = [{}, {}]\nmargins = [0.0, 0.0, 0.0, 0.0]\n",
+            format_mm(origin[0]),
+            format_mm(origin[1])
+        ),
+    )?;
+    write_text(
+        &write_dir
+            .join("drawings")
+            .join(&drawing_name)
+            .join("entities.ndjson"),
+        &(converted.entities.join("\n") + "\n"),
+    )?;
+    Ok((project_name, drawing_name, converted))
 }
 
 fn write_read_only_project(
@@ -1567,6 +1589,9 @@ fn import_warning(code: &str, record_type: &str, base: EntityBase, message: &str
 }
 
 fn record_text_style(context: &mut ConversionContext<'_>, text: &Text) -> String {
+    if text.base.flag & 0x0020 != 0 {
+        context.warnings.push(import_warning("native_vertical_text_unmapped", "CDataMoji", text.base, "JWW vertical-glyph flag is retained in provenance but its font-dependent glyph orientation is not mapped to canonical upright columns; review and explicitly choose the canonical writing direction"));
+    }
     if !text.font_name.is_empty() && text.font_name != "Hiragino Sans" {
         let message = format!(
             "font {:?} is substituted with Hiragino Sans",
@@ -2207,11 +2232,11 @@ fn sheet_scale(
     }
 }
 
-fn sheet_origin(content_bbox: Option<cad_model::BBox>) -> [f64; 2] {
+fn sheet_origin(content_bbox: Option<cad_model::BBox>, margin: f64) -> [f64; 2] {
     let Some(bbox) = content_bbox else {
-        return [-1000.0, -1000.0];
+        return [-margin, -margin];
     };
-    [bbox.min[0] - 1000.0, bbox.min[1] - 1000.0]
+    [bbox.min[0] - margin, bbox.min[1] - margin]
 }
 
 fn entity_extents(entities: &[String]) -> ImportResult<Option<cad_model::BBox>> {
@@ -2776,6 +2801,22 @@ mod tests {
                 .iter()
                 .all(|warning| warning.record_type != "CDataBlock")
         );
+    }
+
+    #[test]
+    fn native_vertical_text_is_reported_instead_of_silently_claiming_glyph_compatibility() {
+        let mut text = test_text("室名", [0., 0.], 2.5);
+        text.base.flag |= 0x0020;
+        let document = test_document(vec![JwwEntity::Text(text)], vec![]);
+        let converted = convert_ok(&document);
+        assert_eq!(converted.entities.len(), 1);
+        assert!(
+            converted
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "native_vertical_text_unmapped")
+        );
+        assert_eq!(entity_values(&converted.entities)[0]["value"], "室名");
     }
 
     #[test]
@@ -3516,7 +3557,7 @@ dimension=0
         assert_eq!(sheet_orientation(Some(ellipse_bbox)), "portrait");
         assert!(arc_bbox.min[0].abs() < 1e-9);
         assert!((arc_bbox.max[1] - 100.0).abs() < 1e-9);
-        assert_eq!(sheet_origin(Some(circle_bbox)), [-6000.0, -6000.0]);
+        assert_eq!(sheet_origin(Some(circle_bbox), 1000.0), [-6000.0, -6000.0]);
     }
 
     #[test]

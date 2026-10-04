@@ -20,6 +20,7 @@ use ulid::Ulid;
 pub mod block_edit;
 mod geometry_edit;
 pub mod region_hatch;
+pub mod source_replacements;
 
 #[derive(Debug, Error)]
 pub enum EditError {
@@ -408,6 +409,7 @@ fn template_layouts(
                 origin: [0.0, 0.0],
                 margins: [10.0; 4],
                 plot_area: None,
+                viewports: vec![],
             },
         )]),
     }
@@ -639,6 +641,8 @@ pub enum EditOperation {
     },
     Rectangle {
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         p1: Point,
         p2: Point,
     },
@@ -695,6 +699,11 @@ pub enum EditOperation {
         center: Point,
         angle_deg: f64,
     },
+    Scale {
+        entity_ids: Vec<String>,
+        center: Point,
+        factor: f64,
+    },
     Mirror {
         entity_ids: Vec<String>,
         axis_start: Point,
@@ -717,6 +726,8 @@ pub enum EditOperation {
     InsertBlock {
         block: String,
         layer: String,
+        #[serde(default)]
+        pen: Option<String>,
         at: Point,
         rotation_deg: f64,
         scale: f64,
@@ -1695,6 +1706,14 @@ fn current_history_files(
         "rules/layers.toml".to_owned(),
         format!("drawings/{drawing}/layouts.toml"),
     ];
+    // Project-scoped history can restore styles, metadata, and other drawings.
+    // Include every current canonical file in the optimistic restore context.
+    paths.extend(
+        cad_model::source_manifest(project_path)
+            .map_err(|error| EditError::InvalidEntity(error.to_string()))?
+            .into_iter()
+            .map(|file| file.relative_path),
+    );
     let blocks_dir = project_path.join("blocks");
     if blocks_dir.exists() {
         let mut block_dirs = fs::read_dir(&blocks_dir)
@@ -1712,6 +1731,8 @@ fn current_history_files(
             paths.push(format!("blocks/{id}/entities.ndjson"));
         }
     }
+    paths.sort();
+    paths.dedup();
     paths
         .into_iter()
         .map(|relative_path| {
@@ -2516,6 +2537,7 @@ fn apply_operation(
         EditOperation::InsertBlock {
             block,
             layer,
+            pen,
             at,
             rotation_deg,
             scale,
@@ -2544,6 +2566,7 @@ fn apply_operation(
                 "id": id,
                 "type": "block_ref",
                 "layer": layer,
+                "pen": pen,
                 "block": block,
                 "at": at,
                 "rotation_deg": rotation_deg,
@@ -2687,6 +2710,26 @@ fn apply_operation(
                 entity_ids,
                 |entity| rotate_entity(entity, *center, *angle_deg),
                 "rotate",
+            )
+        }
+        EditOperation::Scale {
+            entity_ids,
+            center,
+            factor,
+        } => {
+            ensure_unique_entity_ids(entity_ids)?;
+            if !center.iter().all(|v| v.is_finite()) || !factor.is_finite() || *factor <= 0.0 {
+                return Err(EditError::InvalidEntity(
+                    "scale center must be finite and factor positive".into(),
+                ));
+            }
+            transform_entities(
+                project,
+                entities,
+                raw_lines,
+                entity_ids,
+                |entity| scale_entity(entity, *center, *factor),
+                "scale",
             )
         }
         EditOperation::Mirror {
@@ -2916,7 +2959,13 @@ fn transform_json_points(value: &mut Value, transform: &impl Fn(Point) -> Point)
     }
 }
 
-fn rotate_entity(entity: &Entity, center: Point, angle_deg: f64) -> EditResult<Entity> {
+/// Rotate model geometry and its world-space orientation, preserving IDs/styles.
+pub fn rotate_entity(entity: &Entity, center: Point, angle_deg: f64) -> EditResult<Entity> {
+    if !center.iter().all(|v| v.is_finite()) || !angle_deg.is_finite() {
+        return Err(EditError::InvalidEntity(
+            "rotation requires finite coordinates and angle".into(),
+        ));
+    }
     let angle = angle_deg.to_radians();
     let (sin, cos) = angle.sin_cos();
     let mut value = serde_json::to_value(entity)
@@ -2927,10 +2976,27 @@ fn rotate_entity(entity: &Entity, center: Point, angle_deg: f64) -> EditResult<E
         [center[0] + x * cos - y * sin, center[1] + x * sin + y * cos]
     });
     if let Some(object) = value.as_object_mut() {
+        if let Some(measurement) = object.get_mut("measurement").and_then(Value::as_object_mut)
+            && let Some(kind) = measurement.get("kind").and_then(Value::as_str)
+            && matches!(kind, "horizontal" | "vertical")
+        {
+            let turn = angle_deg.rem_euclid(180.);
+            if (turn - 90.).abs() < 1e-9 {
+                let swapped = if kind == "horizontal" {
+                    "vertical"
+                } else {
+                    "horizontal"
+                };
+                measurement.insert("kind".into(), Value::from(swapped));
+            } else if turn.min(180. - turn) >= 1e-9 {
+                return Err(EditError::InvalidEntity("Projected horizontal/vertical dimensions require rotation in multiples of 90 degrees".into()));
+            }
+        }
         // Circular arc angles are in world space; ellipse/curve-solid angles
         // are local parameters and rotate together with their axis.
         let fields: &[&str] = match entity {
             Entity::Arc { .. } => &["start_deg", "end_deg"],
+            Entity::Hatch { .. } => &["angle_deg"],
             _ => &["rotation_deg", "text_rotation_deg"],
         };
         for &key in fields {
@@ -2940,6 +3006,43 @@ fn rotate_entity(entity: &Entity, center: Point, angle_deg: f64) -> EditResult<E
         }
     }
     serde_json::from_value(value).map_err(|error| EditError::InvalidEntity(error.to_string()))
+}
+
+/// Uniform positive model scaling; shared paper-unit styles remain unchanged.
+pub fn scale_entity(entity: &Entity, center: Point, factor: f64) -> EditResult<Entity> {
+    if !center.iter().all(|v| v.is_finite()) || !factor.is_finite() || factor <= 0. {
+        return Err(EditError::InvalidEntity(
+            "scale requires finite coordinates and a positive factor".into(),
+        ));
+    }
+    let mut value =
+        serde_json::to_value(entity).map_err(|e| EditError::InvalidEntity(e.to_string()))?;
+    transform_json_points(&mut value, &|point| {
+        [
+            center[0] + (point[0] - center[0]) * factor,
+            center[1] + (point[1] - center[1]) * factor,
+        ]
+    });
+    // These are geometry lengths or per-entity multipliers. Shared paper-unit
+    // text, dimension and line styles stay unchanged, as do IDs and references.
+    let fields: &[&str] = match entity {
+        Entity::Circle { .. } | Entity::Arc { .. } => &["radius"],
+        Entity::Ellipse { .. } => &["radius_x", "radius_y"],
+        Entity::CurveSolid { .. } => &["radius", "solid_param"],
+        Entity::Dimension { .. } => &["offset"],
+        Entity::BlockRef { .. } | Entity::Point { .. } | Entity::Hatch { .. } => &["scale"],
+        Entity::Line { .. }
+        | Entity::Polyline { .. }
+        | Entity::Text { .. }
+        | Entity::Solid { .. } => &[],
+    };
+    for field in fields {
+        let old = value[field].as_f64().ok_or_else(|| {
+            EditError::InvalidEntity(format!("scale field {field} is not numeric"))
+        })?;
+        value[field] = Value::from(old * factor);
+    }
+    serde_json::from_value(value).map_err(|e| EditError::InvalidEntity(e.to_string()))
 }
 
 fn mirror_entity(entity: &Entity, axis_start: Point, axis_end: Point) -> EditResult<Entity> {
@@ -6327,6 +6430,7 @@ mod tests {
             temp.path(),
             EditOperation::Rectangle {
                 layer: "0-1".into(),
+                pen: None,
                 p1: [0., 0.],
                 p2: [100., 200.],
             },
@@ -6336,6 +6440,84 @@ mod tests {
             project.drawings[0].entities.last().unwrap().entity,
             Entity::Polyline { closed: true, .. }
         ));
+    }
+
+    #[test]
+    fn rectangle_pen_is_preserved_checked_and_undoable() {
+        let temp = test_project(false);
+        let mut source = cad_model::load_project(temp.path()).unwrap();
+        source.styles.pens.insert(
+            "picked".into(),
+            cad_model::PenStyleDef {
+                color: source.styles.colors.keys().next().unwrap().clone(),
+                line_type: source.styles.line_types.keys().next().unwrap().clone(),
+                line_width: 0.4,
+            },
+        );
+        fs::write(
+            temp.path().join("rules/styles.toml"),
+            toml::to_string(&source.styles).unwrap(),
+        )
+        .unwrap();
+        assert!(cad_check::check_project(temp.path()).is_ok());
+        let path = entities_path(temp.path(), "plan");
+        let before = fs::read(&path).unwrap();
+        let legacy: EditOperation = serde_json::from_value(
+            serde_json::json!({"kind":"rectangle","layer":"0-1","p1":[0,0],"p2":[10,20]}),
+        )
+        .unwrap();
+        assert!(matches!(legacy, EditOperation::Rectangle { pen: None, .. }));
+        let revision = editor_state(&cad_model::load_project(temp.path()).unwrap(), "plan")
+            .unwrap()
+            .revision;
+        let request = DrawingEditRequest {
+            drawing: "plan".into(),
+            expected_revision: revision,
+            operation: EditOperation::Rectangle {
+                layer: "0-1".into(),
+                pen: Some("picked".into()),
+                p1: [0., 0.],
+                p2: [10., 20.],
+            },
+        };
+        preview_edit(temp.path(), &request).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let applied = apply_edit(temp.path(), &request).unwrap();
+        let current = cad_model::load_project(temp.path()).unwrap();
+        assert_eq!(
+            current.drawings[0].entities.last().unwrap().entity.pen(),
+            Some("picked")
+        );
+        assert!(cad_check::check_project(temp.path()).is_ok());
+        let saved = fs::read(&path).unwrap();
+        assert!(
+            apply_edit(
+                temp.path(),
+                &DrawingEditRequest {
+                    expected_revision: applied.revision,
+                    operation: EditOperation::Rectangle {
+                        layer: "0-1".into(),
+                        pen: Some("missing".into()),
+                        p1: [20., 0.],
+                        p2: [30., 20.]
+                    },
+                    ..request
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        undo_drawing_edit(
+            temp.path(),
+            &DrawingHistoryRequest {
+                drawing: "plan".into(),
+                expected_files: list_drawing_history(temp.path(), "plan")
+                    .unwrap()
+                    .current_files,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -6384,6 +6566,14 @@ mod tests {
     fn stretch_bounds_compose_nested_rotations_and_text_layout_extent() {
         let temp = test_project(false);
         let mut project = cad_model::load_project(temp.path()).unwrap();
+        project.styles.pens.insert(
+            "picked".into(),
+            cad_model::PenStyleDef {
+                color: project.styles.colors.keys().next().unwrap().clone(),
+                line_type: project.styles.line_types.keys().next().unwrap().clone(),
+                line_width: 0.25,
+            },
+        );
         let line = project.drawings[0].entities[0].entity.clone();
         let block = |name: &str, entity: Entity| cad_model::BlockDefinition {
             id: name.into(),
@@ -6401,6 +6591,7 @@ mod tests {
             &EditOperation::InsertBlock {
                 block: "inner".into(),
                 layer: "0-1".into(),
+                pen: Some("picked".into()),
                 at: [0., 0.],
                 rotation_deg: 0.,
                 scale: 1.,
@@ -6413,6 +6604,7 @@ mod tests {
             &mut raw,
         )
         .unwrap();
+        assert_eq!(inserted[0].pen(), Some("picked"));
         assert!(matches!(
             inserted[0],
             Entity::BlockRef {
@@ -6721,6 +6913,185 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn uniform_scaling_preserves_shape_parameters_styles_and_reference_ids() {
+        use serde_json::json;
+        let cases = [
+            json!({"type":"line","p1":[11,22],"p2":[13,24]}),
+            json!({"type":"polyline","points":[[11,22],[13,24]],"closed":false}),
+            json!({"type":"circle","center":[11,22],"radius":5}),
+            json!({"type":"arc","center":[11,22],"radius":5,"start_deg":10,"end_deg":180}),
+            json!({"type":"ellipse","center":[11,22],"radius_x":5,"radius_y":2,"rotation_deg":30,"start_deg":0,"end_deg":360}),
+            json!({"type":"curve_solid","center":[11,22],"radius":5,"solid_param":2,"flatness":0.5,"rotation_deg":30,"start_deg":0,"end_deg":360,"encoding_code":1,"fill":"black"}),
+            json!({"type":"text","at":[11,22],"rotation_deg":30,"style":"note","value":"manual 123"}),
+            json!({"type":"point","at":[11,22],"rotation_deg":30,"scale":1.5}),
+            json!({"type":"block_ref","at":[11,22],"rotation_deg":30,"scale":1.5,"mirror_x":true,"block":"door"}),
+            json!({"type":"solid","points":[[11,22],[13,24],[14,22]],"fill":"black"}),
+            json!({"type":"hatch","loops":[[[11,22],[13,24],[14,22]]],"pattern":"solid","scale":1.5,"angle_deg":30}),
+            json!({"type":"dimension","p1":[11,22],"p2":[13,22],"offset":-4,"style":"dim","value":null,"measurement":{"kind":"aligned","first":{"kind":"entity","entity_id":"ent_01JZ0000000000000000000001","feature":"start"},"second":{"kind":"fixed","point":[13,22]}}}),
+        ];
+        for mut source in cases {
+            source["schema_version"] = json!(cad_model::CURRENT_SCHEMA_VERSION);
+            source["id"] = json!("ent_01JZ0000000000000000000000");
+            source["layer"] = json!("0-1");
+            let entity: Entity = serde_json::from_value(source).unwrap();
+            let original = serde_json::to_value(&entity).unwrap();
+            let result = scale_entity(&entity, [10., 20.], 2.).unwrap();
+            validate_entity_geometry(&result).unwrap();
+            let scaled = serde_json::to_value(&result).unwrap();
+            let coordinate = match entity {
+                Entity::Line { .. } | Entity::Dimension { .. } => &scaled["p1"],
+                Entity::Polyline { .. } | Entity::Solid { .. } => &scaled["points"][0],
+                Entity::Hatch { .. } => &scaled["loops"][0][0],
+                Entity::Text { .. } | Entity::Point { .. } | Entity::BlockRef { .. } => {
+                    &scaled["at"]
+                }
+                _ => &scaled["center"],
+            };
+            assert_eq!(coordinate, &json!([12., 24.]));
+            for field in [
+                "type",
+                "id",
+                "layer",
+                "pen",
+                "style",
+                "fill",
+                "block",
+                "rotation_deg",
+                "start_deg",
+                "end_deg",
+                "flatness",
+                "encoding_code",
+                "value",
+                "mirror_x",
+                "angle_deg",
+            ] {
+                assert_eq!(scaled[field], original[field], "field {field}");
+            }
+            for field in [
+                "radius",
+                "radius_x",
+                "radius_y",
+                "solid_param",
+                "scale",
+                "offset",
+            ] {
+                if let Some(value) = original[field].as_f64() {
+                    assert_eq!(scaled[field].as_f64(), Some(value * 2.));
+                }
+            }
+            if matches!(entity, Entity::Dimension { .. }) {
+                assert_eq!(
+                    scaled["measurement"]["first"],
+                    original["measurement"]["first"]
+                );
+                assert_eq!(scaled["measurement"]["second"]["point"], json!([16., 24.]));
+            }
+            let restored = scale_entity(&result, [10., 20.], 0.5).unwrap();
+            assert_eq!(restored, entity);
+        }
+    }
+
+    #[test]
+    fn scaling_preview_undo_and_invalid_batches_preserve_source_bytes() {
+        let temp = test_project(false);
+        let path = entities_path(temp.path(), "plan");
+        let before = fs::read(&path).unwrap();
+        let revision = editor_state(&cad_model::load_project(temp.path()).unwrap(), "plan")
+            .unwrap()
+            .revision;
+        let request = DrawingEditRequest {
+            drawing: "plan".into(),
+            expected_revision: revision.clone(),
+            operation: EditOperation::Scale {
+                entity_ids: vec!["ent_01JZ0000000000000000000000".into()],
+                center: [1., 1.],
+                factor: 2.,
+            },
+        };
+        let preview = preview_edit(temp.path(), &request).unwrap();
+        assert_eq!(preview.entities[0]["p2"], serde_json::json!([19., -1.]));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let scaled = apply_edit(temp.path(), &request).unwrap();
+        assert_eq!(scaled.operation, "scale");
+        assert!(cad_check::check_project(temp.path()).is_ok());
+        let history = list_drawing_history(temp.path(), "plan").unwrap();
+        undo_drawing_edit(
+            temp.path(),
+            &DrawingHistoryRequest {
+                drawing: "plan".into(),
+                expected_files: history.current_files,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let history = list_drawing_history(temp.path(), "plan").unwrap();
+        redo_drawing_edit(
+            temp.path(),
+            &DrawingHistoryRequest {
+                drawing: "plan".into(),
+                expected_files: history.current_files,
+            },
+        )
+        .unwrap();
+        let after = fs::read(&path).unwrap();
+        for factor in [0., -1., f64::INFINITY, f64::MAX] {
+            let revision = editor_state(&cad_model::load_project(temp.path()).unwrap(), "plan")
+                .unwrap()
+                .revision;
+            let request = DrawingEditRequest {
+                drawing: "plan".into(),
+                expected_revision: revision,
+                operation: EditOperation::Scale {
+                    entity_ids: vec!["ent_01JZ0000000000000000000000".into()],
+                    center: [0., 0.],
+                    factor,
+                },
+            };
+            assert!(apply_edit(temp.path(), &request).is_err());
+            assert_eq!(fs::read(&path).unwrap(), after);
+        }
+        let revision = editor_state(&cad_model::load_project(temp.path()).unwrap(), "plan")
+            .unwrap()
+            .revision;
+        let invalid_batch = DrawingEditRequest {
+            drawing: "plan".into(),
+            expected_revision: revision,
+            operation: EditOperation::Batch {
+                operations: vec![
+                    request.operation.clone(),
+                    EditOperation::Scale {
+                        entity_ids: vec!["ent_01JZ0000000000000000000000".into()],
+                        center: [0., 0.],
+                        factor: 0.,
+                    },
+                ],
+            },
+        };
+        assert!(apply_edit(temp.path(), &invalid_batch).is_err());
+        assert_eq!(fs::read(&path).unwrap(), after);
+        let locked = test_project(true);
+        let original = fs::read(entities_path(locked.path(), "plan")).unwrap();
+        let revision = editor_state(&cad_model::load_project(locked.path()).unwrap(), "plan")
+            .unwrap()
+            .revision;
+        assert!(
+            apply_edit(
+                locked.path(),
+                &DrawingEditRequest {
+                    drawing: "plan".into(),
+                    expected_revision: revision,
+                    operation: request.operation.clone()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(entities_path(locked.path(), "plan")).unwrap(),
+            original
+        );
     }
 
     #[test]

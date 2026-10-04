@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Building tools</title></head>
+<body><main style="padding: 24px"><h1>Building tools</h1><div id="controls"></div><output id="result" aria-live="polite" style="overflow-wrap:anywhere">Choose a tool.</output></main>
+<script type="module">
+import { render, h } from "preact";
+import { ToolkitPanel } from "/src/toolkit-panel.tsx";
+import "/src/styles.css";
+let previewReady = false;
+let generated;
+let analysisReport = null;
+const mount = () => render(h(ToolkitPanel, {
+  selected: location.search.includes("tangent") ? ["horizontal-line", "vertical-line"] : location.search.includes("massing") ? ["footprint"] : [], pens: ["outline"], textStyles: ["note"], disabled: false, previewReady,
+  analysisReport,
+  onSaveReport: async (path, report) => { if (!path) return false; document.querySelector("#result").textContent=JSON.stringify({path,report}); return true; },
+  onGenerate: async (geometry, pen) => { generated = { geometry, pen }; if(["massing_projection","sun_shadow","sky_view"].includes(geometry.type)) analysisReport={schema_version:"cad-massing-review/1",drawing_revision:"source-revision",analysis:{conditions:geometry}}; previewReady = true; mount(); return []; },
+  onApply: () => { document.querySelector("#result").textContent = JSON.stringify(generated); previewReady = false; mount(); },
+  onCancel: () => { previewReady = false; mount(); },
+  onMeasure: async options => ({ total_length_mm: 12000, total_area_mm2: options.areaMode === "union" ? 1500000 : 2000000, additive_area_mm2: 2000000, area_mode: options.areaMode, curve_tolerance_mm: options.areaMode === "union" ? options.curveToleranceMm : null, area_approximation_error_estimate_mm2: 0.5, supported_leaf_count: 3, unsupported_count: 1, measurements: [] }),
+}), document.querySelector("#controls"));
+mount();
+document.querySelector("details").open = true;
+if (location.search.includes("tangent")) {
+  const tool = document.querySelector("select[aria-label='Building tool']");
+  tool.value = "tangent_circle";
+  tool.dispatchEvent(new Event("change", { bubbles: true }));
+}
+if (location.search.includes("calculated")) {
+  const tool = document.querySelector("select[aria-label='Building tool']");
+  tool.value = "calculated_text";
+  tool.dispatchEvent(new Event("change", { bubbles: true }));
+}
+if (location.search.includes("union")) {
+  const mode = document.querySelector("select[aria-label='Area calculation']");
+  mode.value = "union";
+  mode.dispatchEvent(new Event("change", { bubbles: true }));
+  setTimeout(() => document.querySelector(".toolkit-actions button:last-child").click(), 0);
+}
+if (location.search.includes("massing_loaded")) {
+  const tool=document.querySelector("select[aria-label='Building tool']");
+  tool.value="sky_view";tool.dispatchEvent(new Event("change",{bubbles:true}));
+  setTimeout(()=>{
+    const observer=document.querySelector("input[aria-label='Observer east,north']");
+    observer.value="-5000,-5000";observer.dispatchEvent(new Event("input",{bubbles:true}));
+    setTimeout(()=>document.querySelector(".toolkit-panel button[type='submit']").click(),0);
+  },0);
+}
+</script></body></html>

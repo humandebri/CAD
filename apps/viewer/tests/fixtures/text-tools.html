@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Annotation text edits</title></head><body><main style="padding:24px"><h1>Annotation text edits</h1><button id="refresh" type="button">Refresh sources</button><div id="panel"></div><output id="result" aria-live="polite" style="overflow-wrap:anywhere">Source unchanged.</output></main><script type="module">
+import {render,h} from 'preact';
+import {TextToolsPanel} from '/src/text-tools-panel.tsx';
+import '/src/styles.css';
+let ready=false, revision='current', request, selected=location.search.includes('empty') ? [] : ['text-wall'];
+const entities=[{schema_version:'0.3',id:'text-wall',type:'text',layer:'0-1',style:'note',value:'既存壁と既存壁'},{schema_version:'0.3',id:'text-door',type:'text',layer:'0-2',style:'note',value:'既存建具'},{schema_version:'0.3',id:'dimension',type:'dimension',layer:'0-1',style:'dim',value:'既存寸法'}];
+const mount=()=>render(h(TextToolsPanel,{entities,styles:['note','title'],selected,sourceRevision:revision,disabled:false,previewReady:ready,onGenerate:async input=>{
+  if(location.search.includes('failure'))throw new Error('revision_conflict: source changed before generation');
+  if(location.search.includes('slow'))await new Promise(resolve=>setTimeout(resolve,250));
+  request=input;return {operation:{kind:'batch',operations:[]},warnings:[]};
+},onPreview:()=>{ready=true;mount();},onApply:()=>{document.querySelector('#result').textContent=JSON.stringify(request);ready=false;mount();},onCancel:()=>{ready=false;mount();},onSelect:id=>{selected=[id];mount();document.querySelector('#result').textContent='Selection: '+id;}}),document.querySelector('#panel'));
+mount(); document.querySelector('details').open=true;
+document.querySelector('#refresh').onclick=()=>{revision+='-new';mount();};
+if(location.search.includes('ready')) {
+  const find=document.querySelector('input[aria-label="Find annotation text"]');
+  find.value='既存';find.dispatchEvent(new Event('input',{bubbles:true}));
+  const replacement=document.querySelector('textarea[aria-label="Replacement text"]');
+  replacement.value='改修';replacement.dispatchEvent(new Event('input',{bubbles:true}));
+  setTimeout(()=>Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Preview text replacement').click(),0);
+}
+</script></body></html>

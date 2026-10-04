@@ -1,0 +1,6 @@
+interface:
+  display_name: "CAD図面・Git差分レビュー"
+  short_description: "CAD図面をGitの版と比較し、寸法・設定・印刷・JWW互換性の影響を確認する"
+  default_prompt: "$cad-review を使い、対象CADプロジェクトのHEADと作業中の図面を比較してください。"
+policy:
+  allow_implicit_invocation: true

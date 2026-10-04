@@ -1,0 +1,9 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Scale drawing selection</title></head><body><main style="padding:24px"><h1>Scale drawing selection</h1><div id="panel"></div><output id="result" aria-live="polite" style="overflow-wrap:anywhere">Selection unchanged.</output></main><script type="module">
+import {render,h} from 'preact';
+import {DraftingPanel,initialDraftingOptions,retuneDraftOperation} from '/src/drafting-panel.tsx';
+import '/src/styles.css';
+let options={...initialDraftingOptions,scale:'2'};
+const original={kind:'scale',entity_ids:['ent_01JZ0000000000000000000000'],center:[20000,20000],factor:2};
+const mount=()=>render(h(DraftingPanel,{command:'scale',options,artifacts:{},message:'Base point: 20000,20000. Review the scale before applying.',busy:false,invalid:!retuneDraftOperation(original,options),onChange:updated=>{options=updated;mount();},onApply:()=>{document.querySelector('#result').textContent=JSON.stringify(retuneDraftOperation(original,options));},onCancel:()=>{document.querySelector('#result').textContent='Cancelled; selection unchanged.';}}),document.querySelector('#panel'));
+mount();
+</script></body></html>

@@ -1,0 +1,13 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scaled sheet</title></head><body><main style="padding:24px"><h1>Scaled sheet</h1><div id="controls"></div><output id="result" style="overflow-wrap:anywhere">No changes.</output></main>
+<script type="module">
+import {render,h} from "preact";
+import {SheetViewportsPanel} from "/src/sheet-viewports-panel.tsx";
+import "/src/styles.css";
+render(h(SheetViewportsPanel,{
+  layout:{id:"default",paper:"A3",orientation:"landscape",scale:"1/100",origin:[0,0],margins:[0,0,0,0],active:true,revision:"source",viewports:location.search.includes("loaded")?[{name:"Plan",drawing:"plan",origin:[0,0],at_mm:[10,10],size_mm:[100,100],scale:"1/100",layers:[]},{name:"Detail",drawing:"detail",origin:[0,0],at_mm:[150,10],size_mm:[100,100],scale:"1/20",layers:[]}]:[]},drawing:"plan",drawings:["plan","detail"],layers:["walls","notes"],disabled:false,
+  onPreview:async views=>({report:{plan_hash:"reviewed-source",warnings:["Source geometry is unchanged."],views},svg:`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 297"><defs><clipPath id="viewclip"><rect x="10" y="10" width="100" height="100"/></clipPath></defs><g clip-path="url(#viewclip)"><path d="M 0 0 L 500 297" stroke="black"/></g><image href="https://example.invalid/image.png" onerror="window.sheetHacked=true"/><script>window.sheetHacked=true<\/script></svg>`}),
+  onApply:async(views,hash)=>{if(location.search.includes("stale"))throw new Error("Sheet source changed; review again");document.querySelector("#result").textContent=JSON.stringify({views,hash});},
+}),document.querySelector("#controls"));
+document.querySelector("details").open=true;
+if(location.search.includes("loaded"))setTimeout(()=>document.querySelector(".sheet-viewports-panel > fieldset > button:last-child").click(),0);
+</script></body></html>

@@ -1,0 +1,24 @@
+[package]
+name = "cad-toolkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-model.workspace = true
+cad-edit.workspace = true
+cad-check.workspace = true
+cad-diff.workspace = true
+cad-import-jww.workspace = true
+cad-render-svg.workspace = true
+blake3.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+geo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+cad-jww-codec.workspace = true

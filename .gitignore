@@ -16,6 +16,7 @@ apps/viewer/src-tauri/gen/
 *.pending-snap
 *.log
 .playwright-cli/
+/apps/viewer/.vlmkit/
 !apps/viewer/src-tauri/icons/
 !apps/viewer/src-tauri/icons/icon.svg
 !apps/viewer/src-tauri/icons/icon.png

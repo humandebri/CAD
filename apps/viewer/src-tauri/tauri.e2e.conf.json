@@ -1,6 +1,15 @@
 {
   "app": {
     "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "CAD Review",
+        "width": 980,
+        "height": 700,
+        "minWidth": 980,
+        "minHeight": 700
+      }
+    ],
     "security": {
       "capabilities": [
         {

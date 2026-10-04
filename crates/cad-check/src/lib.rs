@@ -256,6 +256,13 @@ fn jww_v600_diagnostics(
         });
         return diagnostics;
     };
+    if drawing
+        .layouts
+        .active()
+        .is_some_and(|layout| !layout.viewports.is_empty())
+    {
+        push_jww_diagnostic(&mut diagnostics,Severity::Error,&format!("drawings/{}/layouts.toml",drawing.name),None,Some("layouts.active.viewports".into()),"jww.sheet_viewports_unsupported","Sheet viewport clipping and placement have no validated JWW mapping; export SVG/PDF or select a model layout".into());
+    }
 
     if project.layers.groups.len() > 16 {
         push_jww_diagnostic(
@@ -440,8 +447,18 @@ fn check_jww_entity(
             value,
             style,
             mirror_y,
+            writing_mode,
             ..
         } => {
+            if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                push_jww_entity_warning(
+                    diagnostics,
+                    file,
+                    record,
+                    "jww.upright_text_expanded",
+                    "upright annotation columns expand to positioned single-character records; native vertical text semantics are not preserved",
+                );
+            }
             if *mirror_y {
                 push_jww_entity_warning(
                     diagnostics,
@@ -871,6 +888,16 @@ impl<'a> Checker<'a> {
                 );
             }
             for (layout_id, layout) in &drawing.layouts.layouts {
+                if !layout.viewports.is_empty()
+                    && let Err(message) = cad_model::validate_layout_viewports(self.project, layout)
+                {
+                    self.push_diagnostic(
+                        &layouts_file,
+                        "layout.invalid_viewports",
+                        Some(format!("layouts.{layout_id}.viewports")),
+                        message,
+                    );
+                }
                 if !matches!(layout.paper.as_str(), "A0" | "A1" | "A2" | "A3" | "A4") {
                     self.push_diagnostic(
                         &layouts_file,
@@ -1026,7 +1053,42 @@ impl<'a> Checker<'a> {
         }
 
         match &record.entity {
-            Entity::Text { style, .. } => {
+            Entity::Text {
+                style,
+                writing_mode,
+                value,
+                at,
+                rotation_deg,
+                mirror_y,
+                ..
+            } => {
+                if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                    if value
+                        .chars()
+                        .any(|character| character.is_control() && character != '\n')
+                    {
+                        self.push_entity(
+                            file,
+                            record,
+                            "text.invalid_upright_control",
+                            Some("value"),
+                            "upright text supports LF columns but no other control characters"
+                                .into(),
+                        );
+                    }
+                    if let Some(style) = self.project.styles.text_styles.get(style)
+                        && cad_model::upright_text_bbox(*at, *rotation_deg, *mirror_y, value, style)
+                            .is_none()
+                    {
+                        self.push_entity(
+                            file,
+                            record,
+                            "text.invalid_upright_extent",
+                            Some("value"),
+                            "upright text layout has non-finite coordinates".into(),
+                        );
+                    }
+                }
                 if !self.project.styles.text_styles.contains_key(style) {
                     self.push_entity(
                         file,

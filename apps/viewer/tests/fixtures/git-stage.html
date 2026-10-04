@@ -1,0 +1,9 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Selective staging</title></head><body><main style="padding:24px"><h1>CAD staging</h1><div id="panel"></div><output id="result" aria-live="polite">Index preserved.</output></main><script type="module">
+import {render,h} from 'preact';
+import {GitStagePanel} from '/src/git-stage-panel.tsx';
+import '/src/styles.css';
+const blocked=new URLSearchParams(location.search).has('blocked');
+render(h(GitStagePanel,{selected:['ent_wall'],disabled:false,onPreview:async()=>({svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60"><path d="M10 20h80" stroke="red"/><path d="M10 30h80" stroke="green"/><script>window.compromised=true<\/script></svg>',report:{plan_hash:'reviewed-123',expanded_ids:['ent_wall','ent_dimension'],changed_files:['drawings/plan/entities.ndjson'],cad_check:{status:blocked?'error':'ok',diagnostics:blocked?[{message:'Dimension target is missing.'}]:[]},diff:{changes:[{drawing:'plan',entity_id:'ent_wall',kind:'modified'}],configuration_changes:[]}}}),onApply:async(hash)=>{document.querySelector('#result').textContent=`Staged ${hash}`;}}),document.querySelector('#panel'));
+document.querySelector('details').open=true;
+if(new URLSearchParams(location.search).has('ready')) document.querySelector('details > button').click();
+</script></body></html>

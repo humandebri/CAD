@@ -18,6 +18,7 @@ export function createDesktopComment(
   request: {
     drawing: string;
     expected_revision: string;
+    expected_drawing_revision?: string;
     entity_id: string;
     anchor: { x: number; y: number };
     text: string;

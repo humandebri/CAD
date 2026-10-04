@@ -46,6 +46,15 @@ export type DiffReport = {
   }>;
 };
 
+export type GitSnapshotIdentity = {
+  revision: string;
+  commit_oid: string | null;
+  source_manifest: Array<{ relative_path: string; revision: string; exists: boolean }>;
+  snapshot_blake3: string;
+};
+
+export type GitComparisonIdentity = { base: GitSnapshotIdentity; head: GitSnapshotIdentity };
+
 export type CommentRecord = {
   id: string;
   drawing: string;
@@ -53,9 +62,12 @@ export type CommentRecord = {
   entity_ids: string[];
   text: string;
   status: string;
+  binding?: {schema_version:string;drawing:string;source_blake3:string;entity_blake3:string;git_commit:string|null;entity:unknown} | null;
+  binding_state?: "unbound" | "current" | "entity_changed" | "entity_deleted" | "entity_moved" | "source_changed" | "invalid";
 };
 
 export type Artifacts = {
+  comparison?: GitComparisonIdentity;
   sheetSvg: string;
   diffSvg: string;
   check: CheckReport;
@@ -86,6 +98,7 @@ export type LayoutWorkspaceState = {
   origin: [number, number];
   margins: [number, number, number, number];
   plot_area?: [number, number, number, number] | null;
+  viewports?: Array<{ name:string;drawing:string;origin:[number,number];at_mm:[number,number];size_mm:[number,number];scale:string;layers?:string[] }>;
   active: boolean;
   revision: string;
 };
@@ -113,7 +126,7 @@ export type EditOperation =
   | { kind: "resolve_dimensions"; operation: EditOperation; resolutions: Array<{ entity_id: string; action: "delete" | "detach" }> }
   | { kind: "endpoint"; entity_id: string; vertex_index: number; to: [number, number] }
   | { kind: "stretch"; entity_ids: string[]; min: [number, number]; max: [number, number]; delta: [number, number] }
-  | { kind: "rectangle"; layer: string; p1: [number, number]; p2: [number, number] }
+  | { kind: "rectangle"; layer: string; pen?: string | null; p1: [number, number]; p2: [number, number] }
   | { kind: "rectangular_array"; entity_ids: string[]; rows: number; columns: number; row_spacing: number; column_spacing: number }
   | { kind: "fillet"; first_entity_id: string; second_entity_id: string; first_pick: [number, number]; second_pick: [number, number]; radius: number }
   | { kind: "chamfer"; first_entity_id: string; second_entity_id: string; first_pick: [number, number]; second_pick: [number, number]; first_distance: number; second_distance: number }
@@ -125,12 +138,14 @@ export type EditOperation =
   | { kind: "translate_many"; entity_ids: string[]; delta: [number, number]; duplicate: boolean }
   | { kind: "delete_many"; entity_ids: string[] }
   | { kind: "rotate"; entity_ids: string[]; center: [number, number]; angle_deg: number }
+  | { kind: "scale"; entity_ids: string[]; center: [number, number]; factor: number }
   | { kind: "mirror"; entity_ids: string[]; axis_start: [number, number]; axis_end: [number, number] }
   | { kind: "offset"; entity_ids: string[]; distance: number }
   | { kind: "trim"; target_entity_id: string; cutter_entity_id: string; pick_point: [number, number] }
   | { kind: "extend"; target_entity_id: string; boundary_entity_id: string; pick_point: [number, number] }
   | {
       kind: "insert_block";
+      pen?: string | null;
       block: string;
       layer: string;
       at: [number, number];
@@ -358,6 +373,7 @@ export type AiContextState = {
 };
 
 export type DesktopReviewArtifacts = {
+  comparison?: GitComparisonIdentity | null;
   project_name: string;
   drawing_names: string[];
   current_drawing: string;

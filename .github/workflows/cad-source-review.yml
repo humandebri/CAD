@@ -1,0 +1,49 @@
+name: CAD source review
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Existing canonical CAD project directory
+        required: true
+        default: examples/cad-acceptance
+        type: string
+      base:
+        description: Base commit/ref containing the project
+        required: true
+        default: HEAD~1
+        type: string
+      head:
+        description: Head commit/ref containing the project
+        required: true
+        default: HEAD
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cad-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Check CAD sources and generate review artifacts
+        run: bash scripts/cad-review-ci.sh
+        env:
+          CAD_REVIEW_PROJECT: ${{ inputs.project }}
+          CAD_REVIEW_BASE: ${{ inputs.base }}
+          CAD_REVIEW_HEAD: ${{ inputs.head }}
+          CAD_REVIEW_OUT: build/cad-review-ci
+      - name: Retain review artifacts, including blocked check reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cad-source-review
+          path: build/cad-review-ci
+          if-no-files-found: warn

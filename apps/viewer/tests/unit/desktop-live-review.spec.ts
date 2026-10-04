@@ -93,6 +93,23 @@ test("reset invalidates an in-flight result", async () => {
   await expect.poll(() => completed).toEqual([]);
 });
 
+test("post-mutation review supersedes a watcher snapshot read before publication", async () => {
+  const beforePublication = deferred<DesktopReviewSnapshot>();
+  const afterPublication = deferred<DesktopReviewSnapshot>();
+  let reads = 0;
+  const queue = new LatestReviewQueue(() => ++reads === 1 ? beforePublication.promise : afterPublication.promise);
+  const displayed: string[] = [];
+  const receive = (value: DesktopReviewSnapshot) => displayed.push(value.projectName);
+  queue.enqueue("project", receive, () => undefined);
+  queue.reset(); // Undo begins while the watcher reads the previous files.
+  queue.enqueue("project", receive, () => undefined); // Publication completes.
+  beforePublication.resolve(snapshot("before-undo"));
+  await expect.poll(() => reads).toBe(2);
+  expect(displayed).toEqual([]);
+  afterPublication.resolve(snapshot("after-undo"));
+  await expect.poll(() => displayed).toEqual(["reviewed-after-undo"]);
+});
+
 test("starts watching before enqueuing the catch-up review", async () => {
   const calls: string[] = [];
   const watchStarted = deferred<unknown>();

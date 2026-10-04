@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 cad-jww-codec.workspace = true
 cad-model.workspace = true
+cad-check.workspace = true
 blake3.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -18,6 +19,5 @@ toml.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
-cad-check.workspace = true
 cad-render-svg.workspace = true
 insta.workspace = true

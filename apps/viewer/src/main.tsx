@@ -3,7 +3,10 @@
  * The viewer keeps SVG interactive by inlining it and reading data-entity-id.
  */
 import { render, type ComponentChildren } from "preact";
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { DxfExchangeDialog, type DxfFileReport } from "./dxf-exchange-dialog";
+import { GitCommitPanel, type CommitPreview } from "./git-commit-panel";
+import { SheetViewportsPanel, type SheetPreview } from "./sheet-viewports-panel";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
@@ -22,6 +25,22 @@ import {
   Copy,
   Minus,
   Layers3,
+  PanelLeft,
+  PanelRight,
+  GitBranch,
+  Blocks,
+  Building2,
+  Move,
+  MoveHorizontal,
+  Square,
+  CornerDownRight,
+  CornerUpRight,
+  Grid2x2,
+  FlipHorizontal,
+  Scissors,
+  ArrowUpRight,
+  Dot,
+  FileText,
   Lock,
   Maximize2,
   MousePointer2,
@@ -68,7 +87,16 @@ import { dimensionAnchorAt, dimensionOffset } from "./drafting-dimensions";
 import { PrintPreview } from "./print-preview";
 import { newBlockEntity, BLOCK_ENTITY_TYPES } from "./block-entities";
 import { closestEntityId } from "./svg-selection";
+import { sanitizeSvg } from "./svg-sanitizer";
 import { DraftingPanel, initialDraftingOptions, finiteDraftNumber, repeatableCommand, retuneDraftOperation } from "./drafting-panel";
+import { ToolkitPanel, type ToolkitMeasurement } from "./toolkit-panel";
+import { TextToolsPanel } from "./text-tools-panel";
+import { acquireCreationAttributes, CreationAttributesPanel, type CreationAttributes } from "./creation-attributes";
+import { GitStagePanel, type StagePreview } from "./git-stage-panel";
+import { GitMergePanel, type MergePreview } from "./git-merge-panel";
+import { ClipboardPanel, type CadClipboard, type PastePreview, type JwsPart } from "./clipboard-panel";
+import type {PartLibraryReport,LoadedLibraryPart} from "./part-library-panel";
+import { EntityHistoryPanel, type EntityHistory, type EntityBlame } from "./entity-history-panel";
 import {
   applyDrawingEdit,
   previewDrawingEdit,
@@ -82,7 +110,8 @@ import {
 import { createDesktopComment, updateDesktopCommentStatus } from "./desktop-comments";
 import { LatestAiContextWriteQueue } from "./desktop-ai-context";
 import { importJwwFromDesktop } from "./desktop-import";
-import { loadReviewSnapshotFromDesktop } from "./desktop-loader";
+import { loadReviewSnapshotFromDesktop, type GitComparison } from "./desktop-loader";
+import { GitComparisonControls } from "./git-comparison";
 import {
   exportDrawingPdfFromDesktop,
   exportJwwFromDesktop,
@@ -107,7 +136,10 @@ import {
   committedWheelPrevious,
   swapPreviousView,
 } from "./view-history";
+import { WorkspaceTabs } from "./workspace-tabs";
+import { useModalFocus } from "./modal-focus";
 import "./styles.css";
+import "./workspace.css";
 
 if (import.meta.env.VITE_CAD_DESKTOP_E2E === "1") {
   void import("@wdio/tauri-plugin");
@@ -149,6 +181,7 @@ type EditorMode =
   | "text"
   | "dimension"
   | "rotate"
+  | "scale"
   | "mirror"
   | "offset"
   | "trim"
@@ -194,8 +227,11 @@ function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [artifacts, setArtifacts] = useState<Artifacts | null>(null);
   const [projectState, setProjectState] = useState<ProjectState | null>(null);
+  const [gitComparison, setGitComparison] = useState<GitComparison | undefined>();
+  const gitComparisonRef = useRef<GitComparison | undefined>();
   const [importMessage, setImportMessage] = useState("");
   const [exportOpen, setExportOpen] = useState(false);
+  const [dxfMode, setDxfMode] = useState<"import" | "export" | null>(null);
   const [projectSetupMode, setProjectSetupMode] = useState<ProjectSetupMode | null>(null);
   const [projectSetupBusy, setProjectSetupBusy] = useState(false);
   const [exportReport, setExportReport] = useState<ExportReport | null>(null);
@@ -208,6 +244,10 @@ function App() {
     status: "no_entity_selected",
     message: "no entity selected",
   });
+  const [leftVisible, setLeftVisible] = useState(true);
+  const [rightVisible, setRightVisible] = useState(true);
+  const [navigatorTab, setNavigatorTab] = useState("review");
+  const [workspaceTab, setWorkspaceTab] = useState("inspect");
   const [viewMode, setViewMode] = useState<ViewMode>("diff");
   const [selectedEntityId, setSelectedEntityId] = useState("");
   const [selectedEntityIds, setSelectedEntityIds] = useState<Set<string>>(new Set());
@@ -218,7 +258,12 @@ function App() {
   const [orthoEnabled, setOrthoEnabled] = useState(false);
   const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
   const [pendingOperation, setPendingOperation] = useState<EditOperation | null>(null);
+  const [generatedPreviewOwner, setGeneratedPreviewOwner] = useState<"building" | "text" | null>(null);
   const [draftingOptions, setDraftingOptions] = useState(initialDraftingOptions);
+  const [acquiredAttributes, setAcquiredAttributes] = useState<CreationAttributes | null>(null);
+  const [cadClipboard,setCadClipboard]=useState<CadClipboard|null>(null);
+  const [cadJwsReport,setCadJwsReport]=useState<JwsPart["report"]|null>(null);
+  const [cadMassingReport,setCadMassingReport]=useState<unknown|null>(null);
   const [editPreview, setEditPreview] = useState<DrawingEditPreview | null>(null);
   const [dimensionResolutions, setDimensionResolutions] = useState<Record<string, "delete" | "detach">>({});
   const [blockEditing, setBlockEditing] = useState<{ block: string; name: string; revision: string; drawingRevision: string; entities: EditorEntity[]; svg: string } | null>(null);
@@ -253,6 +298,16 @@ function App() {
   const [isPanning, setIsPanning] = useState(false);
   const [isZoomAreaActive, setIsZoomAreaActive] = useState(false);
   const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null);
+  useModalFocus(blockEditing !== null || exportOpen || dxfMode !== null || projectSetupMode !== null, () => {
+    if (isEditSaving || isHistoryBusy || exportBusy || projectSetupBusy) return;
+    if (blockEditing !== null) { setBlockEditing(null); selectEditorMode("select"); }
+    else if (exportOpen) setExportOpen(false);
+    else if (dxfMode !== null) {
+      // Exchange dialogs own their asynchronous submit state; use their enabled Close control.
+      const close = document.querySelector<HTMLButtonElement>(".dxf-exchange-dialog button[data-dismiss]");
+      close?.click();
+    } else setProjectSetupMode(null);
+  });
   const drawingStageRef = useRef<HTMLDivElement>(null);
   const svgSurfaceRef = useRef<HTMLDivElement>(null);
   const currentViewBoxRef = useRef<ViewBox | null>(null);
@@ -285,6 +340,7 @@ function App() {
           sanitizeSvg,
           undefined,
           currentDrawingRef.current ?? undefined,
+          gitComparisonRef.current,
         ),
       ),
     [],
@@ -330,15 +386,9 @@ function App() {
       });
   }, [isDesktop, projectState?.project_path, artifacts]);
 
-  useEffect(() => {
-    setSelectedEntityIds((current) => {
-      if (selectedEntityId === "") return new Set();
-      return current.has(selectedEntityId) ? current : new Set([selectedEntityId]);
-    });
-  }, [selectedEntityId]);
-
-  useEffect(() => {
-    if (selectedEntityId !== "" && !selectedEntityIds.has(selectedEntityId)) {
+  // The selection set owns membership. Never restore a removed entity from a stale primary ID.
+  useLayoutEffect(() => {
+    if (!selectedEntityIds.has(selectedEntityId)) {
       setSelectedEntityId(selectedEntityIds.values().next().value ?? "");
     }
   }, [selectedEntityId, selectedEntityIds]);
@@ -395,6 +445,7 @@ function App() {
 
   const sourceSvg = viewMode === "sheet" ? artifacts?.sheetSvg : artifacts?.diffSvg;
   const showingDrawing = editorMode !== "print_preview";
+  const isViewportSheet=(artifacts?.layouts?.find(layout=>layout.active)?.viewports?.length ?? 0)>0;
   const activeSvg = viewMode === "sheet" && editPreview?.svg ? editPreview.svg : sourceSvg;
   const activeBaseViewBox = useMemo(() => parseSvgViewBox(sourceSvg), [sourceSvg]);
   const viewContext = `${projectState?.project_path ?? (isDesktop ? "desktop" : "web")}:${artifacts?.currentDrawing ?? "drawing"}:${viewMode}`;
@@ -423,7 +474,7 @@ function App() {
     [artifacts, selectedEntityId],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const preserveView = shouldPreserveView(viewContextRef.current, viewContext);
     ++asyncDraftSequence.current;
     viewContextRef.current = viewContext;
@@ -440,10 +491,9 @@ function App() {
     }
   }, [activeBaseViewBox, viewContext]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     function cancelActiveOperation(event: KeyboardEvent) {
-      if (event.isComposing) return;
-      if (blockEditing !== null && event.key !== "Escape") return;
+      if (event.isComposing || document.querySelector(".dialog-backdrop") !== null) return;
       const inputFocused = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement;
       if (inputFocused && event.key !== "Escape") {
         if (event.key === "Enter" && event.target instanceof Element && event.target.closest(".drafting-panel") !== null && !(event.target instanceof HTMLTextAreaElement)) {
@@ -461,6 +511,9 @@ function App() {
         setOrthoEnabled((enabled) => !enabled);
         return;
       }
+      // Native controls own Enter/Space and navigation; do not repeat a CAD command behind them.
+      if (["Enter", " ", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key) &&
+        event.target instanceof Element && event.target.closest("button, summary, [role='tab'], [role='button'], a") !== null) return;
       const command = commandForKeyboardEvent(event);
       if (command !== null) {
         event.preventDefault();
@@ -530,10 +583,11 @@ function App() {
     }
     window.addEventListener("keydown", cancelActiveOperation);
     return () => window.removeEventListener("keydown", cancelActiveOperation);
-  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState, draftingOptions, draftParameterError, blockEditing]);
+  }, [editorMode, draftPoints, pendingOperation, artifacts, selectedEntityId, selectedEntityIds, projectState, historyState, draftingOptions, draftParameterError, blockEditing, isEditSaving, isHistoryBusy]);
 
   useEffect(() => {
     const sequence = ++previewSequence.current;
+    if (pendingOperation === null) setGeneratedPreviewOwner(null);
     setEditPreview(null);
     setDimensionResolutions({});
     if (pendingOperation === null || projectState === null || artifacts === null || !isDesktop) {
@@ -561,6 +615,23 @@ function App() {
   useEffect(() => () => clearPendingWheelHistory(), []);
 
   useEffect(() => {
+    setAcquiredAttributes(null);
+    setDraftingOptions(current => ({...current,pen:"",style:"",dimensionStyle:"",fill:""}));
+  }, [projectState?.project_path, artifacts?.currentDrawing]);
+
+  useEffect(() => {
+    if (acquiredAttributes === null || artifacts === null) return;
+    if (!artifacts.layers.layers.some(layer=>layer.id===acquiredAttributes.layer)
+      || (acquiredAttributes.pen !== null && !artifacts.editor.pens.includes(acquiredAttributes.pen))
+      || (acquiredAttributes.textStyle !== null && !artifacts.editor.text_styles.includes(acquiredAttributes.textStyle))
+      || (acquiredAttributes.dimensionStyle !== null && !artifacts.editor.dimension_styles.includes(acquiredAttributes.dimensionStyle))
+      || (acquiredAttributes.fill !== null && !artifacts.editor.fills.includes(acquiredAttributes.fill))) {
+      clearAcquiredAttributes();
+      setEditMessage("Acquired attribute references changed. Pick attributes again.");
+    }
+  }, [artifacts, acquiredAttributes]);
+
+  useLayoutEffect(() => {
     const svg = currentSvgElement();
     if (
       svg === null ||
@@ -574,7 +645,7 @@ function App() {
     svg.setAttribute("viewBox", formatViewBox(currentViewBox));
   }, [activeBaseViewBox, baseViewBox, currentViewBox, showingDrawing]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     document
       .querySelectorAll(".drawing-stage [data-entity-id]")
       .forEach((element) => element.classList.remove("is-selected"));
@@ -592,7 +663,7 @@ function App() {
     lastCommentAnchorRef.current = null;
   }, [artifacts?.currentDrawing, selectedEntityId]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (artifacts !== null) {
       applyLayerWorkspaceToSvg(artifacts.layers);
       document.querySelectorAll<SVGElement>(".drawing-stage [data-screen-stroke-width]").forEach(element => {
@@ -938,6 +1009,17 @@ function App() {
     drawingStageRef.current.setPointerCapture(event.pointerId);
   }
 
+  function beginKeyboardEndpoint(event: KeyboardEvent, entity: EditorEntity, vertexIndex: number, origin: [number, number]) {
+    if (!["Enter", " "].includes(event.key) || isEditSaving || isHistoryBusy) return;
+    event.preventDefault(); event.stopPropagation();
+    endpointDrag.current = { entityId: entity.id, vertexIndex, origin, to: origin };
+    dragInteraction.current = null;
+    setEditorMode("endpoint"); setCadCommand("endpoint");
+    setDraftPoints([origin]); setPendingOperation(null);
+    setEditMessage("Enter new x,y coordinates below, review the preview, then apply.");
+    document.querySelector<HTMLInputElement>("input[aria-label='Command or coordinate']")?.focus();
+  }
+
   /** Mouse down observes the second physical button, which pointerdown omits. */
   function handleChordMouseDown(event: MouseEvent) {
     if (event.buttons !== 3) {
@@ -1272,10 +1354,12 @@ function App() {
       return;
     }
     setIsEditSaving(true);
+    reviewQueue.reset();
     try {
       const result = await createDesktopComment(projectState.project_path, {
         drawing: artifacts.currentDrawing,
         expected_revision: artifacts.commentsRevision,
+        expected_drawing_revision: artifacts.editor.revision,
         entity_id: selectedEntityId,
         anchor: lastCommentAnchorRef.current ?? entityAnchor(selectedEditorEntity),
         text,
@@ -1355,6 +1439,8 @@ function App() {
     previousLayerVisibilityRef.current = null;
     projectStateRef.current = null;
     currentDrawingRef.current = null;
+    gitComparisonRef.current = undefined;
+    setGitComparison(undefined);
     drawingLoadGuard.reset(null);
     if (clearSelection) {
       setSelectedEntityId("");
@@ -1426,6 +1512,7 @@ function App() {
         await openDesktopProject(selected);
       } catch (error: unknown) {
         setSelectedEntityId("");
+        setSelectedEntityIds(new Set());
         setErrorMessage(formatError(error, "unknown project open error"));
         setLoadState("error");
       }
@@ -1518,6 +1605,7 @@ function App() {
     layerRulesQueue.reset();
     previousLayerVisibilityRef.current = null;
     setSelectedEntityId("");
+    setSelectedEntityIds(new Set());
     const openSequence = projectOpenGuard.begin();
     try {
       const state = await importJwwFromDesktop(selectedFile, selectedParent);
@@ -1565,6 +1653,7 @@ function App() {
     if (rememberVisibility) {
       previousLayerVisibilityRef.current = artifacts.layers;
     }
+    if (patch.activeLayer !== undefined) setAcquiredAttributes(null);
     setArtifacts((current) => (current === null ? current : { ...current, layers: next }));
     applyLayerWorkspaceToSvg(next);
     if (selectedEntityId !== "") {
@@ -1579,6 +1668,7 @@ function App() {
         );
         if (layer?.visible === false || group?.visible === false) {
           setSelectedEntityId("");
+          setSelectedEntityIds(new Set());
         }
       }
     }
@@ -1961,6 +2051,7 @@ function App() {
         sanitizeSvg,
         undefined,
         drawing,
+        gitComparisonRef.current,
       );
       if (!drawingLoadGuard.accepts(token, loaded.artifacts.currentDrawing)) {
         return;
@@ -1982,6 +2073,7 @@ function App() {
   }
 
   function selectEditorMode(mode: EditorMode) {
+    if(isViewportSheet && !["select","layout","print_preview"].includes(mode)) {setEditMessage("This sheet contains scaled views. Select a model drawing/layout to edit geometry.");return;}
     ++asyncDraftSequence.current;
     insertionRevision.current = null;
     setDraftParameterError(false);
@@ -2077,11 +2169,11 @@ function App() {
       const length = number(draftingOptions.distance), angle = number(draftingOptions.angle);
       if (length === null || angle === null || length <= 0) { setEditMessage("Length must be positive and angle finite"); return; }
       const radians = angle * Math.PI / 180;
-      setPendingOperation({ kind: "create", entity: { type: "line", layer, pen: null, p1: points[0], p2: [points[0][0] + length * Math.cos(radians), points[0][1] + length * Math.sin(radians)] } });
+      setPendingOperation({ kind: "create", entity: { type: "line", layer, pen: draftingOptions.pen || null, p1: points[0], p2: [points[0][0] + length * Math.cos(radians), points[0][1] + length * Math.sin(radians)] } });
     } else if (editorMode === "rectangle" && points.length === 1 && layer !== null) {
       const width = number(draftingOptions.width), height = number(draftingOptions.height);
       if (width === null || height === null || width <= 0 || height <= 0) { setEditMessage("Width and height must be positive"); return; }
-      setPendingOperation({ kind: "rectangle", layer, p1: points[0], p2: [points[0][0] + width, points[0][1] + height] });
+      setPendingOperation({ kind: "rectangle", layer, pen: draftingOptions.pen || null, p1: points[0], p2: [points[0][0] + width, points[0][1] + height] });
     } else if (editorMode === "hatch" && !draftingOptions.hatchRegion && layer !== null) {
       if (points.length < 3) { setEditMessage("Pick at least three boundary vertices"); return; }
       stageHatch(points.length > 3 && pointArrayDistance(points[0], points.at(-1)!) < 1e-9 ? [points.slice(0, -1)] : [points], layer);
@@ -2102,6 +2194,10 @@ function App() {
       const angle = number(draftingOptions.angle);
       if (angle === null) { setEditMessage("Enter a finite angle"); return; }
       setPendingOperation({ kind: "rotate", entity_ids: [...selectedEntityIds], center: points[0], angle_deg: angle });
+    } else if (editorMode === "scale" && points.length > 0) {
+      const factor = number(draftingOptions.scale);
+      if (factor === null || factor <= 0) { setEditMessage("Enter a positive finite scale factor"); return; }
+      setPendingOperation({ kind: "scale", entity_ids: [...selectedEntityIds], center: points[0], factor });
     } else if (editorMode === "polyline") {
       completePolyline();
     } else {
@@ -2113,21 +2209,41 @@ function App() {
     const layer = activeLayerEditable();
     const style = draftingOptions.style || artifacts?.editor.text_styles[0];
     if (layer === null || !style || !draftingOptions.text.trim()) { setEditMessage("Enter text and choose a style"); return; }
-    setPendingOperation({ kind: "create", entity: { type: "text", layer, pen: null, style, at, rotation_deg: 0, mirror_y: false, value: draftingOptions.text } });
+    setPendingOperation({ kind: "create", entity: { type: "text", layer, pen: draftingOptions.pen || null, style, at, rotation_deg: 0, mirror_y: false, writing_mode: draftingOptions.textWritingMode, value: draftingOptions.text } });
   }
 
   function stageHatch(loops: [number, number][][], layer: string) {
     const scale = finiteDraftNumber(draftingOptions.distance), angle = finiteDraftNumber(draftingOptions.angle);
     const fill = draftingOptions.fill || artifacts?.editor.fills[0];
     if (!fill || scale === null || scale <= 0 || angle === null) { setEditMessage("Choose a fill and finite angle with a positive pitch"); return; }
-    setPendingOperation({ kind: "create", entity: { type: "hatch", layer, pen: null, loops, pattern: draftingOptions.pattern, angle_deg: angle, scale, fill } });
+    setPendingOperation({ kind: "create", entity: { type: "hatch", layer, pen: draftingOptions.pen || null, loops, pattern: draftingOptions.pattern, angle_deg: angle, scale, fill } });
+  }
+
+  function clearAcquiredAttributes() {
+    selectEditorMode("select");
+    setAcquiredAttributes(null);
+    setDraftingOptions(current => ({...current,pen:"",style:"",dimensionStyle:"",fill:""}));
+  }
+
+  function pickSelectedAttributes() {
+    if (selectedEditorEntity === null || artifacts === null) return;
+    try {
+      const attributes = acquireCreationAttributes(selectedEditorEntity, artifacts.editor, artifacts.layers);
+      selectEditorMode("select");
+      setAcquiredAttributes(attributes);
+      setDraftingOptions(current=>({...current,pen:attributes.pen || "",
+        style:attributes.textStyle ?? current.style,
+        dimensionStyle:attributes.dimensionStyle ?? current.dimensionStyle,
+        fill:attributes.fill ?? current.fill}));
+      setEditMessage("Attributes acquired for the next drawing operation");
+    } catch (error) {setEditMessage(formatError(error,"Cannot acquire attributes"));}
   }
 
   function activeLayerEditable(): string | null {
     if (!isDesktop || artifacts === null) {
       return null;
     }
-    const active = artifacts.layers.active_layer;
+    const active = acquiredAttributes?.layer ?? artifacts.layers.active_layer;
     const layer = artifacts.layers.layers.find((candidate) => candidate.id === active);
     const group = artifacts.layers.groups.find(
       (candidate) => candidate.id === (layer?.group ?? "default"),
@@ -2139,6 +2255,7 @@ function App() {
   }
 
   async function commitDrawingEdit(operation: EditOperation) {
+    if(isViewportSheet && operation.kind!=="update_layout") {setEditMessage("Select a model drawing/layout to edit geometry; scaled sheet views are read-only.");return;}
     if (operation === pendingOperation && draftParameterError) {
       setEditMessage("Correct invalid parameters before applying");
       return;
@@ -2249,6 +2366,7 @@ function App() {
     }
     setIsHistoryBusy(true);
     setHistoryMessage(undo ? "Undoing edit..." : "Redoing edit...");
+    reviewQueue.reset();
     const requestSequence = historySequenceRef.current;
     const requestDrawing = artifacts.currentDrawing;
     try {
@@ -2263,6 +2381,11 @@ function App() {
         requestSequence !== historySequenceRef.current
         || currentDrawingRef.current !== requestDrawing
       ) {
+        // A watcher review may have started before Undo published its files.
+        // Always request a post-publication snapshot in the same project.
+        if (projectStateRef.current?.project_path === projectState.project_path && currentDrawingRef.current === requestDrawing) {
+          enqueueDesktopReview(projectState.project_path);
+        }
         return;
       }
       setArtifacts((current) =>
@@ -2348,7 +2471,7 @@ function App() {
     }
     void commitDrawingEdit({
       kind: "create",
-      entity: { type: "polyline", layer, pen: null, points: draftPoints, closed: false },
+      entity: { type: "polyline", layer, pen: draftingOptions.pen || null, points: draftPoints, closed: false },
     });
   }
 
@@ -2386,7 +2509,7 @@ function App() {
       setDraftPoints(points);
       if (layer !== null && points.length === 2) {
         setDraftingOptions(options => ({ ...options, width: String(Math.abs(points[1][0] - points[0][0])), height: String(Math.abs(points[1][1] - points[0][1])) }));
-        setPendingOperation({ kind: "rectangle", layer, p1: points[0], p2: points[1] });
+        setPendingOperation({ kind: "rectangle", layer, pen: draftingOptions.pen || null, p1: points[0], p2: points[1] });
       }
       return true;
     }
@@ -2411,14 +2534,14 @@ function App() {
     if (editorMode === "dimension") {
       const points = [...draftPoints, point];
       setDraftPoints(points);
-      const layer = activeLayerEditable(), style = artifacts.editor.dimension_styles[0];
+      const layer = activeLayerEditable(), style = draftingOptions.dimensionStyle || artifacts.editor.dimension_styles[0];
       if (layer === null || style === undefined) { setEditMessage("Choose an editable layer and a dimension style"); return true; }
       const type = draftingOptions.dimension;
       const selected = artifacts.editor.entities.filter(entity => selectedEntityIds.has(entity.id));
       const fixed = (point: [number, number]) => ({ kind: "fixed", point });
       const reference = (entity: EditorEntity, feature: string) => ({ kind: "entity", entity_id: entity.id, feature });
       const anchor = (point: [number, number]) => draftingOptions.associate ? dimensionAnchorAt(artifacts, point) : fixed(point);
-      const create = (p1: [number, number], p2: [number, number], offset: number, measurement: Record<string, unknown>): EditOperation => ({ kind: "create", entity: { type: "dimension", layer, pen: null, style, p1, p2, offset, text_rotation_deg: 0, text_mirror_y: false, value: null, measurement } });
+      const create = (p1: [number, number], p2: [number, number], offset: number, measurement: Record<string, unknown>): EditOperation => ({ kind: "create", entity: { type: "dimension", layer, pen: draftingOptions.pen || null, style, p1, p2, offset, text_rotation_deg: 0, text_mirror_y: false, value: null, measurement } });
       if (type === "radius" || type === "diameter") {
         const target = selected.find(entity => entity.type === "circle" || entity.type === "arc");
         const center = asCadPoint(target?.center);
@@ -2455,7 +2578,7 @@ function App() {
         : { kind: "translate", entity_id: selectedEntityId, delta, duplicate: editorMode === "copy" });
       return true;
     }
-    if (["rotate", "mirror", "offset", "trim", "extend"].includes(editorMode)) {
+    if (["rotate", "scale", "mirror", "offset", "trim", "extend"].includes(editorMode)) {
       const entityIds = Array.from(selectedEntityIds);
       if (entityIds.length === 0) {
         setEditMessage("Select one or more entities first");
@@ -2470,6 +2593,15 @@ function App() {
         } else {
           setEditMessage("Enter a finite rotation angle");
         }
+        return true;
+      }
+      if (editorMode === "scale") {
+        setDraftPoints([point]);
+        const factor = finiteDraftNumber(draftingOptions.scale);
+        if (factor !== null && factor > 0) {
+          setPendingOperation({ kind: "scale", entity_ids: entityIds, center: point, factor });
+          setEditMessage("Scale preview ready; press Enter to apply");
+        } else { setEditMessage("Enter a positive finite scale factor"); }
         return true;
       }
       if (editorMode === "mirror") {
@@ -2515,7 +2647,7 @@ function App() {
     if (editorMode === "point") {
       void commitDrawingEdit({
         kind: "create",
-        entity: { type: "point", layer, pen: null, at: point, temporary: false, marker_code: null, rotation_deg: 0, scale: 1 },
+        entity: { type: "point", layer, pen: draftingOptions.pen || null, at: point, temporary: false, marker_code: null, rotation_deg: 0, scale: 1 },
       });
       return true;
     }
@@ -2534,6 +2666,7 @@ function App() {
       if (angle === null || scale === null || scale <= 0) { setEditMessage("Choose a finite angle and positive scale"); return true; }
       setPendingOperation({
         kind: "insert_block",
+        pen: draftingOptions.pen || null,
         block: block.id,
         layer,
         at: point,
@@ -2567,11 +2700,11 @@ function App() {
       return true;
     }
     if (editorMode === "line") {
-      void commitDrawingEdit({ kind: "create", entity: { type: "line", layer, pen: null, p1: points[0], p2: points[1] } });
+      void commitDrawingEdit({ kind: "create", entity: { type: "line", layer, pen: draftingOptions.pen || null, p1: points[0], p2: points[1] } });
     } else if (editorMode === "circle") {
-      void commitDrawingEdit({ kind: "create", entity: { type: "circle", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]) } });
+      void commitDrawingEdit({ kind: "create", entity: { type: "circle", layer, pen: draftingOptions.pen || null, center: points[0], radius: pointArrayDistance(points[0], points[1]) } });
     } else if (editorMode === "arc") {
-      void commitDrawingEdit({ kind: "create", entity: { type: "arc", layer, pen: null, center: points[0], radius: pointArrayDistance(points[0], points[1]), start_deg: pointAngle(points[0], points[1]), end_deg: pointAngle(points[0], points[2]) } });
+      void commitDrawingEdit({ kind: "create", entity: { type: "arc", layer, pen: draftingOptions.pen || null, center: points[0], radius: pointArrayDistance(points[0], points[1]), start_deg: pointAngle(points[0], points[1]), end_deg: pointAngle(points[0], points[2]) } });
     }
     return true;
   }
@@ -2629,6 +2762,35 @@ function App() {
     }
   }
 
+  function handleCanvasKey(event: KeyboardEvent) {
+    if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return;
+    const current = currentViewBoxRef.current;
+    if (current === null) return;
+    const pan: Record<string, [number, number]> = {
+      ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+    };
+    if (event.key in pan) {
+      const [dx, dy] = pan[event.key];
+      applyViewBox({ ...current, minX: current.minX + dx * current.width * .1, minY: current.minY + dy * current.height * .1 });
+    } else if (event.key === "Home") resetView();
+    else if (event.key === "+" || event.key === "=") zoomBy(ZOOM_STEP_FACTOR);
+    else if (event.key === "-") zoomBy(1 / ZOOM_STEP_FACTOR);
+    else if (editorMode === "select" && pendingOperation === null &&
+      (["PageDown", "PageUp"].includes(event.key) || (["Enter", " "].includes(event.key) && lastSuccessfulCommand.current === null))) {
+      const ids = [...new Set([...svgSurfaceRef.current?.querySelectorAll<SVGElement>("[data-entity-id]") ?? []]
+        .filter(element => { const box = element.getBoundingClientRect(); return (box.width > 0 || box.height > 0) && getComputedStyle(element).visibility !== "hidden"; })
+        .map(element => element.getAttribute("data-entity-id")!).filter(Boolean))];
+      if (ids.length > 0) {
+        const index = ids.indexOf(selectedEntityId);
+        const step = event.key === "PageUp" ? -1 : 1;
+        const nextIndex = index < 0 ? (step < 0 ? ids.length - 1 : 0) : (index + step + ids.length) % ids.length;
+        selectEntity(ids[nextIndex], false, event.shiftKey);
+      } else { setSelectedEntityId(""); setSelectedEntityIds(new Set()); }
+    } else return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   return (
     <main class="app-shell">
       {blockEditing !== null && artifacts !== null && <div class="dialog-backdrop"><section class="block-edit-dialog" role="dialog" aria-modal="true" aria-label="Edit block contents">
@@ -2677,7 +2839,11 @@ function App() {
         </div>
         <div class="project-actions" aria-label="Project controls">
           {isDesktop && (
-            <>
+            <details class="file-menu" onClick={event => {
+              if (event.target instanceof Element && event.target.closest("button:not(:disabled)")) event.currentTarget.open = false;
+            }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}>
+              <summary><FolderOpen size={16} aria-hidden="true"/>File<ChevronDown size={13} aria-hidden="true"/></summary>
+              <div class="file-menu-content">
               <button type="button" class="tool-button" onClick={chooseProject}>
                 <FolderOpen size={17} aria-hidden="true" />
                 Open Project
@@ -2690,6 +2856,8 @@ function App() {
                 <FileInput size={17} aria-hidden="true" />
                 Import JWW
               </button>
+              <button type="button" class="tool-button" disabled={isEditSaving || isHistoryBusy} onClick={() => setDxfMode("import")}>Import DXF</button>
+              <button type="button" class="tool-button" disabled={projectState === null || isEditSaving || isHistoryBusy} onClick={() => setDxfMode("export")}>Export DXF</button>
               <button
                 type="button"
                 class="tool-button"
@@ -2714,7 +2882,8 @@ function App() {
                   Extract Original
                 </button>
               )}
-            </>
+              </div>
+            </details>
           )}
           <button
             type="button"
@@ -2726,10 +2895,12 @@ function App() {
             Re-run Review
           </button>
           {isDesktop && projectState !== null && <LiveReviewStatus state={liveReviewState} />}
-          <span class="diff-source">HEAD vs working tree</span>
+          <span class="diff-source">{gitComparison?.base ?? "HEAD"} vs {gitComparison?.head ?? "working tree"}</span>
         </div>
+        {isViewportSheet && <p role="status">Scaled sheet views are read-only. Choose a model drawing or layout to edit geometry.</p>}
         {isDesktop && artifacts !== null && (
         <fieldset class="editor-tools" aria-label="Drawing tools" disabled={isEditSaving || isHistoryBusy || pdfBusy || projectState?.editable === false}>
+            <div class="tool-group tool-group-document" role="group" aria-label="Drawing context"><span class="tool-group-label">Drawing</span>
             <select
               class="drawing-select"
               aria-label="Current drawing"
@@ -2762,6 +2933,7 @@ function App() {
                 ))}
               </select>
             )}
+            </div><div class="tool-group" role="group" aria-label="Selection and history"><span class="tool-group-label">Select</span>
             <EditorToolButton mode="select" active={editorMode} label="Select" icon={<MousePointer2 size={16} />} onSelect={selectEditorMode} />
             <button
               type="button"
@@ -2783,25 +2955,29 @@ function App() {
             >
               <Redo2 size={16} />
             </button>
-            <EditorToolButton mode="move" active={editorMode} label="Move" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
-            {(["endpoint", "stretch", "rectangle", "fillet", "chamfer", "rectangular_array", "create_block"] as const).map(mode => <EditorToolButton key={mode} mode={mode} active={editorMode} label={commandLabel(mode).replaceAll("_", " ")} icon={<PenLine size={16} />} onSelect={selectEditorMode} />)}
-            <EditorToolButton mode="copy" active={editorMode} label="Copy" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            </div><div class="tool-group" role="group" aria-label="Geometry tools"><span class="tool-group-label">Draw</span>
             <EditorToolButton mode="line" active={editorMode} label="Line" icon={<Minus size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="polyline" active={editorMode} label="Polyline" icon={<PenLine size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="rectangle" active={editorMode} label={commandLabel("rectangle")} icon={<Square size={16}/>} onSelect={selectEditorMode} />
             <EditorToolButton mode="circle" active={editorMode} label="Circle" icon={<Circle size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="arc" active={editorMode} label="Arc" icon={<RotateCcw size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="text" active={editorMode} label="Text" icon={<TypeIcon size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="dimension" active={editorMode} label="Dimension" icon={<Ruler size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="point" active={editorMode} label="Point" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="point" active={editorMode} label="Point" icon={<Dot size={16} />} onSelect={selectEditorMode} />
+            </div><div class="tool-group" role="group" aria-label="Modify tools"><span class="tool-group-label">Modify</span>
+            <EditorToolButton mode="move" active={editorMode} label="Move" icon={<Move size={16} />} onSelect={selectEditorMode} />
+            {(["endpoint", "stretch", "fillet", "chamfer", "rectangular_array", "create_block"] as const).map(mode => <EditorToolButton key={mode} mode={mode} active={editorMode} label={commandLabel(mode).replaceAll("_", " ")} icon={{endpoint:<Waypoints size={16}/>,stretch:<MoveHorizontal size={16}/>,fillet:<CornerDownRight size={16}/>,chamfer:<CornerUpRight size={16}/>,rectangular_array:<Grid2x2 size={16}/>,create_block:<Blocks size={16}/>}[mode]} onSelect={selectEditorMode} />)}
+            <EditorToolButton mode="copy" active={editorMode} label="Copy" icon={<Copy size={16} />} onSelect={selectEditorMode} />
             <EditorToolButton mode="rotate" active={editorMode} label="Rotate" icon={<RotateCcw size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="mirror" active={editorMode} label="Mirror" icon={<Waypoints size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="offset" active={editorMode} label="Offset" icon={<Plus size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="trim" active={editorMode} label="Trim" icon={<Minus size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="extend" active={editorMode} label="Extend" icon={<Maximize2 size={16} />} onSelect={selectEditorMode} />
-            <EditorToolButton mode="insert_block" active={editorMode} label="Insert Block" icon={<Plus size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="scale" active={editorMode} label="Scale" icon={<Maximize2 size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="mirror" active={editorMode} label="Mirror" icon={<FlipHorizontal size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="offset" active={editorMode} label="Offset" icon={<Copy size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="trim" active={editorMode} label="Trim" icon={<Scissors size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="extend" active={editorMode} label="Extend" icon={<ArrowUpRight size={16} />} onSelect={selectEditorMode} />
+            <EditorToolButton mode="insert_block" active={editorMode} label="Insert Block" icon={<Blocks size={16} />} onSelect={selectEditorMode} />
             <button
               type="button"
-              class="icon-button"
+              class="icon-button text-tool"
               aria-label="Edit Block"
               title="Edit Block"
               disabled={selectedEditorEntity?.type !== "block_ref"}
@@ -2810,9 +2986,10 @@ function App() {
               Edit Block
             </button>
             <EditorToolButton mode="hatch" active={editorMode} label="Hatch" icon={<Layers3 size={16} />} onSelect={selectEditorMode} />
+            </div><div class="tool-group" role="group" aria-label="Output tools"><span class="tool-group-label">Publish</span>
             <button
               type="button"
-              class={cadCommand === "layout" ? "icon-button is-active" : "icon-button"}
+              class={cadCommand === "layout" ? "icon-button text-tool is-active" : "icon-button text-tool"} aria-pressed={cadCommand === "layout"}
               aria-label="Layout"
               title="Layout"
               onClick={() => {
@@ -2825,7 +3002,7 @@ function App() {
             </button>
             <button
               type="button"
-              class={cadCommand === "print_preview" ? "icon-button is-active" : "icon-button"}
+              class={cadCommand === "print_preview" ? "icon-button text-tool is-active" : "icon-button text-tool"} aria-pressed={cadCommand === "print_preview"}
               aria-label="Print Preview"
               title="Print Preview"
               onClick={() => {
@@ -2838,7 +3015,7 @@ function App() {
             </button>
             <button
               type="button"
-              class="icon-button"
+              class="icon-button text-tool"
               aria-label="Export PDF"
               title="Export PDF"
               disabled={!isDesktop || pdfBusy}
@@ -2846,15 +3023,17 @@ function App() {
             >
               {pdfBusy ? "Exporting…" : "PDF"}
             </button>
-            <button type="button" class="icon-button" aria-label="Delete" title="Delete" onClick={() => void deleteSelectedEntities()}>
+            <button type="button" class="icon-button text-tool destructive" aria-label="Delete" title="Delete" onClick={() => void deleteSelectedEntities()}>
               Delete
             </button>
+            </div>
           </fieldset>
         )}
         <div class="mode-tabs" aria-label="SVG mode">
           <button
             type="button"
             class={viewMode === "sheet" ? "tab is-active" : "tab"}
+            aria-pressed={viewMode === "sheet"}
             onClick={() => {
               if (!showingDrawing) selectEditorMode("select");
               setViewMode("sheet");
@@ -2865,6 +3044,7 @@ function App() {
           <button
             type="button"
             class={viewMode === "diff" ? "tab is-active" : "tab"}
+            aria-pressed={viewMode === "diff"}
             onClick={() => {
               if (!showingDrawing) selectEditorMode("select");
               setViewMode("diff");
@@ -2874,6 +3054,8 @@ function App() {
           </button>
         </div>
         <div class="view-tools" aria-label="View controls">
+          <button type="button" class="icon-button pane-toggle" aria-label="Toggle navigator" title="Toggle navigator" aria-pressed={leftVisible} aria-controls="navigator-pane" onClick={() => setLeftVisible(value => !value)}><PanelLeft size={18} aria-hidden="true"/></button>
+          <button type="button" class="icon-button pane-toggle" aria-label="Toggle workspace" title="Toggle workspace" aria-pressed={rightVisible} aria-controls="workspace-pane" onClick={() => setRightVisible(value => !value)}><PanelRight size={18} aria-hidden="true"/></button>
           <button
             type="button"
             class="icon-button"
@@ -2939,8 +3121,8 @@ function App() {
         </div>
       </header>
 
-      <section class="review-grid">
-        <aside class="side-panel" aria-label="Review results">
+      <section class={`review-grid${leftVisible ? "" : " hide-navigator"}${rightVisible ? "" : " hide-inspector"}`}>
+        <aside id="navigator-pane" class="side-panel" aria-label="Review results" hidden={!leftVisible}>
           <PanelHeader
             artifacts={artifacts}
             importMessage={importMessage}
@@ -2948,8 +3130,13 @@ function App() {
             loadState={loadState}
             projectState={projectState}
           />
+          <WorkspaceTabs id="navigator" label="Navigator panels" active={navigatorTab} onChange={setNavigatorTab} tabs={[
+            {id:"review",label:"Layers & review",icon:<Layers3 size={15} aria-hidden="true"/>},
+            {id:"project",label:"Project",icon:<FolderOpen size={15} aria-hidden="true"/>},
+          ]} />
           {artifacts !== null && (
             <>
+              <div id="navigator-panel-project" role="tabpanel" aria-labelledby="navigator-tab-project" hidden={navigatorTab !== "project"}>
               {(artifacts.blocks?.length ?? 0) > 0 && (
                 <section class="workspace-section" aria-label="Block definitions">
                   <h3>Blocks</h3>
@@ -2976,6 +3163,9 @@ function App() {
                   ))}
                 </section>
               )}
+                <p class="task-notice">{artifacts.drawingNames.length} drawing{artifacts.drawingNames.length === 1 ? "" : "s"} in this project.</p>
+              </div>
+              <div id="navigator-panel-review" role="tabpanel" aria-labelledby="navigator-tab-review" hidden={navigatorTab !== "review"}>
               <LayerWorkspace
                 state={artifacts.layers}
                 canPersist={!isDesktop || (projectState !== null && !isEditSaving && !isHistoryBusy)}
@@ -2991,11 +3181,21 @@ function App() {
                 onCreateComment={() => void createCommentForSelection()}
                 onToggleCommentStatus={(comment) => void changeCommentStatus(comment)}
               />
+              </div>
             </>
           )}
         </aside>
 
         <section class="canvas-panel" aria-label="CAD paper">
+          <div class="canvas-heading">
+            <div class="canvas-document"><FileText size={16} aria-hidden="true"/><strong>{artifacts?.currentDrawing ?? "Drawing workspace"}</strong><span class="canvas-mode">{isViewportSheet ? "Scaled sheet" : viewMode === "diff" ? "Revision comparison" : "Model drawing"}</span></div>
+            {viewMode === "diff" && <div class="diff-legend" aria-label="Difference legend"><span class="legend-added">Added</span><span class="legend-modified">Modified</span><span class="legend-removed">Removed</span></div>}
+            {pendingOperation !== null && <button type="button" class="draft-indicator" onClick={() => {
+              if (generatedPreviewOwner !== null) {
+                setRightVisible(true); setWorkspaceTab(generatedPreviewOwner === "building" ? "build" : "text");
+              } else document.querySelector<HTMLInputElement>("input[aria-label='Command or coordinate']")?.focus();
+            }}>Unsaved preview · Review</button>}
+          </div>
           {isDesktop && artifacts !== null && <DraftingPanel command={cadCommand} options={draftingOptions} artifacts={artifacts} onChange={options => {
             setDraftingOptions(options);
             if (editorMode === "dimension" && (options.dimension !== draftingOptions.dimension || options.associate !== draftingOptions.associate)) {
@@ -3021,10 +3221,10 @@ function App() {
             <button type="button" onClick={() => selectEditorMode("select")}>Cancel</button>
           </section>}
           {loadState === "idle" && (
-            <div class="empty-state">Open a CAD project folder to start desktop review.</div>
+            <div class="empty-state"><FolderOpen size={30} aria-hidden="true"/><h2>Start with your drawing</h2><p>Open a CAD project folder to start desktop review.</p><button type="button" class="tool-button primary" onClick={chooseProject}>Open Project</button></div>
           )}
-          {loadState === "loading" && <div class="empty-state">Loading generated artifacts</div>}
-          {loadState === "error" && <div class="empty-state is-error">{errorMessage}</div>}
+          {loadState === "loading" && <div class="empty-state" role="status">Loading generated artifacts</div>}
+          {loadState === "error" && <div class="empty-state is-error" role="alert"><p>{errorMessage}</p><button type="button" class="tool-button" onClick={rerunReview}>Retry review</button></div>}
           {loadState === "ready" && editorMode === "print_preview" && projectState !== null && artifacts !== null && <PrintPreview projectPath={projectState.project_path} drawing={artifacts.currentDrawing} revision={artifacts} />}
           {loadState === "ready" && editorMode !== "print_preview" && activeSvg !== undefined && (
             <div
@@ -3037,6 +3237,7 @@ function App() {
                     : "drawing-stage"
               }
               onWheel={handleWheel}
+              onKeyDown={handleCanvasKey}
               onPointerDown={handlePointerDown}
               onMouseDownCapture={handleChordMouseDown}
               onPointerMove={handlePointerMove}
@@ -3060,6 +3261,12 @@ function App() {
               <div
                 ref={svgSurfaceRef}
                 class="svg-surface"
+                role="group"
+                aria-label="Drawing canvas"
+                aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown PageUp PageDown Home"
+                title="Arrow keys: pan · +/−: zoom · Page Up/Down: select geometry · Home: reset view"
+                tabIndex={0}
+                onKeyDown={handleCanvasKey}
                 onClick={handleSvgClick}
                 dangerouslySetInnerHTML={{ __html: activeSvg }}
               />
@@ -3072,7 +3279,7 @@ function App() {
               )}
               {isDesktop && viewMode === "sheet" && currentViewBox !== null && selectedEditorEntity !== null && ["select", "endpoint"].includes(editorMode) && entityEditableInView(selectedEditorEntity, artifacts!) && (
                 <svg class="vertex-overlay" viewBox={formatViewBox(currentViewBox)} preserveAspectRatio="xMinYMin meet" aria-label="Entity vertices">
-                  {entityVertices(selectedEditorEntity).map((point, index) => <circle key={index} role="button" aria-label={`Vertex ${index + 1}`} cx={point[0]} cy={-point[1]} r={currentViewBox.width / Math.max(drawingStageRef.current?.clientWidth ?? 1000, 1) * 5} onPointerDown={event => beginEndpoint(event, selectedEditorEntity, index, point)} />)}
+                  {entityVertices(selectedEditorEntity).map((point, index) => <circle key={index} role="button" tabIndex={0} aria-label={`Vertex ${index + 1}`} aria-description="Enter or Space to move this vertex using coordinates" cx={point[0]} cy={-point[1]} r={currentViewBox.width / Math.max(svgSurfaceRef.current?.clientWidth ?? 1000, 1) * 5} onKeyDown={event => beginKeyboardEndpoint(event, selectedEditorEntity, index, point)} onPointerDown={event => beginEndpoint(event, selectedEditorEntity, index, point)} />)}
                 </svg>
               )}
               {selectionRect !== null && (
@@ -3090,14 +3297,27 @@ function App() {
           )}
         </section>
 
-        <aside class="detail-panel" aria-label="Selected entity">
+        <aside id="workspace-pane" class="detail-panel" aria-label="Selected entity" hidden={!rightVisible}>
+          <div class="pane-heading"><span>Workspace</span><span class="pane-hint">Tools & properties</span></div>
+          {isDesktop && (
+          <WorkspaceTabs id="workspace" label="Task panels" active={workspaceTab} onChange={setWorkspaceTab} tabs={[
+            {id:"inspect",label:"Inspect",icon:<MousePointer2 size={16} aria-hidden="true"/>},
+            {id:"build",label:"Build",icon:<Building2 size={16} aria-hidden="true"/>},
+            {id:"text",label:"Text",icon:<TypeIcon size={16} aria-hidden="true"/>},
+            {id:"parts",label:"Parts",icon:<Blocks size={16} aria-hidden="true"/>},
+            {id:"sheet",label:"Sheet setup",icon:<FileText size={16} aria-hidden="true"/>},
+            {id:"git",label:"Git",icon:<GitBranch size={16} aria-hidden="true"/>},
+          ]} />)}
+          <div id="workspace-panel-inspect" role={isDesktop ? "tabpanel" : "region"} aria-labelledby={isDesktop ? "workspace-tab-inspect" : undefined} aria-label={isDesktop ? undefined : "Selection properties"} hidden={workspaceTab !== "inspect"} class="workspace-content">
+
           <h2>
             <MousePointer2 size={17} aria-hidden="true" />
             Selection
           </h2>
           {isDesktop && <AiContextStatusLine state={aiContextState} />}
+          {isDesktop && artifacts !== null && <CreationAttributesPanel source={selectedEntityIds.size === 1 ? selectedEditorEntity : null} acquired={acquiredAttributes} disabled={isEditSaving || isHistoryBusy || projectState?.editable === false} onAcquire={pickSelectedAttributes} onClear={clearAcquiredAttributes} />}
           {selectedEntityId === "" || selectedSummary === null ? (
-            <p class="muted">Select an entity on the paper or from a result list.</p>
+            <div class="selection-empty"><MousePointer2 size={28} aria-hidden="true" /><h3>Inspect your drawing</h3><p class="muted">Select an entity on the paper or from a result list.</p><dl class="gesture-guide"><div><dt>Select multiple</dt><dd>Shift + click</dd></div><div><dt>Zoom</dt><dd>Scroll wheel</dd></div><div><dt>Cancel command</dt><dd>Esc</dd></div></dl></div>
           ) : (
             <>
               <EntityDetails entityId={selectedEntityId} summary={selectedSummary} />
@@ -3127,6 +3347,101 @@ function App() {
               )}
             </>
           )}
+          </div>
+          <div id="workspace-panel-build" role="tabpanel" aria-labelledby="workspace-tab-build" hidden={workspaceTab !== "build"} class="workspace-content">
+            <div class="task-intro"><h2>Building & measurement</h2><p>Generate geometry, review it on the drawing, then apply.</p></div>
+          {isDesktop && projectState !== null && artifacts !== null && <ToolkitPanel key={`${projectState.project_path}:${artifacts.currentDrawing}:${artifacts.editor.revision}`} selected={[...selectedEntityIds]} pens={artifacts.editor.pens} disabled={isEditSaving || isHistoryBusy || projectState.editable === false || isViewportSheet || liveReviewState.status === "refreshing"} previewReady={generatedPreviewOwner === "building" && pendingOperation?.kind === "source_checked" && editPreview !== null} onGenerate={async (geometry, pen) => {
+            const layer = activeLayerEditable();
+            if (layer === null) throw new Error("Choose a visible, unlocked active layer.");
+            const sequence = ++asyncDraftSequence.current;
+            const result = await invoke<{ operation: EditOperation; warnings: string[];analysis_report:unknown|null }>("generate_drafting_edit", { projectPath: projectState.project_path, drawing: artifacts.currentDrawing, expectedRevision: artifacts.editor.revision, request: { layer, pen, geometry } });
+            if (sequence !== asyncDraftSequence.current || currentDrawingRef.current !== artifacts.currentDrawing || projectStateRef.current?.project_path !== projectState.project_path || currentEditorRevisionRef.current !== artifacts.editor.revision) throw new Error("Draft or source context changed during generation");
+            setPendingOperation(result.operation);
+            setGeneratedPreviewOwner("building");
+            if(result.analysis_report!==null)setCadMassingReport(result.analysis_report);
+            setEditorMode("select"); setCadCommand("select"); setDraftPoints([]);
+            return result.warnings;
+          }} sourceRevision={artifacts.editor.revision} textStyles={artifacts.editor.text_styles} initialPen={draftingOptions.pen} initialTextStyle={draftingOptions.style} analysisReport={cadMassingReport} reportSaveDisabled={isEditSaving||isHistoryBusy} onSaveReport={async(path,report)=>{
+            const selected=path||await save({title:"New massing calculation report",defaultPath:"massing-report.json",filters:[{name:"JSON report",extensions:["json"]}]});if(!selected)return false;
+            await invoke("save_massing_analysis_report",{projectPath:projectState.project_path,path:selected,report});return true;
+          }} onMeasure={options => invoke<ToolkitMeasurement>("measure_drawing", { projectPath: projectState.project_path, drawing: artifacts.currentDrawing, entityIds: [...selectedEntityIds], ...options })} onApply={() => pendingOperation !== null && void commitDrawingEdit(pendingOperation)} onCancel={() => selectEditorMode("select")} />}
+            {projectState === null && <p class="task-notice">Open a project to use these tools.</p>}
+          </div>
+          <div id="workspace-panel-text" role="tabpanel" aria-labelledby="workspace-tab-text" hidden={workspaceTab !== "text"} class="workspace-content">
+            <div class="task-intro"><h2>Text workspace</h2><p>Find, format and replace drawing annotations.</p></div>
+          {isDesktop && projectState !== null && artifacts !== null && <TextToolsPanel key={`text:${projectState.project_path}:${artifacts.currentDrawing}:${artifacts.editor.revision}`} entities={artifacts.editor.entities} styles={artifacts.editor.text_styles} selected={[...selectedEntityIds]} sourceRevision={artifacts.editor.revision} disabled={isEditSaving || isHistoryBusy || projectState.editable === false || isViewportSheet || liveReviewState.status === "refreshing"} previewReady={generatedPreviewOwner === "text" && pendingOperation?.kind === "source_checked" && editPreview !== null} onGenerate={async request => {
+            const sequence = ++asyncDraftSequence.current;
+            const result = await invoke<{operation:EditOperation;warnings:string[]}>("generate_text_edit", {projectPath: projectState.project_path, drawing: artifacts.currentDrawing, expectedRevision: artifacts.editor.revision, request});
+            if (sequence !== asyncDraftSequence.current || currentDrawingRef.current !== artifacts.currentDrawing || projectStateRef.current?.project_path !== projectState.project_path || currentEditorRevisionRef.current !== artifacts.editor.revision) throw new Error("Draft or source context changed during text generation");
+            return result;
+          }} onPreview={operation => {
+            setPendingOperation(operation); setGeneratedPreviewOwner("text");
+            setEditorMode("select"); setCadCommand("select"); setDraftPoints([]);
+          }} onApply={() => pendingOperation !== null && void commitDrawingEdit(pendingOperation)} onCancel={() => selectEditorMode("select")} onSelect={id => selectEntity(id, true)} />}
+            {projectState === null && <p class="task-notice">Open a project to use these tools.</p>}
+          </div>
+          <div id="workspace-panel-parts" role="tabpanel" aria-labelledby="workspace-tab-parts" hidden={workspaceTab !== "parts"} class="workspace-content">
+            <div class="task-intro"><h2>Parts & clipboard</h2><p>Reuse geometry with reviewed placements and mappings.</p></div>
+          {isDesktop && projectState!==null && artifacts!==null && <ClipboardPanel key={`clipboard:${projectState.project_path}:${artifacts.currentDrawing}:${artifacts.editor.revision}`} selected={[...selectedEntityIds]} document={cadClipboard} onDocument={setCadClipboard} pasteDisabled={projectState.editable===false||isViewportSheet} disabled={isEditSaving||isHistoryBusy||liveReviewState.status==="refreshing"} onCopy={(basePoint,dimensions)=>invoke<CadClipboard>("copy_cad_entities",{projectPath:projectState.project_path,drawing:artifacts.currentDrawing,entityIds:[...selectedEntityIds],basePoint,dimensions})} onPreview={(document,at,rotationDeg,scale)=>invoke<PastePreview>("preview_cad_paste",{projectPath:projectState.project_path,document,request:{drawing:artifacts.currentDrawing,at,rotation_deg:rotationDeg,scale}})} onApply={async(document,at,expectedPlan,rotationDeg,scale)=>{
+            reviewQueue.reset();setIsHistoryBusy(true);selectEditorMode("select");
+            try {const result=await invoke<{entity_ids:string[]}>("apply_cad_paste",{projectPath:projectState.project_path,document,request:{drawing:artifacts.currentDrawing,at,rotation_deg:rotationDeg,scale},expectedPlan});setSelectedEntityIds(new Set(result.entity_ids));setSelectedEntityId(result.entity_ids[0]??"");return result;}
+            finally {enqueueDesktopReview(projectState.project_path);setIsHistoryBusy(false);}
+          }} onChoosePart={async saving=>{
+            const selected=saving?await save({title:"New CAD part",defaultPath:"part.cadpart.json",filters:[{name:"CAD part",extensions:["json"]}]}):await open({title:"Load CAD part",multiple:false,filters:[{name:"CAD part",extensions:["json"]}]});
+            return typeof selected==="string"?selected:null;
+          }} onSavePart={(path,document)=>invoke("save_cad_part",{projectPath:projectState.project_path,path,document})} onLoadPart={path=>invoke<CadClipboard>("load_cad_part",{path})} onChooseJws={async()=>{
+            const selected=await open({title:"Load JWS part",multiple:false,filters:[{name:"JWS symbol",extensions:["jws"]}]});return typeof selected==="string"?selected:null;
+          }} onLoadJws={(path,coordinateScale)=>invoke<JwsPart>("load_jws_part",{path,coordinateScale})} jwsReport={cadJwsReport} onJwsReport={setCadJwsReport} onChooseLibrary={async()=>{
+            const selected=await open({title:"Part library folder",directory:true,multiple:false});return typeof selected==="string"?selected:null;
+          }} onListLibrary={request=>invoke<PartLibraryReport>("list_cad_part_library",{request})} onLoadLibrary={(path,expectedBlake3,coordinateScale)=>invoke<LoadedLibraryPart>("load_cad_library_part",{path,expectedBlake3,coordinateScale})}/>}
+            {projectState === null && <p class="task-notice">Open a project to use these tools.</p>}
+          </div>
+          <div id="workspace-panel-sheet" role="tabpanel" aria-labelledby="workspace-tab-sheet" hidden={workspaceTab !== "sheet"} class="workspace-content">
+            <div class="task-intro"><h2>Sheet setup</h2><p>Compose drawing views at independent paper scales.</p></div>
+          {isDesktop && projectState!==null && artifacts!==null && artifacts.layouts?.filter(layout=>layout.active).map(layout=><SheetViewportsPanel key={`sheet:${projectState.project_path}:${artifacts.currentDrawing}:${layout.revision}:${artifacts.editor.revision}`} layout={layout} drawing={artifacts.currentDrawing} drawings={artifacts.drawingNames} layers={artifacts.layers.layers.map(layer=>layer.id)} disabled={isEditSaving||isHistoryBusy||projectState.editable===false||liveReviewState.status==="refreshing"} onPreview={views=>invoke<SheetPreview>("preview_sheet_viewports",{projectPath:projectState.project_path,drawing:artifacts.currentDrawing,layout:layout.id,viewports:views})} onApply={async(views,expectedPlan)=>{
+            reviewQueue.reset();setIsHistoryBusy(true);selectEditorMode("select");
+            try {return await invoke("apply_sheet_viewports",{projectPath:projectState.project_path,drawing:artifacts.currentDrawing,layout:layout.id,viewports:views,expectedPlan});}
+            finally {enqueueDesktopReview(projectState.project_path);setIsHistoryBusy(false);}
+          }}/ >)}
+            {projectState === null && <p class="task-notice">Open a project to use these tools.</p>}
+          </div>
+          <div id="workspace-panel-git" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={workspaceTab !== "git"} class="workspace-content">
+            <div class="task-intro"><h2>Version control</h2><p>Compare revisions, review staging and commit candidates.</p></div>
+        {isDesktop && projectState?.is_git_project && <GitComparisonControls
+          key={projectState.project_path}
+          value={gitComparison}
+          disabled={liveReviewState.status === "refreshing" || isEditSaving || isHistoryBusy}
+          onApply={comparison => {
+            reviewQueue.reset();
+            gitComparisonRef.current = comparison;
+            setGitComparison(comparison);
+            enqueueDesktopReview(projectState.project_path);
+          }}
+        />}
+          {isDesktop && projectState?.is_git_project && artifacts !== null && <GitStagePanel key={`${projectState.project_path}:${artifacts.currentDrawing}:${artifacts.editor.revision}:${[...selectedEntityIds].sort().join(",")}`} selected={[...selectedEntityIds]} disabled={isEditSaving || isHistoryBusy || liveReviewState.status === "refreshing"} onPreview={() => invoke<StagePreview>("preview_git_stage", {projectPath: projectState.project_path, drawing: artifacts.currentDrawing, entityIds: [...selectedEntityIds]})} onApply={async expectedPlan => {
+            await invoke("apply_git_stage", {projectPath: projectState.project_path, drawing: artifacts.currentDrawing, entityIds: [...selectedEntityIds], expectedPlan});
+            enqueueDesktopReview(projectState.project_path);
+          }} />}
+          {isDesktop && projectState?.is_git_project && artifacts !== null && <GitCommitPanel key={projectState.project_path} disabled={isEditSaving || isHistoryBusy || liveReviewState.status === "refreshing"} onPreview={message => invoke<CommitPreview>("preview_git_commit", { projectPath: projectState.project_path, message })} onCompareIndex={() => {
+            const comparison={base:"HEAD",head:"index"}; reviewQueue.reset();gitComparisonRef.current=comparison;setGitComparison(comparison);setViewMode("diff");enqueueDesktopReview(projectState.project_path);
+          }} onApply={async (message, expectedPlan) => {
+            setIsHistoryBusy(true);
+            try {
+              const result = await invoke<CommitPreview>("apply_git_commit", { projectPath: projectState.project_path, message, expectedPlan, withoutHooks: true });
+              enqueueDesktopReview(projectState.project_path);
+              return result;
+            } finally { setIsHistoryBusy(false); }
+          }} />}
+          {isDesktop && projectState?.is_git_project && artifacts !== null && <GitMergePanel key={`merge:${projectState.project_path}:${artifacts.currentDrawing}:${artifacts.editor.revision}`} disabled={isEditSaving || isHistoryBusy || projectState.editable === false || isViewportSheet || liveReviewState.status === "refreshing"} onPreview={(base,theirs)=>invoke<MergePreview>("preview_git_merge", {projectPath:projectState.project_path,drawing:artifacts.currentDrawing,base,theirs})} onApply={async(base,theirs,expectedPlan)=>{
+            reviewQueue.reset();setIsHistoryBusy(true);selectEditorMode("select");
+            try {return await invoke("apply_git_merge",{projectPath:projectState.project_path,drawing:artifacts.currentDrawing,base,theirs,expectedPlan});}
+            finally {enqueueDesktopReview(projectState.project_path);setIsHistoryBusy(false);}
+          }}/ >}
+          {isDesktop && projectState?.is_git_project && artifacts !== null && selectedEntityIds.size===1 && <EntityHistoryPanel key={`${projectState.project_path}:${artifacts.currentDrawing}:${selectedEntityId}`} disabled={isEditSaving || isHistoryBusy} onLoad={limit => invoke<EntityHistory>("load_entity_history",{projectPath:projectState.project_path,entityId:[...selectedEntityIds][0],revision:"HEAD",limit})} onLoadBlame={limit => invoke<EntityBlame>("load_entity_blame",{projectPath:projectState.project_path,entityId:[...selectedEntityIds][0],revision:"HEAD",limit})} onCompare={(base,head) => {
+            const comparison={base,head}; reviewQueue.reset(); gitComparisonRef.current=comparison; setGitComparison(comparison); setViewMode("diff"); enqueueDesktopReview(projectState.project_path);
+          }} />}
+            {!projectState?.is_git_project && <p class="task-notice">Open a project in a Git repository to compare and review revisions.</p>}
+          </div>
         </aside>
       </section>
       <footer class="command-bar">
@@ -3150,8 +3465,8 @@ function App() {
             }
           }}
         />
-        <button type="button" class={snapEnabled ? "command-toggle is-active" : "command-toggle"} onClick={() => setSnapEnabled((enabled) => !enabled)}>F3 SNAP</button>
-        <button type="button" class={orthoEnabled ? "command-toggle is-active" : "command-toggle"} onClick={() => setOrthoEnabled((enabled) => !enabled)}>F8 ORTHO</button>
+        <button type="button" class={snapEnabled ? "command-toggle is-active" : "command-toggle"} aria-pressed={snapEnabled} onClick={() => setSnapEnabled((enabled) => !enabled)}>F3 SNAP</button>
+        <button type="button" class={orthoEnabled ? "command-toggle is-active" : "command-toggle"} aria-pressed={orthoEnabled} onClick={() => setOrthoEnabled((enabled) => !enabled)}>F8 ORTHO</button>
         <span class="command-status" aria-live="polite">
           {snapCandidate !== null ? `${snapCandidate.kind} ${snapCandidate.point[0].toFixed(2)}, ${snapCandidate.point[1].toFixed(2)}` : selectedEntityIds.size > 0 ? `${selectedEntityIds.size} selected` : historyState?.context_blocked ?? historyMessage}
         </span>
@@ -3165,6 +3480,23 @@ function App() {
           onExport={performJwwExport}
         />
       )}
+      {dxfMode !== null && <DxfExchangeDialog mode={dxfMode} drawings={artifacts?.drawingNames ?? []} currentDrawing={artifacts?.currentDrawing ?? ""} onClose={() => setDxfMode(null)} onChooseInput={async () => {
+        const path = await open({ title: "Import DXF", multiple: false, filters: [{ name: "DXF", extensions: ["dxf"] }] });
+        return typeof path === "string" ? path : null;
+      }} onChooseOutput={async input => {
+        if (dxfMode === "export") return save({ title: "New DXF file", defaultPath: `${projectState?.project_name ?? "drawing"}.dxf`, filters: [{ name: "DXF", extensions: ["dxf"] }] });
+        const parent = await open({ title: "Choose parent for a new DXF project", directory: true, multiple: false });
+        const name = input.split(/[\\/]/).pop()?.replace(/\.dxf$/i, "") || "dxf-import";
+        return typeof parent === "string" ? `${parent}/${name}-cad` : null;
+      }} onSubmit={async values => {
+        if (dxfMode === "import") {
+          const result = await invoke<DxfFileReport>("import_dxf", { inputPath: values.input, outputPath: values.output, reportPath: values.report, unitMm: values.unitMm });
+          if (result.status === "ready") await openDesktopProject(result.output_path);
+          return result;
+        }
+        if (projectState === null) throw new Error("Open a CAD project before exporting.");
+        return invoke<DxfFileReport>("export_dxf", { projectPath: projectState.project_path, drawing: values.drawing, outputPath: values.output, reportPath: values.report, strict: values.strict });
+      }} />}
       {projectSetupMode !== null && (
         <ProjectSetupDialog
           mode={projectSetupMode}
@@ -3819,8 +4151,8 @@ function PanelHeader(props: {
   return (
     <div class="panel-header">
       <div>
-        <p class="eyebrow">Generated review</p>
-        <h1>{projectState?.project_name ?? "plan_1f"}</h1>
+        <p class="eyebrow">Project navigator</p>
+        <h1>{projectState?.project_name ?? artifacts?.currentDrawing ?? "CAD workspace"}</h1>
         {projectState !== null && <p class="project-path">{projectState.project_path}</p>}
         {importMessage !== "" && <p class="warning-line">{importMessage}</p>}
         {projectState?.jww_edit_capability === "mapped_v600" && (
@@ -3858,7 +4190,7 @@ function AiContextStatusLine(props: { state: AiContextState }) {
   if (state.status === "error") {
     return <p class="warning-line">AI Context: write failed: {state.message ?? "unknown error"}</p>;
   }
-  return <p class="warning-line">AI Context: no entity selected</p>;
+  return <p class="context-idle">AI Context: no entity selected</p>;
 }
 
 function LiveReviewStatus(props: { state: LiveReviewState }) {
@@ -3911,6 +4243,10 @@ function ResultPanel(props: {
           <FileJson2 size={17} aria-hidden="true" />
           Diff
         </h2>
+        {artifacts.comparison !== undefined && <p class="row-note snapshot-identity">
+          {artifacts.comparison.base.revision} ({artifacts.comparison.base.snapshot_blake3.slice(0, 8)})
+          {" → "}{artifacts.comparison.head.revision} ({artifacts.comparison.head.snapshot_blake3.slice(0, 8)})
+        </p>}
         {artifacts.diffUnavailable !== undefined && (
           <p class="warning-line">{artifacts.diffUnavailable}</p>
         )}
@@ -3992,6 +4328,7 @@ function ResultPanel(props: {
                 }}
               >
                 <span>{comment.text}</span>
+                <span class="comment-version">{commentVersionLabel(comment.binding_state ?? 'unbound')}</span>
               </button>
               <small>
                 {comment.status}
@@ -4062,6 +4399,7 @@ function EntityDetails(props: {
           summary.comments.map((comment) => (
             <p class="detail-line" key={comment.id}>
               <strong>{comment.status}</strong>
+              <span class="comment-version">{commentVersionLabel(comment.binding_state ?? 'unbound')}</span>
               <span>{comment.text}</span>
             </p>
           ))
@@ -4207,29 +4545,6 @@ function sameViewBox(left: ViewBox, right: ViewBox): boolean {
   );
 }
 
-function sanitizeSvg(svgText: string): string {
-  const document = new DOMParser().parseFromString(svgText, "image/svg+xml");
-  if (document.querySelector("parsererror") !== null) {
-    throw new Error("SVG parse failed");
-  }
-  document.querySelectorAll("script, foreignObject, image, use, iframe, object, embed").forEach((element) => element.remove());
-  document.querySelectorAll("*").forEach((element) => {
-    Array.from(element.attributes).forEach((attribute) => {
-      const attributeName = attribute.name.toLowerCase();
-      const attributeValue = attribute.value.trim().toLowerCase();
-      if (
-        attributeName.startsWith("on")
-        || attributeName === "href"
-        || attributeName.endsWith(":href")
-        || attributeValue.includes("javascript:")
-        || attributeValue.includes("url(")
-      ) {
-        element.removeAttribute(attribute.name);
-      }
-    });
-  });
-  return new XMLSerializer().serializeToString(document.documentElement);
-}
 
 async function fetchText(path: string): Promise<string> {
   const response = await fetch(path);
@@ -4338,7 +4653,12 @@ function parseComment(value: unknown): CommentRecord {
     entity_ids: readArray(value.entity_ids).map(readString),
     text: readString(value.text),
     status: readString(value.status),
+    binding_state: isRecord(value.binding) ? 'invalid' : 'unbound',
   };
+}
+
+function commentVersionLabel(state: NonNullable<CommentRecord['binding_state']>): string {
+  return {unbound:'Original version unrecorded',current:'Original entity unchanged',entity_changed:'Entity changed since comment',entity_deleted:'Original entity deleted',entity_moved:'Original entity moved to another drawing',source_changed:'Canonical source changed; review context',invalid:'Version metadata could not be verified'}[state];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

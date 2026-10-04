@@ -43,6 +43,7 @@ pub enum ChangeReason {
     BlockChanged,
     HatchChanged,
     LayoutChanged,
+    DependencyChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,6 +128,8 @@ pub fn diff_selected_drawing(
 ) -> DiffReport {
     let mut changes = Vec::new();
     let mut warnings = Vec::new();
+    let base_blocks = block_visual_signatures(base);
+    let head_blocks = block_visual_signatures(head);
 
     let base_drawings = drawings_by_name(base);
     let head_drawings = drawings_by_name(head);
@@ -172,8 +175,19 @@ pub fn diff_selected_drawing(
                     });
                 }
                 (Some(base_record), Some(head_record)) => {
-                    let reasons =
+                    let mut reasons =
                         change_reasons(base, head, &base_record.entity, &head_record.entity);
+                    if let (
+                        Entity::BlockRef { block: before, .. },
+                        Entity::BlockRef { block: after, .. },
+                    ) = (&base_record.entity, &head_record.entity)
+                        && base_blocks.get(before) != head_blocks.get(after)
+                    {
+                        reasons.push(ChangeReason::BlockChanged);
+                        reasons.push(ChangeReason::DependencyChanged);
+                    }
+                    reasons.sort();
+                    reasons.dedup();
                     let kind = if reasons.is_empty() {
                         ChangeKind::Unchanged
                     } else {
@@ -275,7 +289,72 @@ fn configuration_changes(
             &mut changes,
         );
     }
+    let before_views = viewport_render_signatures(base, drawing);
+    let after_views = viewport_render_signatures(head, drawing);
+    for path in before_views
+        .keys()
+        .chain(after_views.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let before = before_views
+            .get(path)
+            .map(|hash| serde_json::Value::String(hash.clone()));
+        let after = after_views
+            .get(path)
+            .map(|hash| serde_json::Value::String(hash.clone()));
+        collect_optional_json_changes(
+            &format!("viewport_sources.{path}"),
+            before.as_ref(),
+            after.as_ref(),
+            &mut changes,
+        );
+    }
     changes
+}
+
+fn viewport_render_signatures(
+    project: &ProjectSource,
+    selected: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut signatures = BTreeMap::new();
+    if !project
+        .drawings
+        .iter()
+        .filter(|drawing| selected.is_none_or(|name| name == drawing.name))
+        .any(|drawing| {
+            drawing
+                .layouts
+                .layouts
+                .values()
+                .any(|layout| !layout.viewports.is_empty())
+        })
+    {
+        return signatures;
+    }
+    let mut candidate = project.clone();
+    for (index, drawing) in project
+        .drawings
+        .iter()
+        .enumerate()
+        .filter(|(_, drawing)| selected.is_none_or(|name| name == drawing.name))
+    {
+        for (name, layout) in &drawing.layouts.layouts {
+            if layout.viewports.is_empty() {
+                continue;
+            }
+            candidate.drawings[index].layouts.active_layout = name.clone();
+            let value = match cad_render_svg::render_drawing_svg(&candidate, &drawing.name) {
+                Ok(svg) => format!("svg:{svg}"),
+                Err(error) => format!("error:{error}"),
+            };
+            signatures.insert(
+                format!("{}/{name}", drawing.name),
+                blake3::hash(value.as_bytes()).to_hex().to_string(),
+            );
+        }
+        candidate.drawings[index].layouts.active_layout = drawing.layouts.active_layout.clone();
+    }
+    signatures
 }
 
 fn layout_file_signatures(
@@ -484,6 +563,54 @@ fn drawings_by_name(project: &ProjectSource) -> BTreeMap<String, &[EntityRecord]
         .collect()
 }
 
+fn block_visual_signatures(project: &ProjectSource) -> BTreeMap<String, String> {
+    fn signature(
+        project: &ProjectSource,
+        name: &str,
+        visiting: &mut BTreeSet<String>,
+        cache: &mut BTreeMap<String, String>,
+    ) -> String {
+        if let Some(value) = cache.get(name) {
+            return value.clone();
+        }
+        if visiting.len() >= 32 || !visiting.insert(name.to_owned()) {
+            return format!("invalid block recursion: {name}");
+        }
+        let mut hash = blake3::Hasher::new();
+        if let Some(block) = project.blocks.get(name) {
+            hash.update(format!("{:?}", block.config.base_point).as_bytes());
+            for record in &block.entities {
+                hash.update(entity_geometry_signature(&record.entity).as_bytes());
+                hash.update(entity_text_signature(&record.entity).as_bytes());
+                hash.update(resolved_style_signature(project, &record.entity).as_bytes());
+                if matches!(record.entity, Entity::Dimension { .. }) {
+                    hash.update(
+                        format!(
+                            "{:?}",
+                            cad_model::dimension_primitives(project, &record.entity)
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if let Entity::BlockRef { block, .. } = &record.entity {
+                    hash.update(signature(project, block, visiting, cache).as_bytes());
+                }
+            }
+        } else {
+            hash.update(b"missing block");
+        }
+        visiting.remove(name);
+        let value = hash.finalize().to_hex().to_string();
+        cache.insert(name.to_owned(), value.clone());
+        value
+    }
+    let mut cache = BTreeMap::new();
+    for name in project.blocks.keys() {
+        signature(project, name, &mut BTreeSet::new(), &mut cache);
+    }
+    cache
+}
+
 fn entities_by_id(records: &[EntityRecord]) -> BTreeMap<String, &EntityRecord> {
     records
         .iter()
@@ -501,6 +628,17 @@ fn change_reasons(
 
     if entity_geometry_signature(base) != entity_geometry_signature(head) {
         reasons.insert(ChangeReason::GeometryChanged);
+    }
+    if matches!(
+        (base, head),
+        (Entity::Dimension { .. }, Entity::Dimension { .. })
+    ) && cad_model::dimension_primitives(base_project, base)
+        != cad_model::dimension_primitives(head_project, head)
+    {
+        reasons.insert(ChangeReason::GeometryChanged);
+        if base == head {
+            reasons.insert(ChangeReason::DependencyChanged);
+        }
     }
     match (base, head) {
         (Entity::BlockRef { block: before, .. }, Entity::BlockRef { block: after, .. })
@@ -597,8 +735,9 @@ fn entity_geometry_signature(entity: &Entity) -> String {
             at,
             rotation_deg,
             mirror_y,
+            writing_mode,
             ..
-        } => format!("text:{at:?}:{rotation_deg}:{mirror_y}"),
+        } => format!("text:{at:?}:{rotation_deg}:{mirror_y}:{writing_mode:?}"),
         Entity::Point {
             at,
             temporary,
@@ -816,6 +955,7 @@ fn text_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
             at,
             rotation_deg,
             mirror_y,
+            writing_mode,
             value,
             ..
         } => project
@@ -823,6 +963,15 @@ fn text_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
             .text_styles
             .get(style)
             .and_then(|text_style| {
+                if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                    return cad_model::upright_text_bbox(
+                        *at,
+                        *rotation_deg,
+                        *mirror_y,
+                        value,
+                        text_style,
+                    );
+                }
                 text_bbox_for_style(
                     at,
                     *rotation_deg,
@@ -837,6 +986,16 @@ fn text_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
 }
 
 fn visual_bbox(project: &ProjectSource, record: &EntityRecord) -> Option<BBox> {
+    if matches!(
+        record.entity,
+        Entity::BlockRef { .. }
+            | Entity::Dimension {
+                measurement: Some(_),
+                ..
+            }
+    ) {
+        return cad_render_svg::render_entity_bbox(project, &record.entity);
+    }
     match &record.entity {
         Entity::Text { .. } => text_bbox(project, record).or_else(|| entity_bbox(&record.entity)),
         Entity::Dimension { .. } => {
@@ -954,10 +1113,28 @@ fn render_overlay_entity(
     opacity: f64,
     class_name: &str,
 ) -> Group {
+    render_overlay_entity_with_depth(project, record, color, opacity, class_name, 0)
+}
+
+fn render_overlay_entity_with_depth(
+    project: &ProjectSource,
+    record: &EntityRecord,
+    color: &str,
+    opacity: f64,
+    class_name: &str,
+    depth: usize,
+) -> Group {
     let layer_visible = entity_is_effectively_visible(project, &record.entity);
     let mut group = Group::new()
         .set("class", class_name)
-        .set("data-entity-id", record.entity.id().as_str())
+        .set(
+            if depth == 0 {
+                "data-entity-id"
+            } else {
+                "data-block-child-id"
+            },
+            record.entity.id().as_str(),
+        )
         .set("data-layer", record.entity.layer())
         .set("data-layer-visible", layer_visible)
         .set("opacity", opacity)
@@ -1051,15 +1228,41 @@ fn render_overlay_entity(
             ..
         } => {
             if let Some(text_style) = project.styles.text_styles.get(style) {
-                group = group.add(text_node(
-                    at,
-                    *rotation_deg,
-                    *mirror_y,
-                    value,
-                    text_style,
-                    text_anchor(&text_style.align),
-                    color,
-                ));
+                if let Entity::Text {
+                    writing_mode: cad_model::TextWritingMode::VerticalUpright,
+                    ..
+                } = &record.entity
+                {
+                    let mut glyph_style = text_style.clone();
+                    glyph_style.align = TextAlign::Left;
+                    for (position, character) in cad_model::upright_text_glyphs(
+                        *at,
+                        *rotation_deg,
+                        *mirror_y,
+                        value,
+                        text_style,
+                    ) {
+                        group = group.add(text_node(
+                            &position,
+                            *rotation_deg,
+                            *mirror_y,
+                            &character.to_string(),
+                            &glyph_style,
+                            "start",
+                            color,
+                        ));
+                    }
+                } else {
+                    group = group.add(text_node(
+                        at,
+                        *rotation_deg,
+                        *mirror_y,
+                        value,
+                        text_style,
+                        text_anchor(&text_style.align),
+                        color,
+                    ));
+                }
             } else {
                 group = group.add(
                     Text::new("")
@@ -1074,6 +1277,26 @@ fn render_overlay_entity(
                         )
                         .add(svg::node::Text::new(value.clone())),
                 );
+            }
+        }
+        Entity::Dimension {
+            measurement: Some(_),
+            ..
+        } => {
+            if let Ok(primitives) = cad_model::dimension_primitives(project, &record.entity) {
+                for entity in primitives {
+                    group = group.add(render_overlay_entity_with_depth(
+                        project,
+                        &EntityRecord {
+                            line: record.line,
+                            entity,
+                        },
+                        color,
+                        1.0,
+                        class_name,
+                        depth + 1,
+                    ));
+                }
             }
         }
         Entity::Dimension {
@@ -1186,8 +1409,38 @@ fn render_overlay_entity(
             at,
             rotation_deg,
             scale,
+            mirror_x,
+            mirror_y,
             ..
         } => {
+            if let Some(definition) = project.blocks.get(block)
+                && depth < 32
+            {
+                let mut contents = Group::new().set(
+                    "transform",
+                    format!(
+                        "translate({} {}) rotate({}) scale({} {}) translate({} {})",
+                        at[0],
+                        svg_y(at[1]),
+                        -rotation_deg,
+                        scale * if *mirror_x { -1.0 } else { 1.0 },
+                        scale * if *mirror_y { -1.0 } else { 1.0 },
+                        -definition.config.base_point[0],
+                        definition.config.base_point[1]
+                    ),
+                );
+                for child in &definition.entities {
+                    contents = contents.add(render_overlay_entity_with_depth(
+                        project,
+                        child,
+                        color,
+                        1.0,
+                        class_name,
+                        depth + 1,
+                    ));
+                }
+                return group.add(contents);
+            }
             let size = 100.0 * scale;
             group = group
                 .add(
@@ -1429,6 +1682,47 @@ fn normalize_zero(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_sheet_reports_changes_in_its_source_drawing() {
+        let mut base = cad_model::load_project(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small"),
+        )
+        .unwrap();
+        let mut sheet = base.drawings[0].clone();
+        sheet.name = "sheet".into();
+        sheet.entities.clear();
+        sheet.layouts.layouts.get_mut("default").unwrap().viewports =
+            vec![cad_model::LayoutViewport {
+                name: "Plan".into(),
+                drawing: "plan_1f".into(),
+                origin: [0., 0.],
+                at_mm: [10., 10.],
+                size_mm: [100., 100.],
+                scale: "1/100".into(),
+                layers: vec![],
+            }];
+        base.drawings.push(sheet);
+        let mut head = base.clone();
+        if let cad_model::Entity::Line { p2, .. } = &mut head.drawings[0].entities[0].entity {
+            *p2 = [1000., 0.];
+        } else {
+            panic!()
+        }
+        let report = super::diff_selected_drawing(&base, &head, Some("sheet"));
+        assert!(report.changes.is_empty());
+        assert!(
+            report
+                .configuration_changes
+                .iter()
+                .any(|change| change.path == "viewport_sources.sheet/default")
+        );
+        assert!(
+            !report
+                .configuration_changes
+                .iter()
+                .any(|change| change.path.starts_with("layouts."))
+        );
+    }
     use super::*;
     use std::fs::{create_dir_all, write};
 
@@ -1533,6 +1827,108 @@ mod tests {
                 .reasons
                 .contains(&ChangeReason::GeometryChanged)
         );
+    }
+
+    #[test]
+    fn reference_dimensions_change_when_only_the_wall_changes() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance");
+        let base = cad_model::load_project(root).unwrap();
+        let mut head = base.clone();
+        let Entity::Polyline { points, .. } = &mut head.drawings[0].entities[0].entity else {
+            panic!("expected acceptance wall");
+        };
+        points[1][0] += 300.0;
+        points[2][0] += 300.0;
+        let report = diff_projects(&base, &head);
+        let horizontal = report
+            .changes
+            .iter()
+            .find(|change| change.entity_id.ends_with("0110"))
+            .unwrap();
+        assert_eq!(horizontal.kind, ChangeKind::Modified);
+        assert!(
+            horizontal
+                .reasons
+                .contains(&ChangeReason::DependencyChanged)
+        );
+        let vertical = report
+            .changes
+            .iter()
+            .find(|change| change.entity_id.ends_with("0111"))
+            .unwrap();
+        assert_eq!(vertical.kind, ChangeKind::Unchanged);
+        let svg = render_diff_svg(&base, &head, &report);
+        assert!(svg.contains("5000 mm") && svg.contains("5300 mm"));
+        assert!(svg.contains("data-entity-id=\"ent_01JZ0000000000000000000110\""));
+    }
+
+    #[test]
+    fn shared_block_changes_mark_every_placement_and_render_actual_contents() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance");
+        let base = cad_model::load_project(root).unwrap();
+        let mut head = base.clone();
+        let Entity::Line { p2, .. } = &mut head.blocks.get_mut("door").unwrap().entities[0].entity
+        else {
+            panic!("expected door line");
+        };
+        p2[0] += 200.0;
+        let report = diff_projects(&base, &head);
+        let placements: Vec<_> = base.drawings[0]
+            .entities
+            .iter()
+            .filter(|record| matches!(record.entity, Entity::BlockRef { .. }))
+            .collect();
+        assert_eq!(placements.len(), 3);
+        for record in placements {
+            let change = report
+                .changes
+                .iter()
+                .find(|change| change.entity_id == record.entity.id().as_str())
+                .unwrap();
+            assert_eq!(change.kind, ChangeKind::Modified);
+            assert!(change.reasons.contains(&ChangeReason::DependencyChanged));
+        }
+        let svg = render_diff_svg(&base, &head, &report);
+        assert!(svg.contains("data-block-child-id="));
+        assert!(svg.contains("scale(-1 1)"));
+    }
+
+    #[test]
+    fn nested_block_definition_change_reaches_top_level_placements() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance");
+        let mut base = cad_model::load_project(root).unwrap();
+        let mut inner = base.blocks["door"].clone();
+        inner.id = "inner".into();
+        base.blocks.insert("inner".into(), inner);
+        let child: Entity = serde_json::from_value(serde_json::json!({"schema_version":"0.3","id":"ent_01JZ0000000000000000000999","type":"block_ref","layer":"0-1","block":"inner","at":[100,200],"scale":2,"rotation_deg":30,"mirror_y":true})).unwrap();
+        base.blocks.get_mut("door").unwrap().entities = vec![EntityRecord {
+            line: 1,
+            entity: child,
+        }];
+        let mut head = base.clone();
+        let Entity::Line { p2, .. } = &mut head.blocks.get_mut("inner").unwrap().entities[0].entity
+        else {
+            panic!()
+        };
+        p2[0] += 123.0;
+        let report = diff_projects(&base, &head);
+        for record in &base.drawings[0].entities {
+            if matches!(record.entity, Entity::BlockRef { .. }) {
+                let change = report
+                    .changes
+                    .iter()
+                    .find(|c| c.entity_id == record.entity.id().as_str())
+                    .unwrap();
+                assert_eq!(change.kind, ChangeKind::Modified);
+                assert!(change.reasons.contains(&ChangeReason::DependencyChanged));
+            }
+        }
+        let svg = render_diff_svg(&base, &head, &report);
+        assert!(svg.contains("scale(2 -2)"));
+        assert!(svg.contains("ent_01JZ0000000000000000000999"));
     }
 
     #[test]

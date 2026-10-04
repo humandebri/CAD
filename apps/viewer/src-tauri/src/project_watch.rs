@@ -21,12 +21,13 @@ pub(crate) struct ProjectWatcher {
 }
 
 enum ProjectWatcherBackend {
-    Native { _watcher: NativeWatcher },
+    Native { _watcher: Box<NativeWatcher> },
     ManifestPoll { _watcher: ManifestPollWatcher },
 }
 
 struct NativeWatcher {
     watcher: Option<RecommendedWatcher>,
+    git_watcher: Option<RecommendedWatcher>,
     sender: mpsc::Sender<NativeSignal>,
     stopped: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -34,6 +35,7 @@ struct NativeWatcher {
 
 enum NativeSignal {
     Dirty,
+    ReviewDirty,
     Error(String),
     Stop,
 }
@@ -128,6 +130,7 @@ impl Drop for NativeWatcher {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
         self.watcher.take();
+        self.git_watcher.take();
         let _ = self.sender.send(NativeSignal::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -178,7 +181,7 @@ where
     F: FnOnce() -> Result<ManifestPollWatcher, String>,
 {
     match native {
-        Ok(watcher) => Ok(ProjectWatcherBackend::Native { _watcher: watcher }),
+        Ok(watcher) => Ok(ProjectWatcherBackend::Native { _watcher: Box::new(watcher) }),
         Err(native_error) => fallback()
             .map(|watcher| ProjectWatcherBackend::ManifestPoll { _watcher: watcher })
             .map_err(|poll_error| {
@@ -220,6 +223,8 @@ where
         .watch(root, RecursiveMode::Recursive)
         .map_err(|error| format!("failed to watch project with native watcher: {error}"))?;
 
+    let git_watcher = start_git_metadata_watcher(root, &sender)?;
+
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stopped = Arc::clone(&stopped);
     let worker_root = root.to_path_buf();
@@ -245,6 +250,7 @@ where
 
     Ok(NativeWatcher {
         watcher: Some(watcher),
+        git_watcher,
         sender,
         stopped,
         thread: Some(thread),
@@ -271,7 +277,8 @@ fn run_native_worker<F>(
 
     while !stopped.load(Ordering::Acquire) {
         match receiver.recv() {
-            Ok(NativeSignal::Dirty) => {
+            Ok(signal @ (NativeSignal::Dirty | NativeSignal::ReviewDirty)) => {
+                let mut force_review = matches!(signal, NativeSignal::ReviewDirty);
                 runtime.record_dirty();
                 let deadline = Instant::now() + debounce;
                 loop {
@@ -282,7 +289,10 @@ fn run_native_worker<F>(
                         break;
                     };
                     match receiver.recv_timeout(remaining) {
-                        Ok(NativeSignal::Dirty) => runtime.record_dirty(),
+                        Ok(signal @ (NativeSignal::Dirty | NativeSignal::ReviewDirty)) => {
+                            force_review |= matches!(signal, NativeSignal::ReviewDirty);
+                            runtime.record_dirty();
+                        }
                         Ok(NativeSignal::Error(message)) => {
                             runtime.record_error();
                             emit(watch_error(&project_path, message));
@@ -304,7 +314,7 @@ fn run_native_worker<F>(
                         runtime.record_refresh_success();
                         emit(watch_changed(&project_path, paths));
                     }
-                    ManifestRefresh::Unchanged if runtime.error_active => {
+                    ManifestRefresh::Unchanged if runtime.error_active || force_review => {
                         runtime.record_refresh_success();
                         emit(watch_changed(&project_path, state.snapshot_paths()));
                     }
@@ -324,6 +334,53 @@ fn run_native_worker<F>(
     }
 }
 
+fn start_git_metadata_watcher(
+    root: &Path,
+    sender: &mpsc::Sender<NativeSignal>,
+) -> Result<Option<RecommendedWatcher>, String> {
+    let Ok(directories) = cad_git::metadata_directories(root) else {
+        return Ok(None);
+    };
+    let watched = directories.clone();
+    let sender = sender.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |result: notify::Result<Event>| match result {
+            Ok(event)
+                if event.need_rescan()
+                    || event
+                        .paths
+                        .iter()
+                        .any(|path| watched.iter().any(|root| git_metadata_path(root, path))) =>
+            {
+                let _ = sender.send(NativeSignal::ReviewDirty);
+            }
+            Err(error) => {
+                let _ = sender.send(NativeSignal::Error(format!("Git watcher: {error}")));
+            }
+            _ => {}
+        },
+        Config::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    for directory in directories {
+        watcher
+            .watch(&directory, RecursiveMode::Recursive)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(Some(watcher))
+}
+
+fn git_metadata_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let first = relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str());
+    matches!(first, Some("HEAD" | "index" | "packed-refs" | "refs"))
+}
+
 fn start_manifest_poll_watcher<F>(
     root: PathBuf,
     project_path: String,
@@ -339,9 +396,18 @@ where
         .name("cad canonical source poll".to_owned())
         .spawn(move || {
             let mut state = ManifestWatchState::default();
+            let mut git_revision = git_metadata_revision(&root);
             let mut ready = Some(ready);
             loop {
-                emit_manifest_refresh(state.refresh(&root), &project_path, emit.as_ref());
+                let refresh = state.refresh(&root);
+                let next_git_revision = git_metadata_revision(&root);
+                if matches!(refresh, ManifestRefresh::Unchanged)
+                    && next_git_revision != git_revision
+                {
+                    emit(watch_changed(&project_path, state.snapshot_paths()));
+                }
+                git_revision = next_git_revision;
+                emit_manifest_refresh(refresh, &project_path, emit.as_ref());
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                 }
@@ -359,6 +425,42 @@ where
         stop,
         thread: Some(thread),
     })
+}
+
+// Poll only review metadata, including refs in the common directory of a linked
+// worktree. Object stores and reflogs cannot change a pinned comparison.
+fn git_metadata_revision(root: &Path) -> Option<String> {
+    fn hash_path(path: &Path, hasher: &mut blake3::Hasher) -> std::io::Result<()> {
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            let mut children = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            children.sort();
+            for child in children {
+                hash_path(&child, hasher)?;
+            }
+        } else if metadata.is_file() && !path.as_os_str().to_string_lossy().ends_with(".lock") {
+            let name = path.as_os_str().to_string_lossy();
+            let bytes = fs::read(path)?;
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
+        Ok(())
+    }
+    let directories = cad_git::metadata_directories(root).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    for directory in directories {
+        for name in ["HEAD", "index", "packed-refs", "refs"] {
+            hash_path(&directory.join(name), &mut hasher).ok()?;
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 fn emit_manifest_refresh<F>(refresh: ManifestRefresh, project_path: &str, emit: &F)
@@ -458,6 +560,74 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::sync::Mutex;
+
+    #[test]
+    fn poll_fingerprint_changes_for_index_and_refs_without_source_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        write_source_project(temp.path());
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(temp.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let initial = git_metadata_revision(temp.path()).unwrap();
+        fs::write(temp.path().join(".git/index"), b"test index metadata").unwrap();
+        let index = git_metadata_revision(temp.path()).unwrap();
+        assert_ne!(index, initial);
+        fs::write(temp.path().join(".git/index.lock"), b"ignored").unwrap();
+        assert_eq!(git_metadata_revision(temp.path()).unwrap(), index);
+        fs::write(
+            temp.path().join(".git/refs/heads/branch"),
+            b"reference metadata",
+        )
+        .unwrap();
+        assert_ne!(git_metadata_revision(temp.path()).unwrap(), index);
+    }
+
+    #[test]
+    fn git_metadata_watch_filters_out_objects_and_lock_files() {
+        let root = Path::new("/repo/.git");
+        for path in ["HEAD", "index", "packed-refs", "refs/heads/main"] {
+            assert!(git_metadata_path(root, &root.join(path)));
+        }
+        for path in ["objects/ab/cd", "logs/HEAD", "index.lock", "HEAD.lock"] {
+            assert!(!git_metadata_path(root, &root.join(path)));
+        }
+    }
+
+    #[test]
+    fn git_dirty_emits_review_even_when_canonical_files_are_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        write_source_project(temp.path());
+        let (signal, receiver) = mpsc::channel();
+        let (events, event_receiver) = mpsc::channel();
+        let (ready, ready_receiver) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let root = temp.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            run_native_worker(
+                root,
+                "project".to_owned(),
+                Arc::new(move |event| {
+                    events.send(event).unwrap();
+                }),
+                receiver,
+                stopped,
+                Duration::from_millis(10),
+                Some(ready),
+            )
+        });
+        ready_receiver.recv().unwrap();
+        signal.send(NativeSignal::ReviewDirty).unwrap();
+        let event = event_receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(event.kind, ProjectWatchEventKind::Changed));
+        signal.send(NativeSignal::Stop).unwrap();
+        worker.join().unwrap();
+    }
 
     fn write_source_project(root: &Path) {
         fs::create_dir_all(root.join("rules")).expect("rules should be created");
@@ -627,6 +797,7 @@ mod tests {
         write_source_project(temp.path());
         let events = Arc::new(Mutex::new(Vec::new()));
         let event_sink = Arc::clone(&events);
+        let (delivered, deliveries) = mpsc::channel();
         let (sender, receiver) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
@@ -635,7 +806,10 @@ mod tests {
             run_native_worker(
                 root,
                 "project".to_owned(),
-                Arc::new(move |event| event_sink.lock().expect("events should lock").push(event)),
+                Arc::new(move |event| {
+                    event_sink.lock().expect("events should lock").push(event);
+                    delivered.send(()).expect("delivery should send");
+                }),
                 receiver,
                 worker_stopped,
                 Duration::ZERO,
@@ -646,6 +820,14 @@ mod tests {
             .send(NativeSignal::Error("runtime failure".to_owned()))
             .expect("error should send");
         sender.send(NativeSignal::Dirty).expect("dirty should send");
+        // Stop intentionally discards pending refreshes. Wait for recovery before
+        // shutting down, even when a zero debounce deadline rounds to zero.
+        deliveries
+            .recv_timeout(Duration::from_secs(3))
+            .expect("error should be delivered");
+        deliveries
+            .recv_timeout(Duration::from_secs(3))
+            .expect("catch-up should be delivered");
         sender.send(NativeSignal::Stop).expect("stop should send");
         thread.join().expect("worker should stop");
         let events = events.lock().expect("events should lock");

@@ -4,7 +4,8 @@ import type { Artifacts, EditOperation } from "./artifacts";
 export type DraftingOptions = {
   distance: string; secondDistance: string; angle: string; width: string; height: string;
   rows: string; columns: string; rowSpacing: string; columnSpacing: string;
-  text: string; style: string; pattern: string; fill: string;
+  text: string; style: string; dimensionStyle: string; pen: string; pattern: string; fill: string;
+  textWritingMode: "horizontal" | "vertical_upright";
   block: string; blockName: string; blockSearch: string; scale: string;
   mirrorX: boolean; mirrorY: boolean; replaceOriginals: boolean;
   detachExternalDimensions: boolean;
@@ -14,10 +15,11 @@ export type DraftingOptions = {
 export const initialDraftingOptions: DraftingOptions = {
   distance: "10", secondDistance: "10", angle: "0", width: "1000", height: "1000",
   rows: "1", columns: "2", rowSpacing: "1000", columnSpacing: "1000",
-  text: "", style: "", pattern: "solid", fill: "", block: "", blockName: "",
+  text: "", style: "", dimensionStyle: "", pen: "", pattern: "solid", fill: "", block: "", blockName: "",
   blockSearch: "", scale: "1", mirrorX: false, mirrorY: false, replaceOriginals: true,
   detachExternalDimensions: false,
   dimension: "aligned", associate: true, hatchRegion: false,
+  textWritingMode: "horizontal",
 };
 
 export function finiteDraftNumber(value: string): number | null {
@@ -34,13 +36,14 @@ export function retuneDraftOperation(operation: EditOperation, options: Drafting
   const distance = finiteDraftNumber(options.distance), second = finiteDraftNumber(options.secondDistance), angle = finiteDraftNumber(options.angle), scale = finiteDraftNumber(options.scale);
   switch (operation.kind) {
     case "rotate": return angle === null ? null : { ...operation, angle_deg: angle };
+    case "scale": return scale === null || scale <= 0 ? null : { ...operation, factor: scale };
     case "offset": return distance === null || distance <= 0 ? null : { ...operation, distance: Math.sign(operation.distance) * distance };
     case "fillet": return distance === null || distance <= 0 ? null : { ...operation, radius: distance };
     case "chamfer": return distance === null || second === null || distance <= 0 || second <= 0 ? null : { ...operation, first_distance: distance, second_distance: second };
-    case "insert_block": return angle === null || scale === null || scale <= 0 ? null : { ...operation, block: options.block || operation.block, rotation_deg: angle, scale, mirror_x: options.mirrorX, mirror_y: options.mirrorY };
+    case "insert_block": return angle === null || scale === null || scale <= 0 ? null : { ...operation, pen: options.pen || null, block: options.block || operation.block, rotation_deg: angle, scale, mirror_x: options.mirrorX, mirror_y: options.mirrorY };
     case "rectangle": {
       const width = finiteDraftNumber(options.width), height = finiteDraftNumber(options.height);
-      return width === null || height === null || width <= 0 || height <= 0 ? null : { ...operation, p2: [operation.p1[0] + (Math.sign(operation.p2[0] - operation.p1[0]) || 1) * width, operation.p1[1] + (Math.sign(operation.p2[1] - operation.p1[1]) || 1) * height] };
+      return width === null || height === null || width <= 0 || height <= 0 ? null : { ...operation, pen: options.pen || null, p2: [operation.p1[0] + (Math.sign(operation.p2[0] - operation.p1[0]) || 1) * width, operation.p1[1] + (Math.sign(operation.p2[1] - operation.p1[1]) || 1) * height] };
     }
     case "rectangular_array": {
       const rows = finiteDraftNumber(options.rows), columns = finiteDraftNumber(options.columns), row = finiteDraftNumber(options.rowSpacing), column = finiteDraftNumber(options.columnSpacing);
@@ -51,19 +54,20 @@ export function retuneDraftOperation(operation: EditOperation, options: Drafting
       return operations.some(item => item === null) ? null : { kind: "batch", operations: operations as EditOperation[] };
     }
     case "create": {
-      const entity = operation.entity;
+      const entity: Record<string, unknown> = { ...operation.entity, pen: options.pen || null };
       if (entity.type === "line" && Array.isArray(entity.p1)) {
         if (distance === null || angle === null || distance <= 0) return null;
         const start = entity.p1 as [number, number], radians = angle * Math.PI / 180;
         return { ...operation, entity: { ...entity, p2: [start[0] + distance * Math.cos(radians), start[1] + distance * Math.sin(radians)] } };
       }
-      if (entity.type === "text") return !options.text.trim() ? null : { ...operation, entity: { ...entity, value: options.text, style: options.style || entity.style } };
+      if (entity.type === "text") return !options.text.trim() ? null : { ...operation, entity: { ...entity, value: options.text, style: options.style || entity.style, writing_mode: options.textWritingMode } };
       if (entity.type === "hatch") return angle === null || distance === null || distance <= 0 ? null : { ...operation, entity: { ...entity, angle_deg: angle, scale: distance, fill: options.fill || entity.fill, pattern: options.pattern } };
       if (entity.type === "dimension") {
         const measurement = entity.measurement as Record<string, unknown> | undefined;
-        if (measurement && ["aligned", "horizontal", "vertical"].includes(String(measurement.kind)) && ["aligned", "horizontal", "vertical"].includes(options.dimension)) return { ...operation, entity: { ...entity, measurement: { ...measurement, kind: options.dimension } } };
+        if (measurement && ["aligned", "horizontal", "vertical"].includes(String(measurement.kind)) && ["aligned", "horizontal", "vertical"].includes(options.dimension)) return { ...operation, entity: { ...entity, style: options.dimensionStyle || entity.style, measurement: { ...measurement, kind: options.dimension } } };
+        return { ...operation, entity: { ...entity, style: options.dimensionStyle || entity.style } };
       }
-      return operation;
+      return { ...operation, entity };
     }
     default: return operation;
   }
@@ -83,17 +87,22 @@ export function DraftingPanel(props: {
   return <section class="drafting-panel" aria-label="Drafting parameters">
     <strong>{command.replaceAll("_", " ")}</strong>
     <div class="drafting-fields">
+      {["line", "polyline", "circle", "arc", "rectangle", "text", "dimension", "point", "hatch", "insert_block"].includes(command) && <label>Pen<select aria-label="Drafting pen" value={options.pen} onChange={e => set("pen",e.currentTarget.value)}><option value="">Layer pen</option>{artifacts.editor.pens.map(pen=><option key={pen}>{pen}</option>)}</select></label>}
       {command === "rectangle" && <>{numeric("width", "Width")}{numeric("height", "Height")}</>}
       {command === "line" && <>{numeric("distance", "Length")}{numeric("angle", "Angle")}</>}
       {["offset", "fillet"].includes(command) && numeric("distance", command === "fillet" ? "Radius" : "Distance")}
       {command === "chamfer" && <>{numeric("distance", "First distance")}{numeric("secondDistance", "Second distance")}</>}
       {["rotate", "hatch", "insert_block"].includes(command) && numeric("angle", "Angle")}
+      {command === "scale" && <>{numeric("scale", "Scale factor")}<small>Pick a base point. Geometry and per-entity multipliers scale; shared paper-unit text and line styles stay unchanged.</small></>}
       {command === "rectangular_array" && <>{numeric("rows", "Rows")}{numeric("columns", "Columns")}{numeric("rowSpacing", "Row spacing")}{numeric("columnSpacing", "Column spacing")}</>}
       {command === "text" && <>
         <label>Text<textarea aria-label="Text value" value={options.text} onInput={e => set("text", e.currentTarget.value)} /></label>
         <label>Style<select aria-label="Text style" value={options.style || artifacts.editor.text_styles[0]} onChange={e => set("style", e.currentTarget.value)}>{artifacts.editor.text_styles.map(style => <option key={style}>{style}</option>)}</select></label>
+        <label>Writing direction<select aria-label="New text writing direction" value={options.textWritingMode} onChange={e => set("textWritingMode", e.currentTarget.value as DraftingOptions["textWritingMode"])}><option value="horizontal">Horizontal</option><option value="vertical_upright">Upright vertical columns</option></select></label>
+        {options.textWritingMode === "vertical_upright" && <small>Top-left anchor; one Unicode scalar per cell. Newlines start columns to the left. Vertical punctuation and combining-character shaping are not applied.</small>}
       </>}
       {command === "dimension" && <>
+        <label>Style<select aria-label="Dimension style" value={options.dimensionStyle || artifacts.editor.dimension_styles[0]} onChange={e => set("dimensionStyle",e.currentTarget.value)}>{artifacts.editor.dimension_styles.map(style=><option key={style}>{style}</option>)}</select></label>
         <label>Dimension<select aria-label="Dimension type" value={options.dimension} onChange={e => set("dimension", e.currentTarget.value)}>{["aligned", "horizontal", "vertical", "chain", "baseline", "angle", "radius", "diameter"].map(type => <option key={type}>{type}</option>)}</select></label>
         <label><input type="checkbox" checked={options.associate} onChange={e => set("associate", e.currentTarget.checked)} />Associate with geometry</label>
         <small>Endpoints, vertices, midpoints, centers and quadrants follow geometry. Other points remain fixed.</small>

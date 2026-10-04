@@ -1,0 +1,16 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Reviewed commit</title></head><body><main style="padding:24px"><h1>Git commit</h1><div id="panel"></div><output id="result" style="overflow-wrap:anywhere">Branch preserved.</output></main><script type="module">
+import {render,h} from 'preact';
+import {GitCommitPanel} from '/src/git-commit-panel.tsx';
+import '/src/styles.css';
+const query=new URLSearchParams(location.search);
+render(h(GitCommitPanel,{disabled:false,onPreview:async(message)=>({plan_hash:'reviewed-index',branch:'refs/heads/main',parent_oid:'123456789abcdef',tree_oid:'staged-tree',message,author:{name:'CAD Test',email:'cad@example.invalid'},committer:{name:'CAD Test',email:'cad@example.invalid'},files:[{status:'M',path:'drawings/plan/entities.ndjson'},{status:'A',path:'unrelated.txt'}],patch:'diff --git a/unrelated.txt b/unrelated.txt\n+Previously staged outside the CAD selection',patch_truncated:query.has('large'),cad_check:{status:'ok',diagnostics:[]},hooks_run:false,signed:false,applied:false,commit_oid:null}),onApply:async(message,hash)=>{
+  if(query.has('stale'))throw new Error('Index or branch changed after commit preview');
+  document.querySelector('#result').textContent=JSON.stringify({message,hash});
+  return {applied:true,commit_oid:'new-commit'};
+},onCompareIndex:()=>document.querySelector('#result').textContent='HEAD → index'}),document.querySelector('#panel'));
+document.querySelector('details').open=true;
+if(query.has('ready')) {
+  const message=document.querySelector('textarea');message.value='Reviewed drawing change';message.dispatchEvent(new Event('input',{bubbles:true}));
+  setTimeout(()=>document.querySelector('details > button').click(),0);
+}
+</script></body></html>

@@ -8,6 +8,7 @@ license.workspace = true
 rstar.workspace = true
 blake3.workspace = true
 cad-model.workspace = true
+cad-render-svg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 svg.workspace = true

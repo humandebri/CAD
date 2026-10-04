@@ -151,6 +151,48 @@ pub fn render_drawing_pdf(
     drawing_name: &str,
     layout_name: Option<&str>,
 ) -> PdfResult<Vec<u8>> {
+    let page = render_page(project, drawing_name, layout_name)?;
+    build_pdf(page.width, page.height, &page.commands, &page.font)
+}
+
+/// Render an ordered set of drawing/layout pages from one loaded source snapshot.
+pub fn render_drawings_pdf(
+    project: &ProjectSource,
+    selections: &[(&str, Option<&str>)],
+) -> PdfResult<Vec<u8>> {
+    if selections.is_empty() {
+        return Err(PdfError::NoDrawings);
+    }
+    let pages = selections
+        .iter()
+        .map(|(drawing, layout)| render_page(project, drawing, *layout))
+        .collect::<PdfResult<Vec<_>>>()?;
+    let pages = pages
+        .iter()
+        .map(|page| {
+            (
+                page.width,
+                page.height,
+                page.commands.as_slice(),
+                &page.font,
+            )
+        })
+        .collect::<Vec<_>>();
+    build_pdf_pages(&pages)
+}
+
+struct RenderedPdfPage {
+    width: f64,
+    height: f64,
+    commands: Vec<String>,
+    font: EmbeddedPdfFont,
+}
+
+fn render_page(
+    project: &ProjectSource,
+    drawing_name: &str,
+    layout_name: Option<&str>,
+) -> PdfResult<RenderedPdfPage> {
     let drawing = project
         .drawings
         .iter()
@@ -192,13 +234,52 @@ pub fn render_drawing_pdf(
     let scale = cad_model::parse_layout_scale(&layout.scale)
         .ok_or_else(|| PdfError::InvalidLayout(format!("invalid scale {:?}", layout.scale)))?;
     let mut content = PdfContent::new(paper_width, paper_height, scale, layout)?;
-    for record in &drawing.entities {
-        if is_printable_entity(project, &record.entity) {
-            content.entity(project, &record.entity, 0, Transform::identity())?;
+    if layout.viewports.is_empty() {
+        for record in &drawing.entities {
+            if is_printable_entity(project, &record.entity) {
+                content.entity(project, &record.entity, 0, Transform::identity())?;
+            }
+        }
+    } else {
+        cad_model::validate_layout_viewports(project, layout).map_err(PdfError::InvalidLayout)?;
+        for view in &layout.viewports {
+            let source = project
+                .drawings
+                .iter()
+                .find(|d| d.name == view.drawing)
+                .expect("validated viewport drawing");
+            content.scale =
+                cad_model::parse_layout_scale(&view.scale).expect("validated viewport scale");
+            content.model_origin = view.origin;
+            content.paper_offset = view.at_mm;
+            content.commands.push(format!(
+                "q {} {} {} {} re W n",
+                fmt(view.at_mm[0] * MM_TO_PT),
+                fmt(view.at_mm[1] * MM_TO_PT),
+                fmt(view.size_mm[0] * MM_TO_PT),
+                fmt(view.size_mm[1] * MM_TO_PT)
+            ));
+            for record in &source.entities {
+                if is_printable_entity(project, &record.entity)
+                    && (view.layers.is_empty()
+                        || view
+                            .layers
+                            .iter()
+                            .any(|layer| layer == record.entity.layer()))
+                {
+                    content.entity(project, &record.entity, 0, Transform::identity())?;
+                }
+            }
+            content.commands.push("Q".into());
         }
     }
     let (commands, font) = content.finish()?;
-    build_pdf(paper_width, paper_height, &commands, &font)
+    Ok(RenderedPdfPage {
+        width: paper_width,
+        height: paper_height,
+        commands,
+        font,
+    })
 }
 
 fn is_printable_entity(project: &ProjectSource, entity: &Entity) -> bool {
@@ -326,19 +407,20 @@ impl Transform {
     }
 }
 
-struct PdfContent<'a> {
+struct PdfContent {
     commands: Vec<String>,
     font: PdfFontSubset,
     scale: f64,
-    layout: &'a LayoutConfig,
+    model_origin: [f64; 2],
+    paper_offset: [f64; 2],
 }
 
-impl<'a> PdfContent<'a> {
+impl PdfContent {
     fn new(
         paper_width: f64,
         paper_height: f64,
         scale: f64,
-        layout: &'a LayoutConfig,
+        layout: &LayoutConfig,
     ) -> PdfResult<Self> {
         Ok(Self {
             commands: {
@@ -377,7 +459,8 @@ impl<'a> PdfContent<'a> {
             },
             font: PdfFontSubset::new()?,
             scale,
-            layout,
+            model_origin: layout.origin,
+            paper_offset: [0., 0.],
         })
     }
 
@@ -389,8 +472,8 @@ impl<'a> PdfContent<'a> {
         let point = transform.point(point);
         // Both the canonical model and PDF use a lower-left, Y-up coordinate system.
         // Margins clip the page; they do not relocate its model-space origin.
-        let x = (point[0] - self.layout.origin[0]) * MM_TO_PT / self.scale;
-        let y = (point[1] - self.layout.origin[1]) * MM_TO_PT / self.scale;
+        let x = ((point[0] - self.model_origin[0]) / self.scale + self.paper_offset[0]) * MM_TO_PT;
+        let y = ((point[1] - self.model_origin[1]) / self.scale + self.paper_offset[1]) * MM_TO_PT;
         [x, y]
     }
 
@@ -519,6 +602,7 @@ impl<'a> PdfContent<'a> {
                 value,
                 rotation_deg,
                 mirror_y,
+                writing_mode,
                 style,
                 ..
             } => {
@@ -528,16 +612,35 @@ impl<'a> PdfContent<'a> {
                         entity.id().as_str()
                     ))
                 })?;
-                self.text(
-                    transform,
-                    *at,
-                    value,
-                    *rotation_deg,
-                    *mirror_y,
-                    style,
-                    &stroke.print_color_rgb,
-                    None,
-                )?;
+                if *writing_mode == cad_model::TextWritingMode::VerticalUpright {
+                    let mut glyph_style = style.clone();
+                    glyph_style.align = TextAlign::Left;
+                    for (position, character) in
+                        cad_model::upright_text_glyphs(*at, *rotation_deg, *mirror_y, value, style)
+                    {
+                        self.text(
+                            transform,
+                            position,
+                            &character.to_string(),
+                            *rotation_deg,
+                            *mirror_y,
+                            &glyph_style,
+                            &stroke.print_color_rgb,
+                            None,
+                        )?;
+                    }
+                } else {
+                    self.text(
+                        transform,
+                        *at,
+                        value,
+                        *rotation_deg,
+                        *mirror_y,
+                        style,
+                        &stroke.print_color_rgb,
+                        None,
+                    )?;
+                }
             }
             Entity::Dimension {
                 measurement: Some(_),
@@ -1113,34 +1216,54 @@ fn build_pdf(
     commands: &[String],
     font: &EmbeddedPdfFont,
 ) -> PdfResult<Vec<u8>> {
-    let width = width_mm * MM_TO_PT;
-    let height = height_mm * MM_TO_PT;
-    let stream = if commands.is_empty() {
-        String::new()
-    } else {
-        format!("{}\nQ", commands.join("\n"))
-    };
-    let units = font.units_per_em;
-    let bbox = font.bbox;
-    let to_unicode = to_unicode_cmap(&font.unicode_by_cid);
-    let objects = vec![
+    build_pdf_pages(&[(width_mm, height_mm, commands, font)])
+}
+
+fn build_pdf_pages(pages: &[(f64, f64, &[String], &EmbeddedPdfFont)]) -> PdfResult<Vec<u8>> {
+    let kids = (0..pages.len())
+        .map(|index| format!("{} 0 R", 3 + index * 7))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objects = vec![
         ascii_object("<< /Type /Catalog /Pages 2 0 R >>"),
-        ascii_object("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
         ascii_object(&format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 4 0 R >> >> /Contents 9 0 R >>"
+            "<< /Type /Pages /Kids [{kids}] /Count {} >>",
+            pages.len()
+        )),
+    ];
+    for (index, &(width_mm, height_mm, commands, font)) in pages.iter().enumerate() {
+        let font_id = 4 + index * 7;
+        let cid_id = font_id + 1;
+        let descriptor_id = font_id + 2;
+        let unicode_id = font_id + 3;
+        let bytes_id = font_id + 4;
+        let content_id = font_id + 5;
+        let width = width_mm * MM_TO_PT;
+        let height = height_mm * MM_TO_PT;
+        let stream = if commands.is_empty() {
+            String::new()
+        } else {
+            format!("{}\nQ", commands.join("\n"))
+        };
+        let units = font.units_per_em;
+        let bbox = font.bbox;
+        let to_unicode = to_unicode_cmap(&font.unicode_by_cid);
+        objects.extend([
+        ascii_object(&format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.4} {height:.4}] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
         )),
         ascii_object(&format!(
-            "<< /Type /Font /Subtype /Type0 /BaseFont /{PDF_FONT_NAME} /Encoding /Identity-H /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>"
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{PDF_FONT_NAME} /Encoding /Identity-H /DescendantFonts [{cid_id} 0 R] /ToUnicode {unicode_id} 0 R >>"
         )),
         // CAD text width is an explicit character-cell width. Advertising a
         // 1000-unit CID advance keeps extraction and selection consistent with
         // the independently positioned cells instead of the font's proportional
         // Latin metrics.
         ascii_object(&format!(
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{PDF_FONT_NAME} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 6 0 R /DW 1000 /CIDToGIDMap /Identity >>"
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{PDF_FONT_NAME} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {descriptor_id} 0 R /DW 1000 /CIDToGIDMap /Identity >>"
         )),
         ascii_object(&format!(
-            "<< /Type /FontDescriptor /FontName /{PDF_FONT_NAME} /Flags 32 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 8 0 R >>",
+            "<< /Type /FontDescriptor /FontName /{PDF_FONT_NAME} /Flags 32 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 {bytes_id} 0 R >>",
             scale_font_metric(i32::from(bbox.x_min), units),
             scale_font_metric(i32::from(bbox.y_min), units),
             scale_font_metric(i32::from(bbox.x_max), units),
@@ -1152,7 +1275,8 @@ fn build_pdf(
         stream_object(to_unicode.as_bytes(), None),
         stream_object(&font.bytes, Some(font.bytes.len())),
         stream_object(stream.as_bytes(), None),
-    ];
+    ]);
+    }
     let mut pdf = b"%PDF-1.4\n%\xFF\xFF\xFF\xFF\n".to_vec();
     let mut offsets = Vec::new();
     for (index, object) in objects.iter().enumerate() {
@@ -1237,6 +1361,106 @@ fn publish(output: &Path, bytes: &[u8], overwrite: bool) -> PdfResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upright_annotations_keep_cell_width_and_advance_down_then_left_on_paper() {
+        let mut project = cad_model::load_project(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small"),
+        )
+        .unwrap();
+        let style = project.styles.text_styles.keys().next().unwrap().clone();
+        let metrics = project.styles.text_styles.get_mut(&style).unwrap();
+        metrics.height = 1000.;
+        metrics.width = 500.;
+        metrics.spacing = 100.;
+        metrics.align = TextAlign::Left;
+        project.drawings[0].entities=vec![cad_model::EntityRecord{line:1,entity:serde_json::from_value(serde_json::json!({"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"text","layer":"0-1","style":style,"at":[1000,3000],"rotation_deg":0,"value":"室名\nA2","writing_mode":"vertical_upright"})).unwrap()}];
+        let page = render_page(&project, "plan_1f", None).unwrap();
+        let commands = page.commands.join("\n");
+        assert_eq!(commands.matches(" Tj").count(), 4);
+        for position in [
+            "28.3465 56.6929 Tm",
+            "28.3465 25.5118 Tm",
+            "11.3386 56.6929 Tm",
+            "11.3386 25.5118 Tm",
+        ] {
+            assert!(commands.contains(position), "{commands}");
+        }
+        for line in page.commands.iter().filter(|line| line.contains(" Tj")) {
+            let matrix = line
+                .split_whitespace()
+                .take(4)
+                .map(|value| value.parse::<f64>().unwrap())
+                .collect::<Vec<_>>();
+            for (actual, expected) in matrix.iter().zip([14.1732, 0., 0., 28.3465]) {
+                assert!((actual - expected).abs() < 0.0001, "{line}");
+            }
+        }
+    }
+    #[test]
+    fn sheet_viewports_print_true_paper_distances_at_independent_scales() {
+        let mut project = cad_model::load_project(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/house-small"),
+        )
+        .unwrap();
+        if let Entity::Line { p1, p2, .. } = &mut project.drawings[0].entities[0].entity {
+            *p1 = [1000., 2000.];
+            *p2 = [2000., 2000.];
+        } else {
+            panic!()
+        }
+        project.drawings[0]
+            .layouts
+            .layouts
+            .get_mut("default")
+            .unwrap()
+            .viewports = vec![
+            cad_model::LayoutViewport {
+                name: "Plan".into(),
+                drawing: "plan_1f".into(),
+                origin: [1000., 2000.],
+                at_mm: [10., 10.],
+                size_mm: [100., 100.],
+                scale: "1/100".into(),
+                layers: vec![],
+            },
+            cad_model::LayoutViewport {
+                name: "Detail".into(),
+                drawing: "plan_1f".into(),
+                origin: [1000., 2000.],
+                at_mm: [150., 10.],
+                size_mm: [100., 100.],
+                scale: "1/20".into(),
+                layers: vec![],
+            },
+        ];
+        let page = render_page(&project, "plan_1f", None).unwrap();
+        let commands = page.commands.join("\n");
+        assert!(
+            commands.contains("28.3465 28.3465 m 56.6929 28.3465 l S"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains("425.1969 28.3465 m 566.9291 28.3465 l S"),
+            "{commands}"
+        );
+        assert!(commands.contains("q 425.1969 28.3465 283.4646 283.4646 re W n"));
+        assert_eq!(commands.matches("0.7087 w").count(), 2);
+        assert_eq!(project.drawings[0].entities.len(), 1);
+    }
+
+    #[test]
+    fn ordered_pdf_set_has_independent_pages_fonts_and_content_references() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cad-acceptance");
+        let project = cad_model::load_project(root).unwrap();
+        let bytes =
+            render_drawings_pdf(&project, &[("acceptance", None), ("acceptance", None)]).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Kids [3 0 R 10 0 R] /Count 2"));
+        assert!(text.contains("/F1 4 0 R >> >> /Contents 9 0 R"));
+        assert!(text.contains("/F1 11 0 R >> >> /Contents 16 0 R"));
+        assert!(render_drawings_pdf(&project, &[]).is_err());
+        assert!(render_drawings_pdf(&project, &[("missing", None)]).is_err());
+    }
 
     #[test]
     fn page_origin_and_plot_clip_use_the_same_y_up_model_coordinates() {
@@ -1248,6 +1472,7 @@ mod tests {
             origin: [1000.0, 2000.0],
             margins: [10.0, 20.0, 30.0, 40.0],
             plot_area: Some([1500.0, 2500.0, 2000.0, 3000.0]),
+            viewports: vec![],
         };
         let content = PdfContent::new(420.0, 297.0, 50.0, &layout).unwrap();
         assert_eq!(
@@ -1309,6 +1534,7 @@ mod tests {
             origin: [0.0, 0.0],
             margins: [0.0; 4],
             plot_area: None,
+            viewports: vec![],
         };
         let content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
         let (commands, font) = content.finish().expect("embedded font");
@@ -1398,6 +1624,7 @@ mod tests {
             origin: [0.0, 0.0],
             margins: [0.0; 4],
             plot_area: None,
+            viewports: vec![],
         };
         let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
 
@@ -1445,6 +1672,7 @@ mod tests {
             origin: [0.0, 0.0],
             margins: [0.0; 4],
             plot_area: None,
+            viewports: vec![],
         };
         let mut content = PdfContent::new(210.0, 297.0, 1.0, &layout).expect("PDF content");
 
@@ -1510,6 +1738,7 @@ mod tests {
             origin: [0.0, 0.0],
             margins: [10.0; 4],
             plot_area: None,
+            viewports: vec![],
         };
         let mut content = PdfContent::new(297.0, 210.0, 100.0, &layout).expect("PDF content");
         content

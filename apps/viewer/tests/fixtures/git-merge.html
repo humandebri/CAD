@@ -1,0 +1,9 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CAD merge</title></head><body><main style="padding:24px"><h1>CAD merge</h1><div id="panel"></div><output id="result">Source and index preserved.</output></main><script type="module">
+import {h,render} from 'preact';
+import {GitMergePanel} from '/src/git-merge-panel.tsx';
+import '/src/styles.css';
+const params=new URLSearchParams(location.search),blocked=params.has('blocked');
+render(h(GitMergePanel,{disabled:false,onPreview:async(base,theirs)=>({svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60"><path d="M10 20h80" stroke="red"/><path d="M10 30h80" stroke="green"/><script>window.compromised=true<\/script></svg>',report:{plan_hash:'reviewed-merge',status:blocked?'blocked':'ready',changed_files:['drawings/plan/entities.ndjson','rules/styles.toml'],blockers:blocked?['1 merge conflicts require resolution']:[],merge:{base:{commit_oid:'a'.repeat(40)},theirs:{commit_oid:'b'.repeat(40)},conflicts:blocked?[{file:'drawings/plan/entities.ndjson',field:'/ent_wall/p1',kind:'both_modified',base:[0,0],ours:[5,0],theirs:[10,0]}]:[]},cad_check:{status:'ok',diagnostics:[]},diff:{changes:[{drawing:'plan',entity_id:'ent_wall',kind:'modified'}],configuration_changes:[{}]}}}),onApply:async(base,theirs,hash)=>{if(params.has('stale'))throw new Error('Source changed');document.querySelector('#result').textContent=`Applied ${hash} (${base}, ${theirs})`;}}),document.querySelector('#panel'));
+document.querySelector('details').open=true;
+if(params.has('ready'))document.querySelector('details > button').click();
+</script></body></html>

@@ -92,6 +92,12 @@ pub struct CommentRecord {
     entity_ids: Vec<String>,
     text: String,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<cad_model::CommentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_state: Option<cad_model::CommentBindingState>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +114,8 @@ fn default_schema_version() -> String {
 pub struct CommentCreateRequest {
     pub drawing: String,
     pub expected_revision: String,
+    #[serde(default)]
+    pub expected_drawing_revision: Option<String>,
     pub entity_id: String,
     pub anchor: CommentAnchor,
     pub text: String,
@@ -146,6 +154,13 @@ pub struct ReviewArtifacts {
     editor: cad_edit::EditorDrawingState,
     blocks: Vec<BlockWorkspaceState>,
     layouts: Vec<LayoutWorkspaceState>,
+    comparison: Option<GitComparisonIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitComparisonIdentity {
+    base: cad_git::SnapshotIdentity,
+    head: cad_git::SnapshotIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -165,6 +180,7 @@ pub struct LayoutWorkspaceState {
     origin: cad_model::Point,
     margins: [f64; 4],
     plot_area: Option<[f64; 4]>,
+    viewports: Vec<cad_model::LayoutViewport>,
     active: bool,
     revision: String,
 }
@@ -330,12 +346,75 @@ fn run_review(
     head_cache: State<'_, HeadSnapshotCache>,
     project_path: String,
     drawing_name: Option<String>,
+    base_revision: Option<String>,
+    head_revision: Option<String>,
 ) -> Result<ReviewArtifacts, String> {
-    run_review_for_drawing_with_cache(
+    let mut artifacts = run_review_for_drawing_with_cache(
         Path::new(&project_path),
         drawing_name.as_deref(),
         &head_cache,
-    )
+    )?;
+    if base_revision.is_some() || head_revision.is_some() {
+        let result = compare_git_revisions(
+            Path::new(&project_path),
+            &artifacts.current_drawing,
+            base_revision.as_deref().unwrap_or("HEAD"),
+            head_revision.as_deref().unwrap_or("worktree"),
+        );
+        match result {
+            Ok((diff, svg, identity)) => {
+                artifacts.diff = Some(diff);
+                artifacts.diff_svg = Some(svg);
+                artifacts.diff_unavailable = None;
+                artifacts.comparison = Some(identity);
+            }
+            Err(message) => {
+                artifacts.diff = None;
+                artifacts.diff_svg = None;
+                artifacts.diff_unavailable = Some(message);
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+fn compare_git_revisions(
+    project: &Path,
+    drawing: &str,
+    base: &str,
+    head: &str,
+) -> Result<(cad_diff::DiffReport, String, GitComparisonIdentity), String> {
+    let base = cad_git::snapshot(project, &cad_git::Revision::parse(base))
+        .map_err(|error| error.to_string())?;
+    let head = cad_git::snapshot(project, &cad_git::Revision::parse(head))
+        .map_err(|error| error.to_string())?;
+    for snapshot in [&base, &head] {
+        if !cad_check::check_loaded_project(&snapshot.source).is_ok() {
+            return Err(format!(
+                "{} snapshot failed CAD validation",
+                snapshot.identity.revision
+            ));
+        }
+    }
+    if !base
+        .source
+        .drawings
+        .iter()
+        .chain(&head.source.drawings)
+        .any(|candidate| candidate.name == drawing)
+    {
+        return Err(format!("drawing {drawing:?} is absent from both revisions"));
+    }
+    let report = cad_diff::diff_selected_drawing(&base.source, &head.source, Some(drawing));
+    let svg = cad_diff::render_diff_svg(&base.source, &head.source, &report);
+    Ok((
+        report,
+        svg,
+        GitComparisonIdentity {
+            base: base.identity,
+            head: head.identity,
+        },
+    ))
 }
 
 #[tauri::command]
@@ -381,6 +460,332 @@ fn preview_drawing_edit(
         return Err("revision_conflict: project changed while rendering the preview".to_owned());
     }
     Ok(value)
+}
+
+#[tauri::command]
+fn load_entity_blame(
+    project_path: String,
+    entity_id: String,
+    revision: String,
+    limit: usize,
+) -> Result<cad_git::blame::EntityBlameReport, String> {
+    cad_git::blame::entity_blame(Path::new(&project_path), &entity_id, &revision, limit)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_entity_history(
+    project_path: String,
+    entity_id: String,
+    revision: String,
+    limit: usize,
+) -> Result<cad_git::history::EntityHistoryReport, String> {
+    cad_git::history::entity_history(Path::new(&project_path), &entity_id, &revision, limit)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_git_stage(
+    project_path: String,
+    drawing: String,
+    entity_ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let plan = cad_git::stage::plan(Path::new(&project_path), &drawing, &entity_ids)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"report":plan.report,"svg":plan.preview_svg}))
+}
+#[tauri::command]
+fn apply_git_stage(
+    project_path: String,
+    drawing: String,
+    entity_ids: Vec<String>,
+    expected_plan: String,
+) -> Result<cad_git::stage::StageReport, String> {
+    let mut plan = cad_git::stage::plan(Path::new(&project_path), &drawing, &entity_ids)
+        .map_err(|e| e.to_string())?;
+    cad_git::stage::apply(&mut plan, &expected_plan).map_err(|e| e.to_string())?;
+    Ok(plan.report)
+}
+
+#[tauri::command]
+fn preview_git_merge(
+    project_path: String,
+    drawing: String,
+    base: String,
+    theirs: String,
+) -> Result<serde_json::Value, String> {
+    let plan = cad_git::merge_apply::plan(Path::new(&project_path), &drawing, &base, &theirs)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"report":plan.report,"svg":plan.preview_svg}))
+}
+#[tauri::command]
+fn apply_git_merge(
+    project_path: String,
+    drawing: String,
+    base: String,
+    theirs: String,
+    expected_plan: String,
+) -> Result<cad_git::merge_apply::MergeApplyReport, String> {
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    let mut plan = cad_git::merge_apply::plan(Path::new(&project_path), &drawing, &base, &theirs)
+        .map_err(|error| error.to_string())?;
+    cad_git::merge_apply::apply(&mut plan, &expected_plan).map_err(|error| error.to_string())?;
+    Ok(plan.report)
+}
+
+#[tauri::command]
+fn preview_git_commit(
+    project_path: String,
+    message: String,
+) -> Result<cad_git::commit::CommitReport, String> {
+    cad_git::commit::plan(Path::new(&project_path), &message)
+        .map(|plan| plan.report)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn copy_cad_entities(
+    project_path: String,
+    drawing: String,
+    entity_ids: Vec<String>,
+    base_point: cad_model::Point,
+    dimensions: cad_toolkit::clipboard::DimensionCopyPolicy,
+) -> Result<cad_toolkit::clipboard::ClipboardDocument, String> {
+    cad_toolkit::clipboard::capture(
+        Path::new(&project_path),
+        &drawing,
+        &entity_ids,
+        base_point,
+        dimensions,
+    )
+    .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn preview_cad_paste(
+    project_path: String,
+    document: cad_toolkit::clipboard::ClipboardDocument,
+    request: cad_toolkit::clipboard::PasteRequest,
+) -> Result<serde_json::Value, String> {
+    let plan = cad_toolkit::clipboard::plan(Path::new(&project_path), &document, &request)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"report":plan.report,"svg":plan.preview_svg}))
+}
+#[tauri::command]
+fn apply_cad_paste(
+    project_path: String,
+    document: cad_toolkit::clipboard::ClipboardDocument,
+    request: cad_toolkit::clipboard::PasteRequest,
+    expected_plan: String,
+) -> Result<cad_toolkit::clipboard::PasteReport, String> {
+    let mut plan = cad_toolkit::clipboard::plan(Path::new(&project_path), &document, &request)
+        .map_err(|error| error.to_string())?;
+    cad_toolkit::clipboard::apply(&mut plan, &expected_plan).map_err(|error| error.to_string())?;
+    Ok(plan.report)
+}
+#[tauri::command]
+fn save_cad_part(
+    project_path: String,
+    path: String,
+    document: cad_toolkit::clipboard::ClipboardDocument,
+) -> Result<(), String> {
+    let bytes =
+        cad_toolkit::clipboard::serialize_document(&document).map_err(|error| error.to_string())?;
+    let path = cad_exchange::files::new_artifact_path(Path::new(&project_path), Path::new(&path))
+        .map_err(|error| error.to_string())?;
+    cad_edit::atomic_publish(&path, &bytes, false).map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn load_cad_part(path: String) -> Result<cad_toolkit::clipboard::ClipboardDocument, String> {
+    cad_toolkit::clipboard::read_document(Path::new(&path)).map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn load_jws_part(
+    path: String,
+    coordinate_scale: f64,
+) -> Result<cad_toolkit::clipboard_jws::JwsClipboard, String> {
+    cad_toolkit::clipboard_jws::read(Path::new(&path), coordinate_scale)
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn list_cad_part_library(
+    request: cad_toolkit::part_library::LibraryRequest,
+) -> Result<cad_toolkit::part_library::LibraryReport, String> {
+    cad_toolkit::part_library::list(&request).map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn load_cad_library_part(
+    path: String,
+    expected_blake3: String,
+    coordinate_scale: Option<f64>,
+) -> Result<cad_toolkit::part_library::LoadedPart, String> {
+    cad_toolkit::part_library::load(Path::new(&path), &expected_blake3, coordinate_scale)
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn apply_git_commit(
+    project_path: String,
+    message: String,
+    expected_plan: String,
+    without_hooks: bool,
+) -> Result<cad_git::commit::CommitReport, String> {
+    if !without_hooks {
+        return Err(
+            "Reviewed commit requires acknowledging that Git hooks and signing are not run".into(),
+        );
+    }
+    let mut plan =
+        cad_git::commit::plan(Path::new(&project_path), &message).map_err(|e| e.to_string())?;
+    cad_git::commit::apply(&mut plan, &expected_plan).map_err(|e| e.to_string())?;
+    Ok(plan.report)
+}
+
+#[tauri::command]
+fn generate_drafting_edit(
+    project_path: String,
+    drawing: String,
+    expected_revision: String,
+    request: cad_toolkit::drafting::GeneratorRequest,
+) -> Result<serde_json::Value, String> {
+    let mut result = generate_checked_edit(
+        project_path,
+        drawing,
+        expected_revision,
+        |source, drawing| cad_toolkit::drafting::generate(source, drawing, &request),
+    )?;
+    if !result["analysis_report"].is_null() {
+        result["analysis_report"]["generator_request"] =
+            serde_json::to_value(&request).map_err(|error| error.to_string())?;
+    }
+    Ok(result)
+}
+#[tauri::command]
+fn preview_sheet_viewports(
+    project_path: String,
+    drawing: String,
+    layout: String,
+    viewports: Vec<cad_model::LayoutViewport>,
+) -> Result<serde_json::Value, String> {
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    let plan = cad_toolkit::sheet::plan(Path::new(&project_path), &drawing, &layout, viewports)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"report":plan.report,"svg":plan.svg}))
+}
+#[tauri::command]
+fn apply_sheet_viewports(
+    project_path: String,
+    drawing: String,
+    layout: String,
+    viewports: Vec<cad_model::LayoutViewport>,
+    expected_plan: String,
+) -> Result<cad_toolkit::sheet::Report, String> {
+    ensure_jww_source_editable(Path::new(&project_path))?;
+    let plan = cad_toolkit::sheet::plan(Path::new(&project_path), &drawing, &layout, viewports)
+        .map_err(|e| e.to_string())?;
+    cad_toolkit::sheet::apply(&plan, &expected_plan).map_err(|e| e.to_string())?;
+    Ok(plan.report)
+}
+#[tauri::command]
+fn save_massing_analysis_report(
+    project_path: String,
+    path: String,
+    report: serde_json::Value,
+) -> Result<(), String> {
+    if report["schema_version"] != "cad-massing-review/1" {
+        return Err("Invalid massing review report schema".into());
+    }
+    let saved: cad_toolkit::massing::Report =
+        serde_json::from_value(report["analysis"].clone()).map_err(|error| error.to_string())?;
+    let recalculated =
+        cad_toolkit::massing::analyze(&saved.conditions).map_err(|error| error.to_string())?;
+    if serde_json::to_value(recalculated).map_err(|error| error.to_string())?
+        != serde_json::to_value(saved).map_err(|error| error.to_string())?
+    {
+        return Err("Massing report results do not match its saved conditions".into());
+    }
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("Massing report exceeds 4 MiB".into());
+    }
+    let path = cad_exchange::files::new_artifact_path(Path::new(&project_path), Path::new(&path))
+        .map_err(|error| error.to_string())?;
+    cad_edit::atomic_publish(&path, &bytes, false).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn generate_text_edit(
+    project_path: String,
+    drawing: String,
+    expected_revision: String,
+    request: cad_toolkit::text::TextEditRequest,
+) -> Result<serde_json::Value, String> {
+    generate_checked_edit(
+        project_path,
+        drawing,
+        expected_revision,
+        |source, drawing| cad_toolkit::text::generate(source, drawing, &request),
+    )
+}
+
+fn generate_checked_edit(
+    project_path: String,
+    drawing: String,
+    expected_revision: String,
+    generate: impl FnOnce(
+        &cad_model::ProjectSource,
+        &str,
+    ) -> cad_toolkit::Result<cad_toolkit::drafting::GeneratedEdit>,
+) -> Result<serde_json::Value, String> {
+    let root = Path::new(&project_path);
+    ensure_jww_source_editable(root)?;
+    let files = cad_model::source_manifest(root).map_err(|e| e.to_string())?;
+    let source = cad_model::load_project(root).map_err(|e| e.to_string())?;
+    if cad_edit::editor_state(&source, &drawing)
+        .map_err(|e| e.to_string())?
+        .revision
+        != expected_revision
+    {
+        return Err("revision_conflict: drawing changed before generation".into());
+    }
+    let generated = generate(&source, &drawing).map_err(|e| e.to_string())?;
+    let edit = cad_edit::DrawingEditRequest {
+        drawing,
+        expected_revision,
+        operation: generated.operation,
+    };
+    let preview = cad_edit::preview_edit(root, &edit).map_err(|e| e.to_string())?;
+    if preview.source_files != files {
+        return Err("revision_conflict: sources changed during generation".into());
+    }
+    let analysis_report=generated.analysis_report.map(|analysis|serde_json::json!({"schema_version":"cad-massing-review/1","project_path":project_path,"drawing":edit.drawing,"drawing_revision":edit.expected_revision,"source_files":files,"analysis":analysis}));
+    Ok(
+        serde_json::json!({"operation":cad_edit::EditOperation::SourceChecked {operation:Box::new(edit.operation),expected_files:files},"warnings":generated.warnings,"analysis_report":analysis_report}),
+    )
+}
+
+#[tauri::command]
+fn measure_drawing(
+    project_path: String,
+    drawing: String,
+    entity_ids: Vec<String>,
+    area_mode: Option<cad_toolkit::measure::AreaMode>,
+    curve_tolerance_mm: Option<f64>,
+) -> Result<cad_toolkit::measure::MeasurementReport, String> {
+    let snapshot = cad_git::snapshot(Path::new(&project_path), &cad_git::Revision::Worktree)
+        .map_err(|e| e.to_string())?;
+    let check = cad_check::check_project(&snapshot.source.root);
+    if !check.is_ok() {
+        return Err(format!("measurement source failed validation: {check:?}"));
+    }
+    cad_toolkit::measure::measure_project_with_options(
+        &snapshot.source,
+        Some(&drawing),
+        &entity_ids,
+        cad_toolkit::measure::MeasurementOptions {
+            area_mode: area_mode.unwrap_or_default(),
+            curve_tolerance_mm: curve_tolerance_mm.unwrap_or(0.1),
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -763,6 +1168,46 @@ fn import_jww(jww_path: String, out_dir: String) -> Result<ProjectState, String>
 }
 
 #[tauri::command]
+fn import_dxf(
+    input_path: String,
+    output_path: String,
+    report_path: String,
+    unit_mm: Option<f64>,
+) -> Result<cad_exchange::files::FileExchangeReport, String> {
+    if report_path == "-" {
+        return Err("Desktop DXF exchange requires a saved report".into());
+    }
+    cad_exchange::files::import_dxf(
+        Path::new(&input_path),
+        Path::new(&output_path),
+        Path::new(&report_path),
+        unit_mm,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_dxf(
+    project_path: String,
+    drawing: String,
+    output_path: String,
+    report_path: String,
+    strict: bool,
+) -> Result<cad_exchange::files::FileExchangeReport, String> {
+    if report_path == "-" {
+        return Err("Desktop DXF exchange requires a saved report".into());
+    }
+    cad_exchange::files::export_dxf(
+        Path::new(&project_path),
+        &drawing,
+        Path::new(&output_path),
+        Path::new(&report_path),
+        strict,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn update_layer_rules(
     manager: State<'_, LayerRulesUpdateManager>,
     project_path: String,
@@ -902,6 +1347,17 @@ fn create_comment(
             if request.text.trim().is_empty() {
                 return Err("comment text must not be empty".to_owned());
             }
+            if !request.anchor.x.is_finite() || !request.anchor.y.is_finite() {
+                return Err("comment anchor must be finite".into());
+            }
+            if let Some(expected) = &request.expected_drawing_revision {
+                let actual = cad_edit::editor_state(project, &request.drawing)
+                    .map_err(|e| e.to_string())?
+                    .revision;
+                if expected != &actual {
+                    return Err("revision_conflict: drawing changed before comment creation".into());
+                }
+            }
             let drawing = project
                 .drawings
                 .iter()
@@ -922,6 +1378,17 @@ fn create_comment(
                 entity_ids: vec![request.entity_id.clone()],
                 text: request.text.clone(),
                 status: "open".to_owned(),
+                binding: Some(
+                    cad_model::bind_comment_entity(
+                        project,
+                        &request.drawing,
+                        &request.entity_id,
+                        cad_git::head_oid(Path::new(&project_path)),
+                    )
+                    .map_err(|e| e.to_string())?,
+                ),
+                binding_state: None,
+                extra: Default::default(),
             });
             Ok(())
         },
@@ -991,6 +1458,11 @@ where
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| "comment update lock is poisoned".to_owned())?;
+    let relative_path = format!("comments/{drawing}.ndjson");
+    let path = project_path.join(&relative_path);
+    let original_input = cad_edit::read_history_file(project_path, &relative_path)
+        .map_err(|error| format!("failed to read comments: {error}"))?;
+    let source_files = comment_geometry_manifest(project_path)?;
     let project = cad_model::load_project(project_path).map_err(|error| error.to_string())?;
     if !project
         .drawings
@@ -999,10 +1471,6 @@ where
     {
         return Err(format!("drawing {drawing:?} was not found"));
     }
-    let relative_path = format!("comments/{drawing}.ndjson");
-    let path = project_path.join(&relative_path);
-    let original_input = cad_edit::read_history_file(project_path, &relative_path)
-        .map_err(|error| format!("failed to read comments: {error}"))?;
     let original_exists = original_input.exists;
     let original_permissions = original_input.permissions;
     let original = original_input.bytes;
@@ -1020,6 +1488,9 @@ where
     let trailing_newline = original.ends_with(b"\n");
     let mut comments = parse_comment_records(&original)?;
     mutation(&mut comments, &project)?;
+    for comment in &mut comments {
+        comment.binding_state = None;
+    }
     let mut text = comments
         .iter()
         .map(|comment| serde_json::to_string(comment).map_err(|error| error.to_string()))
@@ -1033,6 +1504,9 @@ where
         .bytes;
     if blake3::hash(&current).to_hex().to_string() != expected_revision {
         return Err("revision_conflict: comments changed before publish".to_owned());
+    }
+    if comment_geometry_manifest(project_path)? != source_files {
+        return Err("revision_conflict: canonical source changed during comment mutation".into());
     }
     let before_input = cad_edit::HistoryFileInput {
         relative_path: relative_path.clone(),
@@ -1065,6 +1539,10 @@ where
     let parent = path.parent().ok_or("comments path has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create comments directory: {error}"))?;
+    if comment_geometry_manifest(project_path)? != source_files {
+        history_stage.abort();
+        return Err("revision_conflict: canonical source changed before comment publish".into());
+    }
     let publish_result = if original_exists {
         let permissions = original_permissions
             .as_ref()
@@ -1113,6 +1591,7 @@ where
             }
         }
     }
+    evaluate_comment_versions(&project, &mut comments)?;
     Ok(CommentMutationResult {
         drawing: drawing.to_owned(),
         revision: blake3::hash(&bytes).to_hex().to_string(),
@@ -1120,6 +1599,30 @@ where
         history_id: Some(history_id),
         changed_files: vec![relative_path],
     })
+}
+
+fn comment_geometry_manifest(project: &Path) -> Result<Vec<cad_model::SourceFileRevision>, String> {
+    cad_model::source_manifest_for(project, |path| {
+        cad_model::classify_project_source_path(path) != Some(cad_model::ProjectSourceKind::Comment)
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn evaluate_comment_versions(
+    project: &cad_model::ProjectSource,
+    comments: &mut [CommentRecord],
+) -> Result<(), String> {
+    let revision = cad_model::comment_source_revision(project).map_err(|e| e.to_string())?;
+    for comment in comments {
+        comment.binding_state = Some(cad_model::evaluate_comment_binding(
+            project,
+            &comment.drawing,
+            &comment.entity_ids,
+            comment.binding.as_ref(),
+            &revision,
+        ));
+    }
+    Ok(())
 }
 
 fn parse_comment_records(bytes: &[u8]) -> Result<Vec<CommentRecord>, String> {
@@ -1226,6 +1729,28 @@ pub fn run() {
             run_review,
             apply_drawing_edit,
             preview_drawing_edit,
+            generate_drafting_edit,
+            save_massing_analysis_report,
+            preview_sheet_viewports,
+            apply_sheet_viewports,
+            generate_text_edit,
+            preview_git_stage,
+            preview_git_merge,
+            apply_git_merge,
+            load_entity_history,
+            load_entity_blame,
+            apply_git_stage,
+            preview_git_commit,
+            copy_cad_entities,
+            preview_cad_paste,
+            apply_cad_paste,
+            save_cad_part,
+            load_cad_part,
+            load_jws_part,
+            list_cad_part_library,
+            load_cad_library_part,
+            apply_git_commit,
+            measure_drawing,
             find_hatch_region,
             load_block_contents,
             apply_block_contents,
@@ -1235,6 +1760,8 @@ pub fn run() {
             clear_drawing_history,
             query_snap,
             import_jww,
+            import_dxf,
+            export_dxf,
             export_jww,
             export_jww_preserving,
             extract_original_jww,
@@ -1422,7 +1949,9 @@ fn run_review_for_drawing_with_hook(
     };
     let sheet_svg = cad_render_svg::render_drawing_svg(&head, &drawing_name)
         .map_err(|error| format!("failed to render SVG: {error}"))?;
-    let (comments, comment_diagnostics) = load_comments_for_drawing(project_path, &drawing_name);
+    let (mut comments, comment_diagnostics) =
+        load_comments_for_drawing(project_path, &drawing_name);
+    evaluate_comment_versions(&head, &mut comments)?;
     let comments_revision = comment_revision(project_path, &drawing_name)
         .unwrap_or_else(|_| blake3::hash(&[]).to_hex().to_string());
     check.diagnostics.extend(comment_diagnostics);
@@ -1471,6 +2000,7 @@ fn run_review_for_drawing_with_hook(
                     origin: layout.origin,
                     margins: layout.margins,
                     plot_area: layout.plot_area,
+                    viewports: layout.viewports.clone(),
                     active: id == &drawing.layouts.active_layout,
                     revision: layouts_revision.clone(),
                 })
@@ -1497,6 +2027,7 @@ fn run_review_for_drawing_with_hook(
         editor,
         blocks,
         layouts,
+        comparison: None,
     };
     if cad_model::source_manifest(project_path).map_err(|error| error.to_string())? != source_files
     {
@@ -1977,7 +2508,9 @@ fn build_ai_context(
         .map_err(|error| format!("failed to read selected entity source: {error}"))?;
     let raw = read_source_line(&source.bytes, record.line)?;
     let check = cad_check::check_loaded_project(&project);
-    let (comments, comment_diagnostics) = load_comments_for_drawing(project_path, &drawing_name);
+    let (mut comments, comment_diagnostics) =
+        load_comments_for_drawing(project_path, &drawing_name);
+    evaluate_comment_versions(&project, &mut comments)?;
     let comments = comments
         .into_iter()
         .filter(|comment| comment.entity_ids.iter().any(|id| id == selected_entity_id))
@@ -2324,6 +2857,26 @@ mod tests {
 
         assert_eq!(project.project.name, "desktop-fixture");
         assert_eq!(project.drawings[0].entities.len(), 1);
+        let entities = project_path.join("drawings/plan_1f/entities.ndjson");
+        let original = fs::read_to_string(&entities).unwrap();
+        fs::write(&entities, original.replace("910.0", "1200.0")).unwrap();
+        run_git(temp.path(), &["add", "."]);
+        fs::write(&entities, original.replace("910.0", "1500.0")).unwrap();
+        let (diff, svg, identity) =
+            compare_git_revisions(&project_path, "plan_1f", "HEAD", "index").unwrap();
+        assert!(
+            diff.changes
+                .iter()
+                .any(|change| change.kind == cad_diff::ChangeKind::Modified)
+        );
+        assert!(svg.contains("1200") && !svg.contains("1500"));
+        assert_eq!(identity.head.revision, "index");
+        assert!(
+            compare_git_revisions(&project_path, "plan_1f", "missing-ref", "worktree").is_err()
+        );
+        let (_, _, working) =
+            compare_git_revisions(&project_path, "plan_1f", "index", "worktree").unwrap();
+        assert_ne!(working.base.snapshot_blake3, working.head.snapshot_blake3);
     }
 
     #[test]
@@ -2638,6 +3191,135 @@ mod tests {
     }
 
     #[test]
+    fn comment_binding_is_immutable_and_stale_requests_do_not_publish() {
+        let repo = fixture_repo();
+        let root = &repo.project_path;
+        let project = cad_model::load_project(root).unwrap();
+        let drawing = "plan_1f";
+        let id = "ent_01JZ0000000000000000000000";
+        let expected_drawing = cad_edit::editor_state(&project, drawing).unwrap().revision;
+        let created = create_comment(
+            root.display().to_string(),
+            CommentCreateRequest {
+                drawing: drawing.into(),
+                expected_revision: comment_revision(root, drawing).unwrap(),
+                expected_drawing_revision: Some(expected_drawing.clone()),
+                entity_id: id.into(),
+                anchor: CommentAnchor { x: 0., y: 0. },
+                text: "version-bound comment".into(),
+            },
+        )
+        .unwrap();
+        let last = created.comments.last().unwrap();
+        assert_eq!(
+            last.binding_state,
+            Some(cad_model::CommentBindingState::Current)
+        );
+        let original = serde_json::to_value(last.binding.as_ref().unwrap()).unwrap();
+        assert_eq!(original["git_commit"], cad_git::head_oid(root).unwrap());
+        let path = root.join("comments/plan_1f.ndjson");
+        assert!(!fs::read_to_string(&path).unwrap().contains("binding_state"));
+        let updated = update_comment_status(
+            root.display().to_string(),
+            CommentStatusRequest {
+                drawing: drawing.into(),
+                expected_revision: created.revision,
+                comment_id: last.id.clone(),
+                status: "resolved".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(updated.comments.last().unwrap().binding.as_ref().unwrap())
+                .unwrap(),
+            original
+        );
+        let mut project = cad_model::load_project(root).unwrap();
+        let entity = &mut project.drawings[0].entities[0].entity;
+        if let cad_model::Entity::Line { p2, .. } = entity {
+            p2[0] += 100.;
+        } else {
+            panic!("line fixture");
+        }
+        let entities = project.drawings[0]
+            .entities
+            .iter()
+            .map(|r| serde_json::to_string(&r.entity).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(root.join("drawings/plan_1f/entities.ndjson"), entities).unwrap();
+        let before = fs::read(&path).unwrap();
+        let stale = create_comment(
+            root.display().to_string(),
+            CommentCreateRequest {
+                drawing: drawing.into(),
+                expected_revision: updated.revision,
+                expected_drawing_revision: Some(expected_drawing),
+                entity_id: id.into(),
+                anchor: CommentAnchor { x: 0., y: 0. },
+                text: "stale".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(stale.contains("revision_conflict"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let review = run_review_for_path(root).unwrap();
+        assert_eq!(
+            review.comments.last().unwrap().binding_state,
+            Some(cad_model::CommentBindingState::EntityChanged)
+        );
+        assert_eq!(
+            serde_json::to_value(review.comments.last().unwrap().binding.as_ref().unwrap())
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn comment_mutation_rejects_canonical_changes_and_preserves_unknown_metadata() {
+        let repo = fixture_project();
+        let root = &repo.project_path;
+        let path = root.join("comments/plan_1f.ndjson");
+        let mut value: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        value["future_metadata"] = serde_json::json!({"keep":true});
+        fs::write(&path, format!("{value}\n")).unwrap();
+        let result = update_comment_status(
+            root.display().to_string(),
+            CommentStatusRequest {
+                drawing: "plan_1f".into(),
+                expected_revision: comment_revision(root, "plan_1f").unwrap(),
+                comment_id: value["id"].as_str().unwrap().into(),
+                status: "resolved".into(),
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(value["future_metadata"]["keep"], true);
+        assert!(value.get("binding").is_none());
+        let before = fs::read(&path).unwrap();
+        let entity_path = root.join("drawings/plan_1f/entities.ndjson");
+        let error = mutate_comments(
+            root,
+            "plan_1f",
+            &result.revision,
+            "comment.test",
+            |comments, _| {
+                comments[0].text = "must not publish".into();
+                let mut bytes = fs::read(&entity_path).unwrap();
+                bytes.push(b'\n');
+                fs::write(&entity_path, bytes).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("revision_conflict"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn comment_create_and_status_update_preserve_revision_contract() {
         let repo = fixture_project();
         let path = repo.project_path.join("comments/plan_1f.ndjson");
@@ -2648,6 +3330,7 @@ mod tests {
             CommentCreateRequest {
                 drawing: "plan_1f".to_owned(),
                 expected_revision: revision,
+                expected_drawing_revision: None,
                 entity_id: "ent_01JZ0000000000000000000000".to_owned(),
                 anchor: CommentAnchor { x: 12.0, y: 34.0 },
                 text: "new note".to_owned(),
@@ -2754,6 +3437,9 @@ mod tests {
                     entity_ids: Vec::new(),
                     text: "test".to_owned(),
                     status: "open".to_owned(),
+                    binding: None,
+                    binding_state: None,
+                    extra: Default::default(),
                 });
                 Ok(())
             },
@@ -3350,6 +4036,9 @@ mod tests {
                     entity_ids: vec!["ent_01JZ0000000000000000000000".to_owned()],
                     text: "desktop smoke".to_owned(),
                     status: "open".to_owned(),
+                    binding: None,
+                    binding_state: None,
+                    extra: Default::default(),
                 });
                 Ok(())
             },
@@ -3502,6 +4191,238 @@ mod tests {
             _temp: temp,
             project_path,
         }
+    }
+
+    #[test]
+    fn massing_reports_recompute_before_create_new_and_protect_sources() {
+        let fixture = fixture_project();
+        let root = &fixture.project_path;
+        let before = cad_model::source_manifest(root).unwrap();
+        let conditions = cad_toolkit::massing::Request {
+            schema_version: "cad-massing/1".into(),
+            buildings: vec![cad_toolkit::massing::Building {
+                id: "prism".into(),
+                loops: vec![vec![[0., 0.], [4000., 0.], [4000., 4000.], [0., 4000.]]],
+                base_z_mm: 0.,
+                height_mm: 5000.,
+            }],
+            analysis: cad_toolkit::massing::Analysis::SkyView {
+                observer: [-5000., -5000., 0.],
+                azimuth_samples: 180,
+            },
+        };
+        let report = serde_json::json!({"schema_version":"cad-massing-review/1","project_path":root,"drawing":"plan_1f","source_files":before,"analysis":cad_toolkit::massing::analyze(&conditions).unwrap()});
+        let report =
+            serde_json::from_slice::<serde_json::Value>(&serde_json::to_vec(&report).unwrap())
+                .unwrap();
+        // JavaScript JSON.stringify emits integral f64 values without .0.
+        fn javascript_numbers(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Number(n) => {
+                    if let Some(f) = n.as_f64()
+                        && f.fract() == 0.
+                        && f.abs() < 1e9
+                    {
+                        *n = serde_json::Number::from(f as i64);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(javascript_numbers),
+                serde_json::Value::Object(o) => o.values_mut().for_each(javascript_numbers),
+                _ => (),
+            }
+        }
+        let mut report = report;
+        javascript_numbers(&mut report);
+        let path = fixture._temp.path().join("massing.json");
+        let save = |path: &Path, report: serde_json::Value| {
+            save_massing_analysis_report(
+                root.display().to_string(),
+                path.display().to_string(),
+                report,
+            )
+        };
+        save(&path, report.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+            report
+        );
+        assert!(save(&path, report.clone()).is_err());
+        assert!(save(&root.join("cad.project.toml"), report.clone()).is_err());
+        let mut tampered = report;
+        tampered["analysis"]["result"]["horizontal_sky_view_factor"] = serde_json::json!(0.5);
+        let other = fixture._temp.path().join("tampered.json");
+        assert!(save(&other, tampered).is_err());
+        assert!(!other.exists());
+        assert_eq!(cad_model::source_manifest(root).unwrap(), before);
+    }
+
+    #[test]
+    fn clipboard_part_files_are_validated_create_new_and_protect_canonical_data() {
+        let fixture = fixture_project();
+        let root = &fixture.project_path;
+        let source = cad_model::load_project(root).unwrap();
+        let ids = vec![
+            source.drawings[0].entities[0]
+                .entity
+                .id()
+                .as_str()
+                .to_owned(),
+        ];
+        let before = cad_model::source_manifest(root).unwrap();
+        let document = copy_cad_entities(
+            root.display().to_string(),
+            "plan_1f".into(),
+            ids,
+            [0., 0.],
+            cad_toolkit::clipboard::DimensionCopyPolicy::IncludeReferences,
+        )
+        .unwrap();
+        let path = fixture._temp.path().join("part.cadpart.json");
+        save_cad_part(
+            root.display().to_string(),
+            path.display().to_string(),
+            document.clone(),
+        )
+        .unwrap();
+        let loaded = load_cad_part(path.display().to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&document).unwrap()
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            save_cad_part(
+                root.display().to_string(),
+                path.display().to_string(),
+                document.clone()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        for relative in [
+            "cad.project.toml",
+            "drawings/plan_1f/entities.ndjson",
+            "interop/jww/new.json",
+            "build/.cad-recovery/new.json",
+            "build/.cad-history/new.json",
+        ] {
+            assert!(
+                save_cad_part(
+                    root.display().to_string(),
+                    root.join(relative).display().to_string(),
+                    document.clone()
+                )
+                .is_err()
+            );
+        }
+        let malformed = fixture._temp.path().join("bad.json");
+        fs::write(&malformed, b"{\"schema_version\":\"unknown\"}").unwrap();
+        assert!(load_cad_part(malformed.display().to_string()).is_err());
+        let mut document = loaded;
+        document.schema_version = "unknown".into();
+        assert!(
+            save_cad_part(
+                root.display().to_string(),
+                fixture
+                    ._temp
+                    .path()
+                    .join("invalid.json")
+                    .display()
+                    .to_string(),
+                document
+            )
+            .is_err()
+        );
+        assert_eq!(cad_model::source_manifest(root).unwrap(), before);
+    }
+
+    #[test]
+    fn text_generation_requires_revision_and_canonical_manifest_before_apply() {
+        let fixture = fixture_project();
+        let root = &fixture.project_path;
+        let source = cad_model::load_project(root).unwrap();
+        let created = cad_edit::apply_edit(
+            root,
+            &cad_edit::DrawingEditRequest {
+                drawing: "plan_1f".into(),
+                expected_revision: cad_edit::editor_state(&source, "plan_1f").unwrap().revision,
+                operation: cad_edit::EditOperation::Create {
+                    entity: serde_json::json!({
+                        "type":"text","schema_version":"0.3","layer":"0-1","style":"note",
+                        "at":[100,200],"rotation_deg":30,"mirror_y":true,"value":"既存壁と既存壁"
+                    }),
+                },
+            },
+        )
+        .unwrap();
+        let id = created.entity_ids[0].clone();
+        let path = root.join("drawings/plan_1f/entities.ndjson");
+        let original = fs::read(&path).unwrap();
+        let revision = cad_edit::editor_state(&cad_model::load_project(root).unwrap(), "plan_1f")
+            .unwrap()
+            .revision;
+        let request = || cad_toolkit::text::TextEditRequest::Replace {
+            find: "既存".into(),
+            replace: "改修".into(),
+            entity_ids: vec![id.clone()],
+            style: None,
+        };
+        assert!(
+            generate_text_edit(
+                root.to_string_lossy().into(),
+                "plan_1f".into(),
+                "stale".into(),
+                request()
+            )
+            .is_err()
+        );
+        let generated = generate_text_edit(
+            root.to_string_lossy().into(),
+            "plan_1f".into(),
+            revision.clone(),
+            request(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let operation = serde_json::from_value(generated["operation"].clone()).unwrap();
+        let edit = cad_edit::DrawingEditRequest {
+            drawing: "plan_1f".into(),
+            expected_revision: revision,
+            operation,
+        };
+        let styles_path = root.join("rules/styles.toml");
+        let old_styles = fs::read(&styles_path).unwrap();
+        let mut newer_styles = old_styles.clone();
+        newer_styles.extend_from_slice(b"\n# concurrent source change\n");
+        fs::write(&styles_path, &newer_styles).unwrap();
+        assert!(cad_check::check_project(root).is_ok());
+        assert!(cad_edit::apply_edit(root, &edit).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::write(&styles_path, &old_styles).unwrap();
+        cad_edit::apply_edit(root, &edit).unwrap();
+        assert!(cad_check::check_project(root).is_ok());
+        let source = cad_model::load_project(root).unwrap();
+        let entity = source.drawings[0]
+            .entities
+            .iter()
+            .find(|r| r.entity.id().as_str() == id)
+            .unwrap();
+        let cad_model::Entity::Text {
+            value,
+            at,
+            rotation_deg,
+            mirror_y,
+            style,
+            ..
+        } = &entity.entity
+        else {
+            panic!()
+        };
+        assert_eq!(value, "改修壁と改修壁");
+        assert_eq!(*at, [100., 200.]);
+        assert_eq!(*rotation_deg, 30.);
+        assert!(*mirror_y);
+        assert_eq!(style, "note");
     }
 
     fn write_incomplete_transaction(project_path: &Path) {
