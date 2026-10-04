@@ -13,6 +13,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 mod dimensions;
+pub mod source_schema;
 pub use dimensions::*;
 mod comment_versions;
 pub use comment_versions::*;
@@ -34,13 +35,13 @@ pub enum ModelError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse TOML {path}")]
+    #[error("failed to parse TOML {path}: {source}")]
     Toml {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
     },
-    #[error("failed to parse NDJSON {path}:{line}")]
+    #[error("failed to parse NDJSON {path}:{line}: {source}")]
     Ndjson {
         path: PathBuf,
         line: usize,
@@ -557,14 +558,14 @@ impl Serialize for EntityId {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub schema_version: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayerRules {
     #[serde(default)]
@@ -574,7 +575,7 @@ pub struct LayerRules {
     pub layers: BTreeMap<String, LayerDef>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayerGroupDef {
     pub name: String,
@@ -584,7 +585,7 @@ pub struct LayerGroupDef {
     pub locked: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayerDef {
     pub name: String,
@@ -601,7 +602,7 @@ pub struct LayerDef {
     pub line_width: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StyleRules {
     pub colors: BTreeMap<String, ColorDef>,
@@ -612,7 +613,7 @@ pub struct StyleRules {
     pub dimension_styles: BTreeMap<String, DimensionStyleDef>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ColorDef {
     pub rgb: String,
@@ -621,13 +622,13 @@ pub struct ColorDef {
     pub print_width: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LineTypeDef {
     pub dash: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PenStyleDef {
     pub color: String,
@@ -635,7 +636,7 @@ pub struct PenStyleDef {
     pub line_width: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TextStyleDef {
     pub font_family: String,
@@ -645,7 +646,7 @@ pub struct TextStyleDef {
     pub align: TextAlign,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TextAlign {
     Left,
@@ -653,7 +654,7 @@ pub enum TextAlign {
     Right,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DimensionStyleDef {
     pub text_style: String,
@@ -663,7 +664,7 @@ pub struct DimensionStyleDef {
     pub unit: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutConfig {
     pub name: String,
@@ -680,7 +681,7 @@ pub struct LayoutConfig {
 }
 
 /// A clipped view of model geometry, placed in millimetres from the sheet's lower left.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutViewport {
     pub name: String,
@@ -780,7 +781,7 @@ pub fn validate_layout_viewports(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutsConfig {
     pub schema_version: String,
@@ -968,7 +969,7 @@ pub fn hatch_line_segments(
     Ok(output)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BlockDefinitionConfig {
     pub schema_version: String,
@@ -984,14 +985,14 @@ pub struct BlockDefinition {
     pub entities: Vec<EntityRecord>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SheetOrientation {
     Portrait,
     Landscape,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Entity {
     Line {

@@ -1,0 +1,10 @@
+{
+  "key": "wall-array",
+  "layer": "0-1",
+  "geometry": {
+    "type": "repeat",
+    "copies": 3,
+    "step_mm": [2000, 0],
+    "geometry": {"type": "double_line", "p1": [0, 6500], "p2": [1000, 6500], "width": 100, "centerline": false}
+  }
+}

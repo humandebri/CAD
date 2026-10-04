@@ -2,7 +2,9 @@
 use crate::{BBox, Point, TextAlign, TextStyleDef};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TextWritingMode {
     #[default]

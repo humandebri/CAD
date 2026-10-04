@@ -267,7 +267,7 @@ pub fn export(
     println!("Review bundle generated at {}", directory.display());
     Ok(())
 }
-fn validate_output_directory(project: &Path, directory: &Path) -> Result<()> {
+pub(super) fn validate_output_directory(project: &Path, directory: &Path) -> Result<()> {
     let resolved = super::resolve_output_path(directory)?;
     let root = fs::canonicalize(project).into_diagnostic()?;
     if let Ok(relative) = resolved.strip_prefix(&root) {

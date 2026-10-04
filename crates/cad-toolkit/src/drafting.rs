@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GeneratorRequest {
     pub layer: String,
@@ -14,7 +14,7 @@ pub struct GeneratorRequest {
     pub pen: Option<String>,
     pub geometry: Geometry,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Geometry {
     DoubleLine {

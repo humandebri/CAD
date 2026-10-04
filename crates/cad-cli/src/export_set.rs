@@ -4,15 +4,30 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExportOptions {
+    pub jww: bool,
+    pub strict: bool,
+    pub preview_dpi: Option<f64>,
+}
+
 pub fn export(
     project: &Path,
     revision: &str,
     requested: &[String],
     requested_pages: &[String],
     directory: &Path,
-    jww: bool,
-    strict: bool,
+    options: ExportOptions,
 ) -> Result<()> {
+    let ExportOptions {
+        jww,
+        strict,
+        preview_dpi,
+    } = options;
+    super::review_bundle::validate_output_directory(project, directory)?;
+    if preview_dpi.is_some_and(|dpi| !dpi.is_finite() || !(36.0..=300.0).contains(&dpi)) {
+        return Err(miette!("preview DPI must be 36..300"));
+    }
     let snapshot =
         cad_git::snapshot(project, &cad_git::Revision::parse(revision)).into_diagnostic()?;
     let source = &snapshot.source;
@@ -116,6 +131,10 @@ pub fn export(
             &format!("{prefix}.svg"),
             svg.as_bytes(),
         )?);
+        if let Some(dpi) = preview_dpi {
+            let png = crate::preview_png::render(&svg, dpi)?;
+            files.push(publish(directory, &format!("{prefix}.png"), &png)?);
+        }
         let drawing = page_source
             .drawings
             .iter()
@@ -149,10 +168,35 @@ pub fn export(
             files.push(describe(directory, &format!("{prefix}.jww"))?);
         }
     }
+    if let Some(dpi) = preview_dpi {
+        let gallery_pages = selections
+            .iter()
+            .map(|(name, layout)| {
+                let drawing = source
+                    .drawings
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .expect("validated drawing");
+                (
+                    name.clone(),
+                    layout
+                        .clone()
+                        .unwrap_or_else(|| drawing.layouts.active_layout.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.push(publish(
+            directory,
+            "index.html",
+            crate::preview_png::gallery(&gallery_pages, dpi).as_bytes(),
+        )?);
+    }
     let manifest = json!({
         "schema_version": "cad-export-set/1", "status": "complete",
         "tool_version": env!("CARGO_PKG_VERSION"), "source": snapshot.identity,
         "pages": pages, "files": files, "cad_check": check, "jww_checks": checks,
+        "visual_review": "pending",
+        "png_preview": preview_dpi.map(|dpi| json!({"dpi":dpi,"source":"svg","font_policy":"bundled_mplus_fallback","pdf_visual_review":"pending"})),
     });
     publish(
         directory,
@@ -251,8 +295,7 @@ mod tests {
             &[],
             &["acceptance@detail".into(), "acceptance@default".into()],
             &output,
-            false,
-            false,
+            ExportOptions::default(),
         )
         .unwrap();
         let manifest: Value =
@@ -269,12 +312,68 @@ mod tests {
                 &[],
                 &["acceptance@detail".into()],
                 &temp.path().join("jww"),
-                true,
-                false
+                ExportOptions {
+                    jww: true,
+                    ..Default::default()
+                }
             )
             .is_err()
         );
         assert!(!temp.path().join("jww").exists());
+    }
+    #[test]
+    fn png_gallery_manifest_and_tamper_checks_share_one_source_revision() {
+        let project =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/direct-edit-guide");
+        let before = cad_model::source_manifest(&project).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("preview");
+        export(
+            &project,
+            "worktree",
+            &[],
+            &[],
+            &out,
+            ExportOptions {
+                preview_dpi: Some(72.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        verify(&out).unwrap();
+        let png = fs::read(out.join("001.png")).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["visual_review"], "pending");
+        assert_eq!(manifest["cad_check"]["status"], "ok");
+        assert_eq!(
+            manifest["source"]["source_manifest"],
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(
+            fs::read_to_string(out.join("index.html"))
+                .unwrap()
+                .contains("001.png")
+        );
+        assert_eq!(cad_model::source_manifest(&project).unwrap(), before);
+        fs::write(out.join("001.png"), b"tampered").unwrap();
+        assert!(verify(&out).is_err());
+        assert!(
+            export(
+                &project,
+                "worktree",
+                &[],
+                &[],
+                &temp.path().join("invalid"),
+                ExportOptions {
+                    preview_dpi: Some(f64::NAN),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("invalid").exists());
     }
     #[test]
     fn output_set_preserves_source_identifies_layout_and_detects_tampering() {
@@ -282,14 +381,32 @@ mod tests {
         let before = cad_model::source_manifest(&project).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("set");
-        export(&project, "worktree", &[], &[], &output, false, false).unwrap();
+        export(
+            &project,
+            "worktree",
+            &[],
+            &[],
+            &output,
+            ExportOptions::default(),
+        )
+        .unwrap();
         verify(&output).unwrap();
         assert_eq!(before, cad_model::source_manifest(&project).unwrap());
         let manifest: Value =
             serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["pages"][0]["drawing"], "acceptance");
         assert_eq!(manifest["pages"][0]["layout"]["scale"], "1/50");
-        assert!(export(&project, "worktree", &[], &[], &output, false, false).is_err());
+        assert!(
+            export(
+                &project,
+                "worktree",
+                &[],
+                &[],
+                &output,
+                ExportOptions::default()
+            )
+            .is_err()
+        );
         fs::write(output.join("001.svg"), b"tampered").unwrap();
         assert!(verify(&output).is_err());
     }

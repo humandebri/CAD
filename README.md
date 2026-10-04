@@ -90,6 +90,10 @@ drawing work, use [cad-drafting](.agents/skills/cad-drafting/SKILL.md) to edit
 canonical source and [cad-review](.agents/skills/cad-review/SKILL.md) to review
 drawing revisions.
 
+For direct editing, see [source schemas, coordinate conversion, drafting helpers,
+and checked image previews](docs/direct-edit.md). The helpers produce ordinary
+NDJSON candidates; canonical TOML/NDJSON remains the editable source of truth.
+
 ## Layout
 
 ```text

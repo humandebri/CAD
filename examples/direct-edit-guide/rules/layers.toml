@@ -1,0 +1,26 @@
+active_layer = "0-1"
+
+[groups.design]
+name = "Design"
+order = 0
+scale_denominator = 50.0
+visible = true
+locked = false
+
+[layers."0-1"]
+name = "Walls and components"
+group = "design"
+visible = true
+printable = true
+color = "black"
+line_type = "solid"
+line_width = 0.25
+
+[layers."0-2"]
+name = "Dimensions and notes"
+group = "design"
+visible = true
+printable = true
+color = "black"
+line_type = "solid"
+line_width = 0.18

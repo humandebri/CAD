@@ -1,0 +1,2 @@
+{"schema_version":"0.3","id":"ent_01JZ0000000000000000000200","type":"line","layer":"0-1","p1":[0,0],"p2":[0,900]}
+{"schema_version":"0.3","id":"ent_01JZ0000000000000000000201","type":"arc","layer":"0-1","center":[0,0],"radius":900,"start_deg":0,"end_deg":90}

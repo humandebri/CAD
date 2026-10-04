@@ -7,6 +7,7 @@ pub mod massing;
 pub mod measure;
 pub mod part_library;
 pub mod sheet;
+pub mod source_draft;
 pub mod text;
 
 use thiserror::Error;

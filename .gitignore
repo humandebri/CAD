@@ -5,6 +5,9 @@ dist/
 /build/
 /snapshots/
 /exports/
+# Local drawing jobs, source references and generated previews
+/drawing-projects/
+/output/
 **/build/
 **/snapshots/
 **/exports/

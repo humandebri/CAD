@@ -38,6 +38,8 @@ cad-import-jww = { path = "crates/cad-import-jww" }
 cad-export-jww = { path = "crates/cad-export-jww" }
 cad-edit = { path = "crates/cad-edit" }
 serde = { version = "1", features = ["derive"] }
+schemars = "0.8.22"
+resvg = { version = "0.48.1", default-features = false, features = ["text"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 toml = "1"

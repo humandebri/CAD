@@ -11,7 +11,7 @@ description: このCADのTOML・NDJSONを直接編集して2D図面を作図・�
 
 - リポジトリルートと対象CADプロジェクトを区別する。CLIはリポジトリルートで実行し、対象プロジェクトには絶対パスを渡す。
 - 適用されるAGENTS.md、既存差分、対象図面のレイアウト・レイヤー・スタイル・ブロックを読む。ユーザーの既存変更を保持する。
-- 現行仕様は `crates/cad-model/src/lib.rs`、寸法は `crates/cad-model/src/dimensions.rs`、コマンドは `crates/cad-cli/src/main.rs` を参照する。`examples/cad-acceptance` に実例がある。これらのパスはリポジトリルート基準。未知のフィールドを独自に追加しない。
+- 現行仕様は `crates/cad-model/src/lib.rs`、寸法は `crates/cad-model/src/dimensions.rs`、コマンドは `crates/cad-cli/src/main.rs` を参照する。`examples/direct-edit-guide` に全図形種・固定点/参照点寸法の検査可能な実例がある。形式・座標換算・直接編集候補・画像一括出力には [直接編集の支援](references/direct-edit.md) を読む。これらのパスはリポジトリルート基準。未知のフィールドを独自に追加しない。
 - 新規図面、座標変換、複写、参照寸法、用紙設定には [正本編集の手引き](references/source-editing.md) を読む。Gitの版を比較する依頼には隣の `cad-review` スキルを使える。
 - 壁面展開図では [展開図の手順](references/interior-elevations.md) を読む。
 - 図面間コピー・正本部品、建具・2線・楕円・自由曲線・接線・接円・分割・倍率・属性取得、文字置換・style変更・縦列注記・計算注記・計測・DXF/JWS取り込み、2.5D投影・日影・天空図、混在縮尺の印刷配置には [生成・計測CLI](references/toolkit.md) を読む。生成した編集要求はプレビューしてから適用でき、アプリ履歴にも残る。

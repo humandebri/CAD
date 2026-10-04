@@ -124,6 +124,32 @@ pub struct ImportReport {
     pub compatibility_reason: Option<String>,
     pub edit_capability: cad_model::JwwEditCapability,
     pub warnings: Vec<ImportWarning>,
+    pub coordinates: Option<CoordinateReport>,
+}
+
+/// Coordinates are preserved here; the layer-group scale is not multiplied into geometry.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinateReport {
+    pub stored_coordinates: &'static str,
+    pub model_normalized: bool,
+    pub group_scale_denominators: BTreeMap<String, f64>,
+    pub guidance: &'static str,
+}
+
+pub fn coordinate_report(document: &JwwDocument) -> CoordinateReport {
+    CoordinateReport {
+        stored_coordinates: "jww_record_coordinates",
+        model_normalized: false,
+        group_scale_denominators: document
+            .header
+            .layer_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.scale.is_finite() && g.scale > 0.0)
+            .map(|(i, g)| (format!("jww_g{i:X}"), g.scale))
+            .collect(),
+        guidance: "Import preserves record coordinates and block transforms without multiplying layer-group scales. Confirm a known dimension before using coordinates as model mm. For derived drawings specify coordinate_mm_per_unit explicitly; do not multiply layout scale into model geometry again or assume one factor for mixed groups.",
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +303,7 @@ fn write_project(
         } else {
             cad_model::JwwEditCapability::ExactOnly
         },
+        coordinates: Some(coordinate_report(document)),
         warnings: converted.warnings,
     };
     write_text(
@@ -471,6 +498,7 @@ fn write_read_only_project(
         jww_paper_size: 0,
         jww_memo: String::new(),
         supported_entities: 0,
+        coordinates: None,
         compatibility_state: state,
         compatibility_reason: inspection.reason.clone(),
         edit_capability: cad_model::JwwEditCapability::ExactOnly,

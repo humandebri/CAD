@@ -1599,6 +1599,15 @@ impl<'a> Checker<'a> {
     }
 }
 
+fn parse_error_field(message: &str) -> Option<String> {
+    for prefix in ["unknown field `", "missing field `"] {
+        if let Some(rest) = message.split_once(prefix).map(|(_, rest)| rest) {
+            return rest.split_once('`').map(|(field, _)| field.to_owned());
+        }
+    }
+    None
+}
+
 fn model_error_to_diagnostic(root: &Path, error: &ModelError) -> CheckDiagnostic {
     match error {
         ModelError::Read { path, .. }
@@ -1614,12 +1623,12 @@ fn model_error_to_diagnostic(root: &Path, error: &ModelError) -> CheckDiagnostic
             code: model_error_code(error).to_owned(),
             message: error.to_string(),
         },
-        ModelError::Ndjson { path, line, .. } => CheckDiagnostic {
+        ModelError::Ndjson { path, line, source } => CheckDiagnostic {
             severity: Severity::Error,
             file: relative_path(root, path),
             line: Some(*line),
             entity_id: None,
-            field: None,
+            field: parse_error_field(&source.to_string()),
             code: "format.invalid_ndjson".to_owned(),
             message: error.to_string(),
         },
@@ -1949,6 +1958,12 @@ mod tests {
 
         assert_code(&report, "format.invalid_ndjson");
         assert_eq!(report.diagnostics[0].line, Some(1));
+        assert_eq!(report.diagnostics[0].field.as_deref(), Some("extra"));
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("unknown field `extra`")
+        );
     }
 
     #[test]

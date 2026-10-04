@@ -1,0 +1,34 @@
+{
+  "key": "room-demo",
+  "layer": "0-1",
+  "geometry": {
+    "type": "wall_elevations",
+    "dimension_style": "dim",
+    "text_style": "note",
+    "dimension_offset_mm": 300,
+    "walls": [
+      {
+        "key": "A",
+        "left": [0, 0], "right": [37, 0],
+        "coordinate_mm_per_unit": 100,
+        "ceiling_height_mm": 2400,
+        "at_mm": [0, 6500],
+        "note": "CH2400・窓台900・窓高1200は試作用の仮定",
+        "openings": [
+          {"key": "window", "first": [5, 0], "second": [18, 0], "sill_height_mm": 900, "height_mm": 1200}
+        ]
+      },
+      {
+        "key": "C",
+        "left": [37, 26.25], "right": [0, 26.25],
+        "coordinate_mm_per_unit": 100,
+        "ceiling_height_mm": 2400,
+        "at_mm": [5000, 6500],
+        "note": "CH2400・開口高2000は試作用の仮定",
+        "openings": [
+          {"key": "door", "first": [5, 26.25], "second": [14, 26.25], "sill_height_mm": 0, "height_mm": 2000}
+        ]
+      }
+    ]
+  }
+}

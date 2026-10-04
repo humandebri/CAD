@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 mod exchange;
 mod export_set;
 mod merge_plan;
+mod preview_png;
 mod review_bundle;
+mod source_tools;
 mod symbol;
 
 #[derive(Debug, Parser)]
@@ -22,6 +24,35 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Generate editor JSON Schemas from canonical Rust model types")]
+    SourceSchema {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(
+        about = "Report stored coordinates, import scale evidence and paper scale without changing sources"
+    )]
+    SourceCoordinates {
+        project: PathBuf,
+        #[arg(long)]
+        drawing: String,
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+    },
+    #[command(
+        about = "Generate a checked direct-edit NDJSON candidate with stable IDs; never writes canonical sources"
+    )]
+    DraftSource {
+        project: PathBuf,
+        #[arg(long)]
+        drawing: String,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        previous: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
     #[command(
         about = "Generate pinned all-drawing PDF/SVG, semantic diff, annotation and warning artifacts for review/CI"
     )]
@@ -308,6 +339,13 @@ enum Command {
         jww: bool,
         #[arg(long, requires = "jww")]
         strict: bool,
+        #[arg(
+            long,
+            help = "Include PNG previews and a local HTML gallery from the checked SVGs"
+        )]
+        preview_png: bool,
+        #[arg(long, default_value_t = 144.0, requires = "preview_png")]
+        preview_dpi: f64,
     },
     #[command(about = "Verify exported files against an export-set manifest")]
     VerifyExportSet { directory: PathBuf },
@@ -503,8 +541,11 @@ impl Command {
             | Self::CopyEntities { .. }
             | Self::PasteEntities { .. }
             | Self::ExportSet { .. }
-            | Self::VerifyExportSet { .. } => Vec::new(),
-            Self::Check { project, .. }
+            | Self::VerifyExportSet { .. }
+            | Self::SourceSchema { .. }
+            | Self::DraftSource { .. } => Vec::new(),
+            Self::SourceCoordinates { project, .. }
+            | Self::Check { project, .. }
             | Self::Generate { project, .. }
             | Self::Edit { project, .. }
             | Self::Format { project }
@@ -1116,9 +1157,35 @@ fn main() -> Result<()> {
             out,
             jww,
             strict,
+            preview_png,
+            preview_dpi,
         }) => {
-            export_set::export(&project, &revision, &drawing, &page, &out, jww, strict)?;
+            export_set::export(
+                &project,
+                &revision,
+                &drawing,
+                &page,
+                &out,
+                export_set::ExportOptions {
+                    jww,
+                    strict,
+                    preview_dpi: preview_png.then_some(preview_dpi),
+                },
+            )?;
         }
+        Some(Command::SourceSchema { out }) => source_tools::schemas(&out)?,
+        Some(Command::SourceCoordinates {
+            project,
+            drawing,
+            out,
+        }) => source_tools::coordinates(&project, &drawing, &out)?,
+        Some(Command::DraftSource {
+            project,
+            drawing,
+            request,
+            previous,
+            out,
+        }) => source_tools::draft(&project, &drawing, &request, previous.as_deref(), &out)?,
         Some(Command::VerifyExportSet { directory }) => export_set::verify(&directory)?,
         Some(Command::SheetViewports {
             project,

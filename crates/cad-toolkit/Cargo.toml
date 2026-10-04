@@ -16,6 +16,7 @@ toml.workspace = true
 tempfile.workspace = true
 geo.workspace = true
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ulid.workspace = true

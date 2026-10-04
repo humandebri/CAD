@@ -9,6 +9,8 @@ name = "cadc"
 path = "src/main.rs"
 
 [dependencies]
+resvg.workspace = true
+schemars.workspace = true
 blake3.workspace = true
 cad-check.workspace = true
 cad-exchange.workspace = true
