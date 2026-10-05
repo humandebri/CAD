@@ -11,6 +11,8 @@ use std::path::Path;
 
 pub const CHECK_SCHEMA_VERSION: &str = cad_model::CURRENT_SCHEMA_VERSION;
 const EPSILON_MM: f64 = 0.001;
+// Angular sweeps have their own units; a small angle can describe a long arc.
+const EPSILON_DEG: f64 = 1e-9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1205,8 +1207,9 @@ impl<'a> Checker<'a> {
                 let span = (*end_deg - *start_deg).abs();
                 if !start_deg.is_finite()
                     || !end_deg.is_finite()
-                    || span <= EPSILON_MM
-                    || span > 360.0 + EPSILON_MM
+                    || !span.is_finite()
+                    || span <= 0.0
+                    || span > 360.0 + EPSILON_DEG
                 {
                     self.push_entity(
                         file,
@@ -1250,7 +1253,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let span = (*end_deg - *start_deg).abs();
-                if span <= EPSILON_MM || span > 360.0 + EPSILON_MM {
+                if !span.is_finite() || span <= 0.0 || span > 360.0 + EPSILON_DEG {
                     self.push_entity(
                         file,
                         record,
@@ -1314,7 +1317,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let span = (*end_deg - *start_deg).abs();
-                if !span.is_finite() || span <= EPSILON_MM || span > 360.0 + EPSILON_MM {
+                if !span.is_finite() || span <= 0.0 || span > 360.0 + EPSILON_DEG {
                     self.push_entity(
                         file,
                         record,
@@ -2036,6 +2039,31 @@ mod tests {
         assert_code(&report, "reference.undefined_color");
         assert_code(&report, "reference.undefined_line_type");
         assert_code(&report, "layer.invalid_line_width");
+    }
+
+    #[test]
+    fn accepts_shallow_arc_sweeps_without_using_length_epsilon_as_degrees() {
+        let temp = fixture_project();
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            [
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"arc","layer":"0-1","center":[0,-17000000],"radius":17000000,"start_deg":90,"end_deg":90.0005}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000001","type":"arc","layer":"0-1","center":[0,-17000000],"radius":17000000,"start_deg":90.0005,"end_deg":90}"#,
+                r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000002","type":"ellipse","layer":"0-1","center":[0,0],"radius_x":17000000,"radius_y":10000000,"rotation_deg":0,"start_deg":90,"end_deg":90.0005}"#,
+            ].join("\n"),
+        ).unwrap();
+        let report = check_project(temp.path());
+        assert_eq!(report.status, CheckStatus::Ok, "{report:?}");
+    }
+
+    #[test]
+    fn rejects_arc_sweeps_over_one_turn_even_with_small_excess() {
+        let temp = fixture_project();
+        write(
+            temp.path().join("drawings/plan_1f/entities.ndjson"),
+            r#"{"schema_version":"0.3","id":"ent_01JZ0000000000000000000000","type":"arc","layer":"0-1","center":[0,0],"radius":100,"start_deg":0,"end_deg":360.0001}"#,
+        ).unwrap();
+        assert_code(&check_project(temp.path()), "geometry.invalid_arc");
     }
 
     #[test]

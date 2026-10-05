@@ -1788,12 +1788,7 @@ mod tests {
 
         for (suffix, bbox, kind, label) in [
             ("0", "0,0,910,0", "<line", "x2=\"910\""),
-            (
-                "1",
-                "-500,-500,500,500",
-                "<path",
-                "M500,0 A500,500,0,0,0,0,-500",
-            ),
+            ("1", "0,0,500,500", "<path", "M500,0 A500,500,0,0,0,0,-500"),
             ("2", "100,200,600,450", "<text", "note"),
             ("3", "0,0,910,370", "<line", "910 mm"),
             ("4", "452.5,-2.5,457.5,2.5", "<text", "door_910"),
@@ -1802,7 +1797,25 @@ mod tests {
             let start = svg.find(&id).unwrap();
             let start = svg[..start].rfind("<g ").unwrap();
             let group = &svg[start..start + svg[start..].find("</g>").unwrap()];
-            assert!(group.contains(&format!("data-bbox=\"{bbox}\"")));
+            let actual_bbox = group
+                .split("data-bbox=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            let actual = actual_bbox
+                .split(',')
+                .map(|v| v.parse::<f64>().unwrap())
+                .collect::<Vec<_>>();
+            let expected = bbox
+                .split(',')
+                .map(|v| v.parse::<f64>().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-9, "{actual_bbox} != {bbox}");
+            }
             assert!(group.contains("data-layer=\"0-1\""));
             assert!(group.contains(kind) && group.contains(label));
         }

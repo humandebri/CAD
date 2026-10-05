@@ -1385,9 +1385,14 @@ pub fn entity_bbox(entity: &Entity) -> Option<BBox> {
             BBox::from_points(&[*p1, *p2])
         }
         Entity::Polyline { points, .. } => BBox::from_points(points),
-        Entity::Arc { center, radius, .. } | Entity::Circle { center, radius, .. } => {
-            BBox::from_center_radius(*center, *radius)
-        }
+        Entity::Arc {
+            center,
+            radius,
+            start_deg,
+            end_deg,
+            ..
+        } => ellipse_bbox(*center, *radius, *radius, 0.0, *start_deg, *end_deg),
+        Entity::Circle { center, radius, .. } => BBox::from_center_radius(*center, *radius),
         Entity::Ellipse {
             center,
             radius_x,
@@ -2206,6 +2211,61 @@ mod tests {
         assert!(quarter.min[1].abs() < 1e-9);
         assert!((quarter.max[0] - 4.0).abs() < 1e-9);
         assert!((quarter.max[1] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn circular_arc_bounds_follow_signed_sweep_and_cross_zero() {
+        for (start, end, expected_min, expected_max) in [
+            (0.0, 90.0, [0.0, 0.0], [10.0, 10.0]),
+            (90.0, 0.0, [0.0, 0.0], [10.0, 10.0]),
+            (
+                350.0,
+                370.0,
+                [
+                    10.0 * 10_f64.to_radians().cos(),
+                    -10.0 * 10_f64.to_radians().sin(),
+                ],
+                [10.0, 10.0 * 10_f64.to_radians().sin()],
+            ),
+            (
+                10.0,
+                -10.0,
+                [
+                    10.0 * 10_f64.to_radians().cos(),
+                    -10.0 * 10_f64.to_radians().sin(),
+                ],
+                [10.0, 10.0 * 10_f64.to_radians().sin()],
+            ),
+            (30.0, 390.0, [-10.0, -10.0], [10.0, 10.0]),
+        ] {
+            let entity: Entity = serde_json::from_value(serde_json::json!({
+                "schema_version":"0.3", "id":"ent_01JZ0000000000000000000000",
+                "type":"arc", "layer":"0-1", "center":[0,0], "radius":10,
+                "start_deg":start, "end_deg":end
+            }))
+            .unwrap();
+            let bbox = entity_bbox(&entity).unwrap();
+            for axis in 0..2 {
+                assert!((bbox.min[axis] - expected_min[axis]).abs() < 1e-9);
+                assert!((bbox.max[axis] - expected_max[axis]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn shallow_large_radius_arc_has_local_bounds() {
+        let bbox = ellipse_bbox(
+            [0.0, -17_000_000.0],
+            17_000_000.0,
+            17_000_000.0,
+            0.0,
+            90.0,
+            90.0005,
+        )
+        .unwrap();
+        assert!(bbox.width() > 148.0 && bbox.width() < 149.0);
+        assert!(bbox.height() < 0.001);
+        assert!(ellipse_bbox([0.0, 0.0], 10.0, 10.0, 0.0, 90.0, 90.0).is_none());
     }
 
     #[test]
