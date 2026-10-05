@@ -477,16 +477,14 @@ impl Context<'_> {
                         return Ok(None);
                     }
                 };
-                if text.vertical_text_justification
-                    != dxf::enums::VerticalTextJustification::Baseline
-                {
-                    self.report.block(
-                        None,
-                        "text_vertical_alignment",
-                        "Nonbaseline DXF text requires explicit vertical alignment conversion.",
-                    );
-                    return Ok(None);
-                }
+                // Canonical text uses a baseline anchor. DXF uses the second
+                // alignment point whenever either justification is non-default.
+                let vertical_fraction = match text.vertical_text_justification {
+                    dxf::enums::VerticalTextJustification::Baseline
+                    | dxf::enums::VerticalTextJustification::Bottom => 0.0,
+                    dxf::enums::VerticalTextJustification::Middle => 0.5,
+                    dxf::enums::VerticalTextJustification::Top => 1.0,
+                };
                 let id = format!("dxf_text_{:04}", self.source.styles.text_styles.len());
                 let font = "M+ 1p".to_owned();
                 self.source.styles.text_styles.insert(
@@ -499,15 +497,33 @@ impl Context<'_> {
                         align,
                     },
                 );
-                let at = if text.horizontal_text_justification
+                let anchor = if text.horizontal_text_justification
                     == dxf::enums::HorizontalTextJustification::Left
+                    && text.vertical_text_justification
+                        == dxf::enums::VerticalTextJustification::Baseline
                 {
                     &text.location
                 } else {
                     &text.second_alignment_point
                 };
+                let mut at = xy(anchor, scale)?;
+                if text.vertical_text_justification
+                    != dxf::enums::VerticalTextJustification::Baseline
+                {
+                    let direction = if text.is_text_upside_down() {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let shift = -vertical_fraction * text.text_height * scale * direction;
+                    let angle = text.rotation.to_radians();
+                    at[0] -= shift * angle.sin();
+                    at[1] += shift * angle.cos();
+                    self.report.warning(None, "text_vertical_alignment_approximation",
+                        format!("DXF {:?} text alignment is converted to a baseline using nominal height; substituted font cap-height and descender metrics require visual comparison.", text.vertical_text_justification));
+                }
                 self.report.warning(None,"text_font_substitution",format!("DXF text style {:?} is mapped to M+ 1p; font metrics require visual comparison.",text.text_style_name));
-                json!({"type":"text","at":xy(at,scale)?,"rotation_deg":text.rotation,"mirror_y":text.is_text_upside_down(),"style":id,"value":text.value})
+                json!({"type":"text","at":at,"rotation_deg":text.rotation,"mirror_y":text.is_text_upside_down(),"style":id,"value":text.value})
             }
             dx::EntityType::Insert(insert) => {
                 planar(&insert.extrusion_direction)?;

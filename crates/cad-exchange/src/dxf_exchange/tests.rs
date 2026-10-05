@@ -32,6 +32,99 @@ fn encoded(drawing: &Drawing) -> Vec<u8> {
     drawing.save(&mut bytes).unwrap();
     bytes
 }
+
+#[test]
+fn imports_vertical_text_anchors_with_rotation_mirror_and_unit_scaling() {
+    use dxf::enums::{HorizontalTextJustification as H, VerticalTextJustification as V};
+    for (horizontal, vertical, rotation, mirrored, expected) in [
+        (H::Left, V::Baseline, 0.0, false, [70.0, 80.0]),
+        (H::Center, V::Baseline, 0.0, false, [1000.0, 2000.0]),
+        (H::Left, V::Bottom, 0.0, false, [1000.0, 2000.0]),
+        (H::Center, V::Middle, 0.0, false, [1000.0, 1950.0]),
+        (H::Right, V::Top, 0.0, false, [1000.0, 1900.0]),
+        (H::Left, V::Top, 90.0, false, [1100.0, 2000.0]),
+        (H::Center, V::Middle, 90.0, false, [1050.0, 2000.0]),
+        (H::Right, V::Top, 90.0, true, [900.0, 2000.0]),
+        (H::Left, V::Top, 0.0, true, [1000.0, 2100.0]),
+    ] {
+        let mut drawing = Drawing::new();
+        drawing.header.version = AcadVersion::R2013;
+        drawing.header.default_drawing_units = Units::Centimeters;
+        let mut text = dx::Text {
+            location: point([7.0, 8.0]),
+            second_alignment_point: point([100.0, 200.0]),
+            text_height: 10.0,
+            value: "Label".into(),
+            horizontal_text_justification: horizontal,
+            vertical_text_justification: vertical,
+            rotation,
+            ..Default::default()
+        };
+        text.set_is_text_upside_down(mirrored);
+        drawing.add_entity(dx::Entity::new(dx::EntityType::Text(text)));
+        let imported = import(&encoded(&drawing), "text", None).unwrap();
+        assert!(imported.report.blockers.is_empty(), "{:?}", imported.report);
+        assert_eq!(
+            imported
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text_vertical_alignment_approximation"),
+            vertical != V::Baseline
+        );
+        let source = imported.source.as_ref().unwrap();
+        let cad_model::Entity::Text {
+            at,
+            rotation_deg,
+            mirror_y,
+            style,
+            ..
+        } = &source.drawings[0].entities[0].entity
+        else {
+            panic!("expected text")
+        };
+        for axis in 0..2 {
+            assert!(
+                (at[axis] - expected[axis]).abs() < 1e-8,
+                "{at:?} != {expected:?}"
+            );
+        }
+        assert_eq!(*rotation_deg, rotation);
+        assert_eq!(*mirror_y, mirrored);
+        assert_eq!(source.styles.text_styles[style].height, 100.0);
+        assert_eq!(
+            source.styles.text_styles[style].align,
+            match horizontal {
+                H::Left => cad_model::TextAlign::Left,
+                H::Center => cad_model::TextAlign::Center,
+                H::Right => cad_model::TextAlign::Right,
+                _ => unreachable!(),
+            }
+        );
+    }
+}
+
+#[test]
+fn fitted_text_remains_explicitly_blocked() {
+    let mut drawing = Drawing::new();
+    drawing.header.version = AcadVersion::R2013;
+    drawing.header.default_drawing_units = Units::Millimeters;
+    drawing.add_entity(dx::Entity::new(dx::EntityType::Text(dx::Text {
+        value: "Fitted".into(),
+        text_height: 10.0,
+        horizontal_text_justification: dxf::enums::HorizontalTextJustification::Fit,
+        ..Default::default()
+    })));
+    let imported = import(&encoded(&drawing), "fitted", None).unwrap();
+    assert!(imported.source.is_none());
+    assert!(
+        imported
+            .report
+            .blockers
+            .iter()
+            .any(|b| b.code == "text_alignment")
+    );
+}
 #[test]
 fn upright_annotations_expand_to_reported_positioned_text_and_strict_blocks() {
     let (_temp, mut source) = project();
