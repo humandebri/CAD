@@ -13,6 +13,7 @@ members = [
     "crates/cad-export-jww",
     "crates/cad-edit",
     "crates/cad-cli",
+    "crates/cad-plan-audit",
     "apps/viewer/src-tauri",
 ]
 resolver = "3"
