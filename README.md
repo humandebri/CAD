@@ -2,6 +2,9 @@
 
 Git-native CAD source tooling for Jw_cad-style 2D architectural drafting.
 
+See the [documentation index](docs/README.md) for drafting guides, source contracts,
+compatibility evidence, and implementation plans.
+
 ## Current Phase
 
 The drafting workspace uses schema 0.3, with transactional editing, canonical layouts, native
@@ -101,25 +104,36 @@ crates/
   cad-model
   cad-check
   cad-render-svg
+  cad-render-pdf
   cad-diff
+  cad-git
+  cad-toolkit
+  cad-exchange
   cad-jww-codec
   cad-import-jww
   cad-export-jww
-  cad-render-pdf
   cad-edit
   cad-cli
+  cad-plan-audit
 apps/
   viewer
 examples/
+  cad-acceptance
+  direct-edit-guide
   house-small
   house-small-modified
+  jww-fixtures
+docs/                 # User guides and validation evidence
+plans/                # Implementation plans and status
+scripts/              # Setup and verification gates
+.agents/skills/       # CAD drafting and review workflows
 ```
+
+Local drawing jobs live in `drawing-projects/`, with deliverables in `output/`.
+These directories are ignored by Git. `build/`, `target/`, and viewer `dist/`
+contain generated artifacts; repository fixtures belong in `examples/`.
 
 ## Checks
-
-```bash
-scripts/ci-local.sh
-```
 
 On a fresh checkout, run `scripts/ci-bootstrap.sh` once to install the frozen
 viewer dependencies and Chromium. `scripts/ci-local.sh` only verifies the
@@ -547,6 +561,10 @@ curve fills use a reported polygon approximation. Unknown records, unsupported t
 paper-space entities, and 3D geometry block import instead of silently disappearing.
 Unitless input requires `--unit-mm MM_PER_DXF_UNIT`. Import creates a new A3 landscape
 project at 1:100 with new IDs and substituted fonts. Every exchange requires a JSON report;
+Top, middle, and bottom TEXT alignment is converted to a baseline using nominal text
+height, rotation, and reflection. Font-dependent vertical metrics remain approximate
+and produce `text_vertical_alignment_approximation` warnings; fitted/aligned text
+remains blocked rather than silently reduced.
 `export-dxf --strict` blocks reported substitutions and semantic reductions, including the
 loss of canonical page layouts. Receiving-CAD visual comparison remains necessary.
 
@@ -600,6 +618,11 @@ and reviewed edits support Undo/Redo. JWW/DXF expand the columns to positioned
 single-character records with compatibility reports; strict export blocks the expansion.
 Vertical font shaping and native JWW vertical-glyph mapping remain unvalidated.
 See [annotation placement and limits](docs/annotation-writing.md).
+
+## 建築検査をCADの外で実行する
+
+`cad-audit` は外部の対応台帳から片開き建具と開口、設備の干渉、明示した通路・据付条件を検査し、未適用の修正候補・設備表・建具寸法模式図を生成します。CAD本体への建築自動補完は追加しません。使い方と初期実装の範囲は [建築検査CLI](docs/plan-audit.md) を参照してください。
+
 
 ## Out Of Scope
 
