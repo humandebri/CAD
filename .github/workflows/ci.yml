@@ -28,10 +28,10 @@ jobs:
         run: |
           pdfinfo /tmp/cad-pdf-fidelity.pdf
           pdffonts /tmp/cad-pdf-fidelity.pdf | tee /tmp/cad-pdf-fonts.txt
-          rg 'CID TrueType.*Identity-H.*yes +yes +yes' /tmp/cad-pdf-fonts.txt
+          grep -E 'CID TrueType.*Identity-H.*yes +yes +yes' /tmp/cad-pdf-fonts.txt
           pdftotext -layout /tmp/cad-pdf-fidelity.pdf /tmp/cad-pdf-fidelity.txt
-          rg '910 mm' /tmp/cad-pdf-fidelity.txt
-          rg '和室' /tmp/cad-pdf-fidelity.txt
+          grep -F '910 mm' /tmp/cad-pdf-fidelity.txt
+          grep -F '和室' /tmp/cad-pdf-fidelity.txt
           pdftoppm -png -singlefile /tmp/cad-pdf-fidelity.pdf /tmp/cad-pdf-fidelity
           test -s /tmp/cad-pdf-fidelity.png
       - uses: actions/setup-python@v5
