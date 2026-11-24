@@ -52,6 +52,13 @@ jobs:
         working-directory: apps/viewer
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build cadc CLI for viewer E2E
+        working-directory: .
+        run: cargo build -p cad-cli --bin cadc
       - uses: pnpm/action-setup@v4
         with:
           version: 11.0.8
