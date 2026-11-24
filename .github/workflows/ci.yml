@@ -56,9 +56,15 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
-      - name: Build cadc CLI for viewer E2E
+      - name: Build cadc CLI and sample review artifacts for viewer E2E
         working-directory: .
-        run: cargo build -p cad-cli --bin cadc
+        run: |
+          cargo build -p cad-cli --bin cadc
+          mkdir -p examples/house-small/build
+          ./target/debug/cadc check examples/house-small --target cad --format json --out examples/house-small/build/check.json
+          ./target/debug/cadc render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg
+          ./target/debug/cadc diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json
+          ./target/debug/cadc diff examples/house-small examples/house-small-modified --format svg --out examples/house-small/build/plan_1f.diff.svg
       - uses: pnpm/action-setup@v4
         with:
           version: 11.0.8
