@@ -28,10 +28,10 @@ jobs:
         run: |
           pdfinfo /tmp/cad-pdf-fidelity.pdf
           pdffonts /tmp/cad-pdf-fidelity.pdf | tee /tmp/cad-pdf-fonts.txt
-          rg 'CID TrueType.*Identity-H.*yes +yes +yes' /tmp/cad-pdf-fonts.txt
+          grep -E 'CID TrueType.*Identity-H.*yes +yes +yes' /tmp/cad-pdf-fonts.txt
           pdftotext -layout /tmp/cad-pdf-fidelity.pdf /tmp/cad-pdf-fidelity.txt
-          rg '910 mm' /tmp/cad-pdf-fidelity.txt
-          rg '和室' /tmp/cad-pdf-fidelity.txt
+          grep -F '910 mm' /tmp/cad-pdf-fidelity.txt
+          grep -F '和室' /tmp/cad-pdf-fidelity.txt
           pdftoppm -png -singlefile /tmp/cad-pdf-fidelity.pdf /tmp/cad-pdf-fidelity
           test -s /tmp/cad-pdf-fidelity.png
       - uses: actions/setup-python@v5
@@ -52,6 +52,19 @@ jobs:
         working-directory: apps/viewer
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build cadc CLI and sample review artifacts for viewer E2E
+        working-directory: .
+        run: |
+          cargo build -p cad-cli --bin cadc
+          mkdir -p examples/house-small/build
+          ./target/debug/cadc check examples/house-small --target cad --format json --out examples/house-small/build/check.json
+          ./target/debug/cadc render examples/house-small --format svg --out examples/house-small/build/plan_1f.svg
+          ./target/debug/cadc diff examples/house-small examples/house-small-modified --format json --out examples/house-small/build/diff.json
+          ./target/debug/cadc diff examples/house-small examples/house-small-modified --format svg --out examples/house-small/build/plan_1f.diff.svg
       - uses: pnpm/action-setup@v4
         with:
           version: 11.0.8
